@@ -11,6 +11,24 @@ import (
 	"strings"
 )
 
+// sandboxBypassCtx is the context key for signaling that the sandbox should be
+// bypassed for a bash command the user explicitly authorized.
+type sandboxBypassCtx struct{}
+
+// WithSandboxBypass returns a context that signals the bash tool to skip OS
+// sandbox wrapping. Callers inject this after Gate.Check returns allow for a
+// bash command, so an explicitly authorized command can write wherever it needs
+// to (e.g. Go's GOCACHE outside the project directory).
+func WithSandboxBypass(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sandboxBypassCtx{}, true)
+}
+
+// SandboxBypass reports whether ctx carries a sandbox-bypass signal.
+func SandboxBypass(ctx context.Context) bool {
+	v, _ := ctx.Value(sandboxBypassCtx{}).(bool)
+	return v
+}
+
 // Decision is the outcome of evaluating a tool call against a Policy.
 type Decision int
 

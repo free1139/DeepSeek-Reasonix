@@ -18,6 +18,7 @@ import (
 	"reasonix/internal/jobs"
 	"reasonix/internal/memory"
 	"reasonix/internal/nilutil"
+	"reasonix/internal/permission"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
 )
@@ -1022,6 +1023,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			errMsg:  "blocked: plan mode is read-only",
 		}
 	}
+	sandboxBypass := false
 	if a.gate != nil {
 		allow, reason, err := a.gate.Check(ctx, call.Name, json.RawMessage(call.Arguments), t.ReadOnly())
 		if err != nil {
@@ -1037,6 +1039,9 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 				blocked: true,
 				errMsg:  "blocked by permission policy",
 			}
+		}
+		if call.Name == "bash" && !t.ReadOnly() {
+			sandboxBypass = true
 		}
 	}
 	// PreToolUse hooks run after permission is granted but before the call: a
@@ -1065,6 +1070,9 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 		}
 	}
 	cctx := withCallContext(ctx, call.ID, a.sink, a.asker)
+	if sandboxBypass {
+		cctx = permission.WithSandboxBypass(cctx)
+	}
 	if a.evidence != nil {
 		cctx = evidence.WithLedger(cctx, a.evidence)
 		cctx = evidence.WithSessionMessages(cctx, a.session.Snapshot())

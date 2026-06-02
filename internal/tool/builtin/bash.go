@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"reasonix/internal/jobs"
+	"reasonix/internal/permission"
 	"reasonix/internal/sandbox"
 	"reasonix/internal/tool"
 )
@@ -129,8 +130,15 @@ func (b bash) Execute(ctx context.Context, args json.RawMessage) (string, error)
 			"conditional chaining, or issue the commands as separate calls")
 	}
 
-	// Wrap in the OS sandbox when configured; otherwise argv is just the shell.
-	argv, _ := sandbox.Command(b.sb, sh, p.Command)
+	// Wrap in the OS sandbox when configured. When the permission layer
+	// explicitly authorized this call the sandbox is unnecessary — the user
+	// has taken responsibility, and bypassing lets the command write wherever
+	// it needs to (Go's GOCACHE outside the project, etc.).
+	sb := b.sb
+	if permission.SandboxBypass(ctx) {
+		sb.Mode = "off"
+	}
+	argv, _ := sandbox.Command(sb, sh, p.Command)
 	cmdEnv := bashCommandEnv(ctx)
 
 	if p.RunInBackground {
