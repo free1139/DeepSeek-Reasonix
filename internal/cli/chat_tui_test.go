@@ -1136,7 +1136,7 @@ func TestQueueIndicatorHiddenWhenIdle(t *testing.T) {
 }
 
 // TestViewAltScreenFillsHeight proves the switch to alt-screen: View requests
-// the alt buffer + mouse, and the frame is exactly the terminal height (the
+// the alt buffer, and the frame is exactly the terminal height (the
 // transcript viewport pads to fill above the pinned bottom region).
 func TestViewAltScreenFillsHeight(t *testing.T) {
 	ctrl := control.New(control.Options{})
@@ -1147,9 +1147,6 @@ func TestViewAltScreenFillsHeight(t *testing.T) {
 
 	if !v.AltScreen {
 		t.Error("View must request alt-screen so resize repaints the whole grid")
-	}
-	if v.MouseMode != tea.MouseModeCellMotion {
-		t.Error("View must enable mouse so the wheel scrolls the transcript")
 	}
 	if lines := strings.Count(v.Content, "\n") + 1; lines != 24 {
 		t.Errorf("alt-screen frame = %d lines, want 24 (full terminal height)", lines)
@@ -1192,9 +1189,9 @@ func TestTranscriptTailFollow(t *testing.T) {
 		t.Fatal("new output while pinned should keep the viewport at the bottom")
 	}
 
-	cur = adv(cur, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	cur = adv(cur, tea.KeyPressMsg{Key: tea.KeyCtrlUp})
 	if cur.viewport.AtBottom() {
-		t.Fatal("wheel-up should break the bottom pin")
+		t.Fatal("ctrl+up should break the bottom pin")
 	}
 
 	cur = adv(cur, notice)

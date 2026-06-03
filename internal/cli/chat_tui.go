@@ -425,6 +425,38 @@ type clipboardPasteMsg struct {
 	err  error
 }
 
+func inputStyles() textarea.Styles {
+	lightDark := lipgloss.LightDark(true)
+
+	var s textarea.Styles
+	s.Focused = textarea.StyleState{
+		Base:             lipgloss.NewStyle(),
+		CursorLine:       lipgloss.NewStyle().Background(lightDark(lipgloss.Color("255"), lipgloss.Color("0"))),
+		CursorLineNumber: lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("240"), lipgloss.Color("240"))),
+		EndOfBuffer:      lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("254"), lipgloss.Color("0"))),
+		LineNumber:       lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("249"), lipgloss.Color("7"))),
+		Placeholder:      lipgloss.NewStyle().Foreground(lipgloss.Color("0")),
+		Prompt:           lipgloss.NewStyle().Foreground(lipgloss.Color("7")),
+		Text:             lipgloss.NewStyle(),
+	}
+	s.Blurred = textarea.StyleState{
+		Base:             lipgloss.NewStyle(),
+		CursorLine:       lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("245"), lipgloss.Color("7"))),
+		CursorLineNumber: lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("249"), lipgloss.Color("7"))),
+		EndOfBuffer:      lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("254"), lipgloss.Color("0"))),
+		LineNumber:       lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("249"), lipgloss.Color("7"))),
+		Placeholder:      lipgloss.NewStyle().Foreground(lipgloss.Color("240")),
+		Prompt:           lipgloss.NewStyle().Foreground(lipgloss.Color("7")),
+		Text:             lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("245"), lipgloss.Color("7"))),
+	}
+	s.Cursor = textarea.CursorStyle{
+		Color: lipgloss.Color("7"),
+		Shape: tea.CursorBlock,
+		Blink: true,
+	}
+	return s
+}
+
 // newChatTUI assembles the initial model. The controller has already been wired
 // with an event sink that feeds eventCh; the TUI issues commands to it and
 // renders the events it emits. Label, history, host, and commands are read from
@@ -2260,7 +2292,7 @@ func (m chatTUI) View() tea.View {
 	}
 	v := tea.NewView(mainArea + "\n" + strings.Join(parts, "\n"))
 	v.AltScreen = true
-	v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript
+	// v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript
 	// Anchor the real terminal cursor at the textarea's insertion point only when
 	// the composer is visible. input.Cursor() is relative to the textarea; offset
 	// by the viewport height + rows above + the box's top border row (+1 column
