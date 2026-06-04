@@ -425,38 +425,6 @@ type clipboardPasteMsg struct {
 	err  error
 }
 
-func inputStyles() textarea.Styles {
-	lightDark := lipgloss.LightDark(true)
-
-	var s textarea.Styles
-	s.Focused = textarea.StyleState{
-		Base:             lipgloss.NewStyle(),
-		CursorLine:       lipgloss.NewStyle().Background(lightDark(lipgloss.Color("255"), lipgloss.Color("0"))),
-		CursorLineNumber: lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("240"), lipgloss.Color("240"))),
-		EndOfBuffer:      lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("254"), lipgloss.Color("0"))),
-		LineNumber:       lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("249"), lipgloss.Color("7"))),
-		Placeholder:      lipgloss.NewStyle().Foreground(lipgloss.Color("0")),
-		Prompt:           lipgloss.NewStyle().Foreground(lipgloss.Color("7")),
-		Text:             lipgloss.NewStyle(),
-	}
-	s.Blurred = textarea.StyleState{
-		Base:             lipgloss.NewStyle(),
-		CursorLine:       lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("245"), lipgloss.Color("7"))),
-		CursorLineNumber: lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("249"), lipgloss.Color("7"))),
-		EndOfBuffer:      lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("254"), lipgloss.Color("0"))),
-		LineNumber:       lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("249"), lipgloss.Color("7"))),
-		Placeholder:      lipgloss.NewStyle().Foreground(lipgloss.Color("240")),
-		Prompt:           lipgloss.NewStyle().Foreground(lipgloss.Color("7")),
-		Text:             lipgloss.NewStyle().Foreground(lightDark(lipgloss.Color("245"), lipgloss.Color("7"))),
-	}
-	s.Cursor = textarea.CursorStyle{
-		Color: lipgloss.Color("7"),
-		Shape: tea.CursorBlock,
-		Blink: true,
-	}
-	return s
-}
-
 // newChatTUI assembles the initial model. The controller has already been wired
 // with an event sink that feeds eventCh; the TUI issues commands to it and
 // renders the events it emits. Label, history, host, and commands are read from
@@ -464,7 +432,6 @@ func inputStyles() textarea.Styles {
 func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Event, termW int) chatTUI {
 	ti := textarea.New()
 	configureChatTextarea(&ti)
-
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = themeStyle(activeCLITheme.accent)
@@ -517,7 +484,8 @@ func configureChatTextarea(ti *textarea.Model) {
 	ti.SetVirtualCursor(false)
 	// Plain Enter submits (the chatTUI handler intercepts it), so the textarea's
 	// own InsertNewline binding moves to Alt+Enter / Ctrl+J / Shift+Enter.
-	ti.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("alt+enter", "ctrl+j", "shift+enter"))
+	//ti.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("alt+enter", "ctrl+j", "shift+enter"))
+	ti.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("alt+enter", "shift+enter")) // fix by free1139
 	ti.Focus()
 }
 
