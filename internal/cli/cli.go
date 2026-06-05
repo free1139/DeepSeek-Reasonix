@@ -379,6 +379,32 @@ func chatREPL(args []string) int {
 		configureCLIThemeWithStyle(cfg.UITheme(), cfg.UIThemeStyle())
 	}
 
+	// Resolve the session directory. If the project directory isn't initialized
+	// for local session storage, prompt the user to do so (n exits).
+	cwd, _ := os.Getwd()
+	sessionDir := config.ResolveSessionDir(cwd)
+	if !config.IsProjectInitialized(cwd) {
+		if !isInteractive() {
+			fmt.Fprintln(os.Stderr, "not a terminal — run from an interactive shell or use --dir")
+			return 1
+		}
+		fmt.Printf("\nThis directory (%s) has not been initialized.\n", cwd)
+		fmt.Printf("Initialize it now? Sessions and checkpoints will be stored in .reasonix/\n")
+		fmt.Printf("[Y/n] ")
+		var answer string
+		fmt.Scanln(&answer)
+		answer = strings.TrimSpace(strings.ToLower(answer))
+		if answer != "" && answer != "y" && answer != "yes" {
+			return 0
+		}
+		if dir, err := config.InitProject(cwd); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		} else {
+			sessionDir = dir
+		}
+	}
+
 	// Decide whether we're starting fresh or resuming. --resume opens an
 	// interactive picker; --continue / -c jumps straight into the newest.
 	var resumePath string
@@ -390,7 +416,7 @@ func chatREPL(args []string) int {
 		}
 		resumePath = path
 	case *cont:
-		sessions, err := agent.ListSessions(config.SessionDir())
+		sessions, err := agent.ListSessions(sessionDir)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 			return 1

@@ -694,10 +694,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		classifier = control.NewProviderAutoPlanClassifier(classifierProv)
 	}
 
-	sessionDir := opts.SessionDir
-	if sessionDir == "" {
-		sessionDir = config.SessionDir()
-	}
+	sessionDir := config.ResolveSessionDir(root) // add init project and move global session to project sessoin
+	// sessionDir := opts.SessionDir
+	// if sessionDir == "" {
+	// 	sessionDir = config.SessionDir()
+	// }
 
 	ctrlOpts := control.Options{
 		Runner:        runner,

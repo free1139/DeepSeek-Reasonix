@@ -1599,6 +1599,48 @@ func SessionDir() string {
 	return filepath.Join(dir, "reasonix", "sessions")
 }
 
+// IsProjectInitialized reports whether root has a .reasonix convention directory,
+// signalling that the project has been set up for local session storage.
+func IsProjectInitialized(root string) bool {
+	if root == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(root, ".reasonix"))
+	return err == nil && info.IsDir()
+}
+
+// InitProject creates the project-local .reasonix directory and its sessions
+// subdirectory. It returns the project-local sessions path on success. Safe to
+// call on an already-initialized project.
+func InitProject(root string) (string, error) {
+	if root == "" {
+		return "", fmt.Errorf("project root is empty")
+	}
+	dir := filepath.Join(root, ".reasonix", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("creating .reasonix/sessions: %w", err)
+	}
+	return dir, nil
+}
+
+// ResolveSessionDir returns the project-local sessions path when root is
+// not empty and not the user's home directory. Callers should ensure
+// .reasonix/sessions/ exists before using the returned path. Falls back to
+// SessionDir when root is empty or is the home dir.
+func ResolveSessionDir(root string) string {
+	if root == "" {
+		return SessionDir()
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		p, perr := filepath.Abs(root)
+		if perr == nil && p == home {
+			return SessionDir()
+		}
+	}
+	return filepath.Join(root, ".reasonix", "sessions")
+}
+
 // CacheDir is the per-user cache root for derived/regenerable artefacts: MCP
 // handshake snapshots, plugin startup-latency telemetry. Lives beside the
 // existing dirs (UserConfigDir/reasonix/...) so the whole reasonix state tree

@@ -1189,7 +1189,7 @@ func TestTranscriptTailFollow(t *testing.T) {
 		t.Fatal("new output while pinned should keep the viewport at the bottom")
 	}
 
-	cur = adv(cur, tea.KeyPressMsg{Key: tea.KeyCtrlUp})
+	cur = adv(cur, tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModCtrl})
 	if cur.viewport.AtBottom() {
 		t.Fatal("ctrl+up should break the bottom pin")
 	}
