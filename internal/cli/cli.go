@@ -67,6 +67,7 @@ func Run(args []string, version string) int {
 	case "run":
 		return runAgent(rest)
 	case "chat", "code": // "code" is the v0.x name for the interactive session
+		configureCLIThemeFromConfigForTTYOutput()
 		return chatREPL(rest)
 	case "serve":
 		return runServe(rest)
