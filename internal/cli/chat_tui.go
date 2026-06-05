@@ -810,10 +810,16 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "pgdown":
 			m.viewport.PageDown()
 			return m, finalize(m, cmds)
-		case "ctrl+home":
+		case "ctrl+k":
+			m.viewport.ScrollUp(3)
+			return m, finalize(m, cmds)
+		case "ctrl+j":
+			m.viewport.ScrollDown(3)
+			return m, finalize(m, cmds)
+		case "ctrl+home", "ctrl+alt+k":
 			m.viewport.GotoTop()
 			return m, finalize(m, cmds)
-		case "ctrl+end":
+		case "ctrl+end", "ctrl+alt+j":
 			m.viewport.GotoBottom()
 			return m, finalize(m, cmds)
 		case "ctrl+z":
@@ -2260,7 +2266,7 @@ func (m chatTUI) View() tea.View {
 	}
 	v := tea.NewView(mainArea + "\n" + strings.Join(parts, "\n"))
 	v.AltScreen = true
-	// v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript
+	//v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript
 	// Anchor the real terminal cursor at the textarea's insertion point only when
 	// the composer is visible. input.Cursor() is relative to the textarea; offset
 	// by the viewport height + rows above + the box's top border row (+1 column
