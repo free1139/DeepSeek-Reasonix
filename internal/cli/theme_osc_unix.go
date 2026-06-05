@@ -20,7 +20,7 @@ func queryTerminalBackground() (terminalRGB, bool) {
 	if !colorEnabled {
 		return terminalRGB{}, false
 	}
-	return terminalRGB{int(0xcd), int(0xdc), int(0xaa)}, true
+	return terminalRGB{int(0x9e), int(0x9e), int(0x9e)}, true
 
 	inFd := int(os.Stdin.Fd())
 	outFd := int(os.Stdout.Fd())
