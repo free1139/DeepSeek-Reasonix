@@ -38,6 +38,7 @@ import (
 	"reasonix/internal/hook"
 	"reasonix/internal/i18n"
 	"reasonix/internal/jobs"
+	"reasonix/internal/lsp"
 	"reasonix/internal/memory"
 	"reasonix/internal/nilutil"
 	"reasonix/internal/permission"
@@ -76,6 +77,9 @@ type Controller struct {
 	classifier    autoPlanClassifier
 	startedOnce   bool                             // guards the one-shot SessionStart hook on first turn
 	onRemember    func(rule string) RememberResult // set via Options; invoked when user picks "always allow"
+
+	// f275ea01 (feat: 显示 MCP/LSP 服务状态信息)
+	lspManager *lsp.Manager // LSP server manager; nil when LSP is disabled
 
 	// balanceURL/balanceKey target the active provider's optional wallet-balance
 	// endpoint (empty when the provider declares none). Captured at build so a
@@ -221,6 +225,10 @@ type Options struct {
 	Hooks         *hook.Runner
 	Memory        *memory.Set
 	Cleanup       func()
+
+	// (feat: 显示 MCP/LSP 服务状态信息)
+	LSPManager *lsp.Manager // LSP server manager; nil when LSP is disabled
+
 	// BalanceURL/BalanceKey wire the active provider's optional wallet-balance
 	// endpoint and bearer key; empty when the provider declares no balance_url.
 	BalanceURL    string
@@ -289,6 +297,9 @@ func New(opts Options) *Controller {
 		approvals:        map[string]pendingApproval{},
 		asks:             map[string]chan []event.AskAnswer{},
 		granted:          map[string]bool{},
+
+		// (feat: 在显示 MCP/LSP 服务状态信息)
+		lspManager: opts.LSPManager,
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -1828,6 +1839,10 @@ func (c *Controller) Balance(ctx context.Context) (*billing.Balance, error) {
 // Host returns the running MCP host (nil when no plugins), for frontends that
 // list servers / resolve MCP prompts.
 func (c *Controller) Host() *plugin.Host { return c.host }
+
+// LSPManager returns the lazily-spawned language-server manager (nil when LSP is
+// disabled in config). Status UIs read RunningServers() from it directly.
+func (c *Controller) LSPManager() *lsp.Manager { return c.lspManager }
 
 // Commands returns the loaded custom slash commands.
 func (c *Controller) Commands() []command.Command { return c.commands }

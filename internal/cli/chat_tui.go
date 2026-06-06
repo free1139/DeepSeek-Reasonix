@@ -2131,7 +2131,7 @@ func (m chatTUI) View() tea.View {
 	case m.ctrl.AutoApproveTools():
 		status = "  " + modeTag + " · " + i18n.M.ChatStatusYoloIdle + " " + dim("("+i18n.M.ChatStatusCycleHint+")")
 	default:
-		status = "  " + modeTag + " · " + i18n.M.ChatStatusIdle + " " + dim("("+i18n.M.ChatStatusCycleHint+")")
+		status = "  " + modeTag + " · " + i18n.M.ChatStatusIdle + " " + dim("("+i18n.M.ChatStatusCycleHint+")") + m.mcpLSPTag()
 	}
 	if et := m.effortTag(); et != "" {
 		status += " · " + et
@@ -2139,6 +2139,7 @@ func (m chatTUI) View() tea.View {
 	if gt := m.gitTag(boxW - visibleWidth(status) - visibleWidth(" · ")); gt != "" {
 		status += " · " + gt
 	}
+
 	// The spinning "thinking…" indicator is its own line ABOVE the input box (shown
 	// only while a turn runs); the status/data rows stay below. This mirrors Claude
 	// Code: live progress over the composer, shortcuts + stats under it.
@@ -2389,6 +2390,50 @@ func (m chatTUI) jobsTag() string {
 		return ""
 	}
 	return dim(fmt.Sprintf("⚙ %d", n))
+}
+
+// mcpLSPTag returns the live MCP/LSP status for the idle status line. Each
+// connected service shows its name (capped at 2 per category to keep the status
+// line compact); any remaining count is shown as "+N". Failures get a ✘ marker.
+func (m chatTUI) mcpLSPTag() string {
+	var parts []string
+	if m.host != nil {
+		servers := m.host.Servers()
+		failures := m.host.Failures()
+		if n := len(servers); n > 0 {
+			tag := "MCP "
+			switch {
+			case n == 1:
+				tag += servers[0].Name
+			case n == 2:
+				tag += servers[0].Name + "·" + servers[1].Name
+			default:
+				tag += servers[0].Name + "·" + servers[1].Name + fmt.Sprintf(" +%d", n-2)
+			}
+			parts = append(parts, tag)
+		}
+		if n := len(failures); n > 0 {
+			parts = append(parts, fmt.Sprintf("✘%d", n))
+		}
+	}
+	if lsp := m.ctrl.LSPManager(); lsp != nil {
+		if names := lsp.RunningServerNames(); len(names) > 0 {
+			tag := "LSP "
+			switch {
+			case len(names) == 1:
+				tag += names[0]
+			case len(names) == 2:
+				tag += names[0] + "·" + names[1]
+			default:
+				tag += names[0] + "·" + names[1] + fmt.Sprintf(" +%d", len(names)-2)
+			}
+			parts = append(parts, tag)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return dim(" · " + strings.Join(parts, " "))
 }
 
 func (m chatTUI) modelTag() string {

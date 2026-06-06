@@ -368,8 +368,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// registering them is cheap even when no server is installed (a query then
 	// returns an install hint). The manager is session-scoped; chain its shutdown
 	// into the controller's cleanup so servers stop with the session, not the turn.
+	var lspMgr *lsp.Manager
 	if cfg.LSP.Enabled {
-		lspMgr := lsp.NewManager(root, LSPSpecs(cfg.LSP))
+		lspMgr = lsp.NewManager(root, LSPSpecs(cfg.LSP))
 		for _, t := range lsp.Tools(lspMgr) {
 			reg.Add(t)
 		}
@@ -709,6 +710,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		SystemPrompt:  sysPrompt,
 		SessionDir:    sessionDir,
 		Host:          pluginHost,
+		LSPManager:    lspMgr,
 		Commands:      cmds,
 		Skills:        skills,
 		AllSkills:     allSkills,

@@ -74,6 +74,30 @@ func (m *Manager) Close() {
 	m.cancel()
 }
 
+// RunningServers returns the number of lazily-started LSP clients that are
+// currently alive, keyed by language (e.g. "go", "python"). The count is
+// defensive: it only reports servers that completed their init handshake
+// and are past the COLD_START phase, so a still-starting server isn't
+// double-counted as ready. Use this for status-line readouts.
+func (m *Manager) RunningServers() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.clients)
+}
+
+// RunningServerNames returns the language keys of started LSP servers (e.g.
+// ["go", "python"]), sorted for stable status-line display.
+func (m *Manager) RunningServerNames() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := make([]string, 0, len(m.clients))
+	for lang := range m.clients {
+		names = append(names, lang)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // DefaultSpecs maps a language key to its conventional server. Commands are tried
 // on PATH; nothing here ships with reasonix. Extensions drive file routing, so a
 // user can override any entry or add a new language entirely from config.
