@@ -1474,9 +1474,16 @@ func (m chatTUI) hideComposer() bool {
 }
 
 // transcriptHeight is the row budget left for the transcript viewport once the
-// pinned bottom region is accounted for (at least one row).
+// pinned bottom region is accounted for (at least one row). Also accounts for
+// the top MCP/LSP header and separator line when present, so they don't overlap.
 func (m chatTUI) transcriptHeight() int {
-	if h := m.height - m.bottomRows(); h > 1 {
+	// Subtract the top header/separator rows if present
+	topRows := 0
+	if tag := m.mcpLSPTag(); tag != "" {
+		topRows = 2 // header row + separator line
+	}
+	h := m.height - m.bottomRows() - topRows
+	if h > 1 {
 		return h
 	}
 	return 1
@@ -2131,7 +2138,7 @@ func (m chatTUI) View() tea.View {
 	case m.ctrl.AutoApproveTools():
 		status = "  " + modeTag + " · " + i18n.M.ChatStatusYoloIdle + " " + dim("("+i18n.M.ChatStatusCycleHint+")")
 	default:
-		status = "  " + modeTag + " · " + i18n.M.ChatStatusIdle + " " + dim("("+i18n.M.ChatStatusCycleHint+")") + m.mcpLSPTag()
+		status = "  " + modeTag + " · " + i18n.M.ChatStatusIdle + " " + dim("("+i18n.M.ChatStatusCycleHint+")") // no LSP tag, shown in window header instead
 	}
 	if et := m.effortTag(); et != "" {
 		status += " · " + et
@@ -2246,36 +2253,46 @@ func (m chatTUI) View() tea.View {
 	}
 	parts = append(parts, statusBlockStyle.Width(boxW).MaxWidth(boxW).Render(statusBlock))
 
-	if m.nativeScrollback {
-		v := tea.NewView(strings.Join(parts, "\n"))
-		if !hideComposer {
-			if cur := m.input.Cursor(); cur != nil {
-				cur.X += 1
-				cur.Y += rowsAboveBox + 1
-				v.Cursor = cur
-			}
-		}
-		return v
+	// Full-screen frame: row 0 = MCP/LSP header, row 1 = separator line, then
+	// the transcript viewport (alt-screen grid), then the pinned bottom region.
+	// The header is fixed outside the viewport so ctrl+j/k scrolling doesn't affect it.
+	header := ""
+	separator := ""
+	if tag := m.mcpLSPTag(); tag != "" {
+		// Header style: use the same accent color as the input box border for visual unity
+		inputBoxAccent := activeCLITheme.accent
+		header = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color(inputBoxAccent.hex)).
+			Width(boxW).Render(tag)
+		// Separator line with the same accent color theme
+		separator = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#d97757")). // match input box border
+			Width(boxW).Render(strings.Repeat("-", boxW))
 	}
+	//  end (refactor(mainArea): adjust height for top status bar and align with input box color)
 
-	// Full-screen frame: the transcript viewport on top (it pads to exactly its
-	// height), the pinned bottom region beneath. Alt-screen owns the grid, so
-	// resize repaints cleanly — no scrollback reflow, no ghost borders.
 	mainArea := m.renderTranscript()
 	if card := m.renderMainManager(); card != "" {
 		mainArea = m.renderTranscriptWithMainManager(card)
 	}
-	v := tea.NewView(mainArea + "\n" + strings.Join(parts, "\n"))
+	v := tea.NewView(header + "\n" + separator + "\n" + mainArea + "\n" + strings.Join(parts, "\n"))
 	v.AltScreen = true
 	//v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript
 	// Anchor the real terminal cursor at the textarea's insertion point only when
-	// the composer is visible. input.Cursor() is relative to the textarea; offset
-	// by the viewport height + rows above + the box's top border row (+1 column
-	// for PaddingLeft).
+	// the composer is visible. Input box position stays fixed from screen top:
+	// row 0 (header if present) + row 1 (separator if present) + viewport height
+	// + rowsAboveBox + 1 (box border). Adjust Y so cursor aligns to input box top.
 	if !hideComposer {
 		if cur := m.input.Cursor(); cur != nil {
+			topRows := 0
+			if tag := m.mcpLSPTag(); tag != "" {
+				topRows = 2 // header row + separator line
+			}
 			cur.X += 1
-			cur.Y += m.viewport.Height() + rowsAboveBox + 1
+			// Input box starts at: topRows + viewport.Height() + rowsAboveBox + 1
+			// We must add topRows to the Y offset to keep the absolute position fixed.
+			cur.Y += m.viewport.Height() + rowsAboveBox + 1 + topRows
 			v.Cursor = cur
 		}
 	}

@@ -20,13 +20,13 @@ func TestTextSinkReproducesInlineOutput(t *testing.T) {
 	s.Emit(event.Event{Kind: event.Message, Text: "Hello", Reasoning: "let me think"})
 	s.Emit(event.Event{Kind: event.Usage, Usage: &provider.Usage{
 		PromptTokens: 1000, CompletionTokens: 200, TotalTokens: 1200,
-		CacheHitTokens: 900, CacheMissTokens: 100,
+		CacheHitTokens: 900, CacheMissTokens: 100, FinishReason: "length",
 	}})
 	s.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{Name: "read_file", Args: `{"path":"a"}`}})
 	s.Emit(event.Event{Kind: event.ToolResult, Tool: event.Tool{Name: "read_file", Output: "contents"}})
 	s.Emit(event.Event{Kind: event.ToolResult, Tool: event.Tool{Name: "bash", Err: "blocked by permission policy"}})
 	s.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "tool output truncated: 5 of 100 bytes elided"})
-	s.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "response truncated: hit max output tokens"})
+	s.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "response truncated: hit max output tokens (200 tokens)"})
 
 	want := "\x1b[2m  ▎ thinking\x1b[0m\n" + // reasoning header
 		"Hello" + // answer delta
@@ -36,7 +36,7 @@ func TestTextSinkReproducesInlineOutput(t *testing.T) {
 		// successful read_file result is silent
 		"  ⊘ bash blocked by permission policy\n" + // blocked result
 		"  · tool output truncated: 5 of 100 bytes elided\n" + // info notice
-		"  ! response truncated: hit max output tokens\n" // warn notice
+		"  ! response truncated: hit max output tokens (200 tokens)\n" // warn notice
 
 	if got := b.String(); got != want {
 		t.Errorf("TextSink output mismatch:\n got: %q\nwant: %q", got, want)

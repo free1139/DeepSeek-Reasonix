@@ -1320,7 +1320,7 @@ func finishReasonMessage(u *provider.Usage) (string, bool) {
 	}
 	switch u.FinishReason {
 	case "length":
-		return "response truncated: hit max output tokens", true
+		return fmt.Sprintf("response truncated: hit max output tokens (%d tokens)", u.CompletionTokens), true
 	case "content_filter":
 		return "response blocked by content filter", true
 	case "repetition_truncation":
