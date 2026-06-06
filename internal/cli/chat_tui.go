@@ -2433,18 +2433,20 @@ func (m chatTUI) mcpLSPTag() string {
 			parts = append(parts, fmt.Sprintf("✘%d", n))
 		}
 	}
-	if lsp := m.ctrl.LSPManager(); lsp != nil {
-		if names := lsp.RunningServerNames(); len(names) > 0 {
-			tag := "LSP "
-			switch {
-			case len(names) == 1:
-				tag += names[0]
-			case len(names) == 2:
-				tag += names[0] + "·" + names[1]
-			default:
-				tag += names[0] + "·" + names[1] + fmt.Sprintf(" +%d", len(names)-2)
+	if m.ctrl != nil {
+		if lsp := m.ctrl.LSPManager(); lsp != nil {
+			if names := lsp.RunningServerNames(); len(names) > 0 {
+				tag := "LSP "
+				switch {
+				case len(names) == 1:
+					tag += names[0]
+				case len(names) == 2:
+					tag += names[0] + "·" + names[1]
+				default:
+					tag += names[0] + "·" + names[1] + fmt.Sprintf(" +%d", len(names)-2)
+				}
+				parts = append(parts, tag)
 			}
-			parts = append(parts, tag)
 		}
 	}
 	if len(parts) == 0 {
