@@ -2412,6 +2412,8 @@ func (m chatTUI) jobsTag() string {
 // mcpLSPTag returns the live MCP/LSP status for the idle status line. Each
 // connected service shows its name (capped at 2 per category to keep the status
 // line compact); any remaining count is shown as "+N". Failures get a ✘ marker.
+// When LSP servers are configured but not yet running their names appear dimmed
+// so the user can always see the LSP landscape.
 func (m chatTUI) mcpLSPTag() string {
 	var parts []string
 	if m.host != nil {
@@ -2435,16 +2437,36 @@ func (m chatTUI) mcpLSPTag() string {
 	}
 	if m.ctrl != nil {
 		if lsp := m.ctrl.LSPManager(); lsp != nil {
-			if names := lsp.RunningServerNames(); len(names) > 0 {
-				tag := "LSP "
-				switch {
-				case len(names) == 1:
-					tag += names[0]
-				case len(names) == 2:
-					tag += names[0] + "·" + names[1]
-				default:
-					tag += names[0] + "·" + names[1] + fmt.Sprintf(" +%d", len(names)-2)
+			configured := lsp.ConfiguredLanguages()
+			running := lsp.RunningServerNames()
+			// Build a boolean set of running languages for O(1) lookup.
+			runningSet := make(map[string]bool, len(running))
+			for _, lang := range running {
+				runningSet[lang] = true
+			}
+			// Render each configured language: normal (running) or dimmed (awaiting).
+			tag := "LSP "
+			shown := 0
+			overflow := 0
+			for _, lang := range configured {
+				if shown < 2 {
+					if shown > 0 {
+						tag += "·"
+					}
+					if runningSet[lang] {
+						tag += lang
+					} else {
+						tag += dim(lang)
+					}
+					shown++
+				} else {
+					overflow++
 				}
+			}
+			if overflow > 0 {
+				tag += fmt.Sprintf(" +%d", overflow)
+			}
+			if shown > 0 {
 				parts = append(parts, tag)
 			}
 		}

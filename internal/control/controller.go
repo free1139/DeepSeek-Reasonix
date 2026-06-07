@@ -310,6 +310,24 @@ func New(opts Options) *Controller {
 			}
 		})
 		c.executor.SetMemoryQueue(c)
+		// Post-edit hook: when a Go file is written, run gopls diagnostics
+		// and append the results so the model sees compiler/linter feedback
+		// (misspellings, unused imports, etc.) inline with the edit result.
+		c.executor.SetPostEditHook(func(ch diff.Change, result string) string {
+			if c.lspManager == nil {
+				return result
+			}
+			if !strings.HasSuffix(ch.Path, ".go") {
+				return result
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			diags, err := c.lspManager.Diagnostics(ctx, ch.Path)
+			if err != nil || diags == "" {
+				return result
+			}
+			return result + "\n\n" + diags
+		})
 	}
 	return c
 }

@@ -98,6 +98,21 @@ func (m *Manager) RunningServerNames() []string {
 	return names
 }
 
+// ConfiguredLanguages returns the language keys this manager is configured to
+// serve (e.g. ["go", "python"]), sorted. Unlike RunningServerNames this
+// includes servers that haven't been requested yet; the UI uses it to always
+// show the configured LSP landscape even when no file has been opened yet.
+func (m *Manager) ConfiguredLanguages() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := make([]string, 0, len(m.specs))
+	for lang := range m.specs {
+		names = append(names, lang)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // DefaultSpecs maps a language key to its conventional server. Commands are tried
 // on PATH; nothing here ships with reasonix. Extensions drive file routing, so a
 // user can override any entry or add a new language entirely from config.
