@@ -174,6 +174,10 @@ type chatTUI struct {
 	wrappedLines []string // transcript wrapped to viewport width (rendered each frame)
 	viewport     viewport.Model
 	sel          selection
+	// forceScrollBottom forces the viewport to scroll to the bottom after the next
+	// Update. Set when the user submits a message (Enter) or starts a new session
+	// (/new), so the new content is visible even if the user had scrolled up.
+	forceScrollBottom bool
 	// autoScroll drives edge-drag scrolling: -1 up, +1 down, 0 off. dragX is the
 	// column the drag is held at, so the ticker can extend the selection head.
 	autoScroll int
@@ -656,8 +660,9 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wrapped := wrapTranscript(strings.Join(cm.transcript, "\n"), contentW)
 		cm.viewport.SetContent(wrapped)
 		cm.wrappedLines = strings.Split(wrapped, "\n")
-		if wasAtBottom {
+		if wasAtBottom || cm.forceScrollBottom {
 			cm.viewport.GotoBottom() // tail-follow: stay pinned to newest output
+			cm.forceScrollBottom = false
 		}
 	}
 	cm.transcriptDirty = false
@@ -1138,6 +1143,10 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			sentLine := m.expandPastedBlocks(line)
 			m.input.Reset()
+
+			// Force scroll to bottom on any user-initiated turn (normal submit or
+			// @-references); the user is actively engaging, not browsing history.
+			m.forceScrollBottom = true
 
 			// @references (local files / MCP resources, including inline image
 			// attachments) are resolved off the event loop by the controller; the turn
@@ -3287,6 +3296,9 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 		// Native scrollback keeps the old transcript; mark the fork with a fresh banner.
 		m.resetFreshContextView(false)
 		m.notice(i18n.M.SlashNewDone)
+
+		m.forceScrollBottom = true // (feat: force scroll to bottom after new message or /new command)
+
 	case "/clear":
 		m.echoLocalCommand(input)
 		m.clearConfirm = &clearConfirm{confirm: 1}
