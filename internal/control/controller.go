@@ -1279,6 +1279,158 @@ func (c *Controller) maybeSessionStart(ctx context.Context) {
 	c.hooks.SessionStart(ctx)
 }
 
+// checkSessionContext runs on the first user turn when the session is fresh: it
+// lists saved sessions whose preview matches the current input and asks the user
+// whether to resume one instead. Returns (true, nil) when the user chose to
+// switch away — the caller should skip the current turn.
+func (c *Controller) checkSessionContext(ctx context.Context, input string) (bool, error) {
+	// Only on a truly fresh session: no user content yet.
+	if c.executor == nil || c.executor.Session().HasContent() {
+		return false, nil
+	}
+	// Check if the input looks like a slash command — skip those.
+	if len(input) > 0 && input[0] == '/' {
+		return false, nil
+	}
+	dir := c.sessionDir
+	if dir == "" {
+		return false, nil
+	}
+	sessions, err := agent.ListSessions(dir)
+	if err != nil || len(sessions) == 0 {
+		return false, nil // no saved sessions to compare
+	}
+	// Find sessions whose preview shares keywords with the user input.
+	inputKeywords := extractKeywords(input)
+	var matches []agent.SessionInfo
+	const maxMatches = 3
+	for _, s := range sessions {
+		previewKeywords := extractKeywords(s.Preview)
+		titleKeywords := extractKeywords(s.TopicTitle)
+		if keywordOverlap(inputKeywords, previewKeywords, titleKeywords) && len(matches) < maxMatches {
+			matches = append(matches, s)
+		}
+	}
+	if len(matches) == 0 {
+		return false, nil
+	}
+	// Build ask options: one per match plus "start fresh".
+	qs := []event.AskQuestion{{
+		ID:     "q1",
+		Header: "会话上下文",
+		Prompt: "检测到您的问题与之前的会话有相似之处。是否要切换到已有的会话以保留上下文？",
+		Options: []event.AskOption{
+			{Label: "开始新会话", Description: "忽略之前会话，用新会话继续"},
+		},
+		Multi: false,
+	}}
+	for _, m := range matches {
+		preview := m.Preview
+		if len([]rune(preview)) > 50 {
+			preview = string([]rune(preview)[:47]) + "…"
+		}
+		label := fmt.Sprintf("切换到: %s", preview)
+		desc := fmt.Sprintf("%d 轮对话 · %s", m.Turns, m.ModTime.Local().Format("01-02 15:04"))
+		if m.TopicTitle != "" {
+			label = fmt.Sprintf("切换到: %s", m.TopicTitle)
+		}
+		qs[0].Options = append(qs[0].Options, event.AskOption{
+			Label:       label,
+			Description: desc,
+		})
+	}
+	answers, err := c.Ask(ctx, qs)
+	if err != nil {
+		return false, nil // ctx cancelled or no interactive user — proceed silently
+	}
+	if len(answers) == 0 || len(answers[0].Selected) == 0 {
+		return false, nil
+	}
+	choice := answers[0].Selected[0]
+	if choice == "开始新会话" {
+		return false, nil
+	}
+	// User chose to switch — find the selected session and resume it.
+	idx := -1
+	for i, m := range matches {
+		label := m.Preview
+		if len([]rune(label)) > 50 {
+			label = string([]rune(label)[:47]) + "…"
+		}
+		if m.TopicTitle != "" {
+			label = m.TopicTitle
+		}
+		if choice == fmt.Sprintf("切换到: %s", label) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return false, nil
+	}
+	target := matches[idx]
+	loaded, err := agent.LoadSession(target.Path)
+	if err != nil {
+		return false, nil // fall through — start fresh
+	}
+	_ = c.Snapshot()
+	c.Resume(loaded, target.Path)
+	// Emit a session-switched event so the frontend knows to re-render.
+	c.sink.Emit(event.Event{
+		Kind: event.SessionSwitched,
+		Text: fmt.Sprintf("Switched to session: %s (%d turns, last active %s)",
+			target.Path, target.Turns, target.ModTime.Local().Format("01-02 15:04")),
+	})
+	return true, nil
+}
+
+// extractKeywords returns the set of meaningful words from s.
+func extractKeywords(s string) map[string]int {
+	words := strings.Fields(s)
+	out := make(map[string]int, len(words))
+	for _, w := range words {
+		w = strings.Trim(w, "，。！？、；：「」【】《》.,!?;:\"'()[]{}")
+		if len(w) <= 1 {
+			continue
+		}
+		// Skip very common stop words.
+		w = strings.ToLower(w)
+		switch w {
+		case "the", "a", "an", "is", "are", "was", "were", "be", "been",
+			"being", "have", "has", "had", "do", "does", "did", "will",
+			"would", "could", "should", "may", "might", "shall", "can",
+			"to", "of", "in", "for", "on", "with", "at", "by", "from",
+			"as", "into", "about", "than", "that", "this", "these",
+			"those", "it", "its", "and", "or", "not", "no", "but",
+			"如果", "的", "了", "在", "是", "我", "有", "和", "就", "不",
+			"人", "都", "一", "一个", "上", "也", "很", "到", "说", "要",
+			"去", "你", "会", "着", "没有", "看", "好", "自己", "这":
+			continue
+		}
+		out[w]++
+	}
+	return out
+}
+
+// keywordOverlap returns true when the user's input keywords overlap significantly
+// with session preview or title keywords.
+func keywordOverlap(input, preview, title map[string]int) bool {
+	if len(input) == 0 {
+		return false
+	}
+	// Count how many input keywords appear in the session's text.
+	matches := 0
+	for w := range input {
+		if _, ok := preview[w]; ok {
+			matches++
+		} else if _, ok := title[w]; ok {
+			matches++
+		}
+	}
+	// At least 2 keywords match OR >30% of input keywords match.
+	return matches >= 2 || (len(input) > 0 && matches*100/len(input) >= 30)
+}
+
 // NewSession snapshots the current conversation, rotates to a fresh file, and
 // resets the executor to a clean session carrying the same system prompt. It
 // ends the old session and starts the new one for lifecycle hooks.

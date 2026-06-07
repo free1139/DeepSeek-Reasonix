@@ -3228,6 +3228,10 @@ func (m *chatTUI) ingestEvent(e event.Event) {
 		}
 		m.refreshMCPManager()
 
+	case event.SessionSwitched:
+		m.finalizeStreamed()
+		m.replayActiveBranch("会话切换 — 已载入之前的对话")
+
 	case event.TurnDone:
 		// The turn settled — freeze anything still streaming, surface a real error,
 		// and gate a plan-mode proposal on the user's approval. Autosave already

@@ -203,6 +203,14 @@ func builtinSkills() []Skill {
 			RunAs:       RunInline,
 		},
 		{
+			Name:        "session-context",
+			Description: "Check if a new conversation overlaps an existing saved session and offer to resume it instead — saves re-stating context. Inlined — runs in the parent loop. Also invoked automatically on first turn.",
+			Body:        builtinSessionContextBody,
+			Scope:       ScopeBuiltin,
+			Path:        "(builtin)",
+			RunAs:       RunInline,
+		},
+		{
 			Name:         "explore",
 			Description:  "Explore the codebase in an isolated subagent — wide-net read-only investigation that returns one distilled answer. Best for: 'find all places that...', 'how does X work across the project', 'survey the code for Y'.",
 			Body:         builtinExploreBody,
