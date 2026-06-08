@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -153,6 +154,10 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 	}
 	resp, err := provider.SendWithRetry(ctx, c.http, c.name, c.keyEnv, newReq)
 	if err != nil {
+		var apiErr *provider.APIError
+		if errors.As(err, &apiErr) && apiErr.Status == 400 {
+			return nil, fmt.Errorf("%w\n\nrequest body:\n%s", err, string(body))
+		}
 		return nil, err
 	}
 
@@ -213,8 +218,8 @@ func (c *client) buildRequest(req provider.Request) anthRequest {
 			}
 			for _, tc := range m.ToolCalls {
 				input := json.RawMessage(tc.Arguments)
-				if len(input) == 0 {
-					input = json.RawMessage("{}") // input is required, even when empty
+				if !json.Valid(input) || len(input) == 0 {
+					input = json.RawMessage("{}") // input is required, even when empty or invalid
 				}
 				blocks = append(blocks, contentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})
 			}

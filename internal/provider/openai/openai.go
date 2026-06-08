@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -181,6 +182,10 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 	}
 	resp, err := provider.SendWithRetry(ctx, c.http, c.name, c.keyEnv, newReq)
 	if err != nil {
+		var apiErr *provider.APIError
+		if errors.As(err, &apiErr) && apiErr.Status == 400 {
+			return nil, fmt.Errorf("%w\n\nrequest body:\n%s", err, string(body))
+		}
 		return nil, err
 	}
 
@@ -247,7 +252,11 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		for _, tc := range m.ToolCalls {
 			wire := chatToolCall{ID: tc.ID, Type: "function"}
 			wire.Function.Name = tc.Name
-			wire.Function.Arguments = tc.Arguments
+			if !json.Valid([]byte(tc.Arguments)) {
+				wire.Function.Arguments = "{}"
+			} else {
+				wire.Function.Arguments = tc.Arguments
+			}
 			cm.ToolCalls = append(cm.ToolCalls, wire)
 		}
 		if m.Role != provider.RoleAssistant || len(cm.ToolCalls) == 0 || m.Content != "" {
