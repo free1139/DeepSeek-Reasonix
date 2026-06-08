@@ -2419,17 +2419,16 @@ func (m chatTUI) jobsTag() string {
 	return dim(fmt.Sprintf("⚙ %d", n))
 }
 
-// mcpLSPTag returns the live MCP/LSP status for the idle status line. Each
-// connected service shows its name (capped at 2 per category to keep the status
-// line compact); any remaining count is shown as "+N". Failures get a ✘ marker.
-// When LSP servers are configured but not yet running their names appear dimmed
-// so the user can always see the LSP landscape.
+// mcpLSPTag returns the MCP/LSP/Skills working output status for the top status bar.
+// Shows compact indicators: running servers with ⎿, LSP states, skills count.
 func (m chatTUI) mcpLSPTag() string {
 	var parts []string
+
 	if m.host != nil {
 		servers := m.host.Servers()
 		failures := m.host.Failures()
-		if n := len(servers); n > 0 {
+		n := len(servers)
+		if n > 0 {
 			tag := "MCP "
 			switch {
 			case n == 1:
@@ -2441,23 +2440,23 @@ func (m chatTUI) mcpLSPTag() string {
 			}
 			parts = append(parts, tag)
 		}
-		if n := len(failures); n > 0 {
-			parts = append(parts, fmt.Sprintf("✘%d", n))
+		for _, f := range failures {
+			if f.Name != "" && f.Error != "" {
+				parts = append(parts, "✘"+f.Name)
+			}
 		}
 	}
+
 	if m.ctrl != nil {
 		if lsp := m.ctrl.LSPManager(); lsp != nil {
 			configured := lsp.ConfiguredLanguages()
 			running := lsp.RunningServerNames()
-			// Build a boolean set of running languages for O(1) lookup.
 			runningSet := make(map[string]bool, len(running))
 			for _, lang := range running {
 				runningSet[lang] = true
 			}
-			// Render each configured language: normal (running) or dimmed (awaiting).
 			tag := "LSP "
 			shown := 0
-			overflow := 0
 			for _, lang := range configured {
 				if shown < 2 {
 					if shown > 0 {
@@ -2466,25 +2465,45 @@ func (m chatTUI) mcpLSPTag() string {
 					if runningSet[lang] {
 						tag += lang
 					} else {
-						tag += dim(lang)
+						tag += lang
 					}
 					shown++
-				} else {
-					overflow++
 				}
-			}
-			if overflow > 0 {
-				tag += fmt.Sprintf(" +%d", overflow)
 			}
 			if shown > 0 {
 				parts = append(parts, tag)
 			}
 		}
 	}
+
+	if m.ctrl != nil {
+		skills := m.ctrl.Skills()
+		var active []string
+		for _, sk := range skills {
+			if sk.Scope == skill.ScopeGlobal || sk.Scope == skill.ScopeCustom {
+				active = append(active, sk.Name)
+			}
+		}
+		if len(active) > 0 {
+			tag := "Skills"
+			for i, name := range active {
+				if i >= 2 {
+					tag += fmt.Sprintf(" +%d", len(active)-2)
+					break
+				}
+				if i > 0 {
+					tag += "·"
+				}
+				tag += name
+			}
+			parts = append(parts, tag)
+		}
+	}
+
 	if len(parts) == 0 {
 		return ""
 	}
-	return dim(" · " + strings.Join(parts, " "))
+	return strings.Join(parts, " · ")
 }
 
 func (m chatTUI) modelTag() string {
