@@ -83,12 +83,6 @@ const (
 	// event — or TurnDone — clears. Appended last to keep the Kind values before
 	// it wire-stable.
 	Retrying
-	// SessionSwitched is emitted when the controller automatically replaced the
-	// current session with a previously-saved one (via the session-context check).
-	// Text carries the switched-from session path; Meta["to"] carries the new path.
-	// The frontend should re-render the conversation history so the user sees the
-	// loaded session.
-	SessionSwitched
 )
 
 // Level classifies a Notice so sinks can style or filter it.
