@@ -138,6 +138,9 @@ type client struct {
 	minimax     bool          // true for api.minimaxi.com — emits MiniMax-M3's thinking knob instead of reasoning_effort
 	effort      string        // reasoning_effort for OpenAI; thinking.type for MiniMax; "" = auto/provider default
 	idleTimeout time.Duration // SSE stall watchdog window; defaultStreamIdleTimeout unless a test overrides
+
+	// c1abf4d9 (auto-disable reasoning_effort/thinking for models that reject them on 400)
+	thinkingDisabled atomic.Bool
 }
 
 func (c *client) Name() string { return c.name }
@@ -160,38 +163,73 @@ var bufPool = sync.Pool{
 }
 
 func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provider.Chunk, error) {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	if err := json.NewEncoder(buf).Encode(c.buildRequest(req)); err != nil {
+	marshalBody := func() []byte {
+		buf := bufPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		_ = json.NewEncoder(buf).Encode(c.buildRequest(req))
+		body := make([]byte, buf.Len())
+		copy(body, buf.Bytes())
 		bufPool.Put(buf)
-		return nil, fmt.Errorf("%s: marshal request: %w", c.name, err)
+		return body
 	}
-	body := make([]byte, buf.Len())
-	copy(body, buf.Bytes())
-	bufPool.Put(buf)
 
-	newReq := func(ctx context.Context) (*http.Request, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+	body := marshalBody()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		newReq := func(ctx context.Context) (*http.Request, error) {
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+			if err != nil {
+				return nil, err
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+			httpReq.Header.Set("Accept", "text/event-stream")
+			return httpReq, nil
+		}
+
+		resp, err := provider.SendWithRetry(ctx, c.http, c.name, c.keyEnv, newReq)
 		if err != nil {
+			var apiErr *provider.APIError
+			if errors.As(err, &apiErr) && apiErr.Status == 400 {
+				if attempt == 0 && !c.thinkingDisabled.Load() && c.isThinkingRelatedError(apiErr) {
+					c.thinkingDisabled.Store(true)
+					body = marshalBody()
+					continue
+				}
+				return nil, fmt.Errorf("%w\n\nrequest body:\n%s", err, string(body))
+			}
 			return nil, err
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-		httpReq.Header.Set("Accept", "text/event-stream")
-		return httpReq, nil
-	}
-	resp, err := provider.SendWithRetry(ctx, c.http, c.name, c.keyEnv, newReq)
-	if err != nil {
-		var apiErr *provider.APIError
-		if errors.As(err, &apiErr) && apiErr.Status == 400 {
-			return nil, fmt.Errorf("%w\n\nrequest body:\n%s", err, string(body))
-		}
-		return nil, err
-	}
 
-	out := make(chan provider.Chunk)
-	go c.streamWithReconnect(ctx, resp, newReq, out)
-	return out, nil
+		out := make(chan provider.Chunk)
+		go c.streamWithReconnect(ctx, resp, newReq, out)
+		return out, nil
+	}
+	panic("unreachable")
+}
+
+// isThinkingRelatedError reports whether a 400 error suggests the model doesn't
+// support the reasoning_effort / thinking parameters. When true, the client
+// disables them and retries once, so models that don't support thinking work
+// without manual config changes.
+func (c *client) isThinkingRelatedError(apiErr *provider.APIError) bool {
+	body := strings.ToLower(apiErr.Body)
+	// Only relevant when we're actually sending thinking-related parameters.
+	hasEffort := c.effort != ""
+	hasThinking := c.deepseek
+	if !hasEffort && !hasThinking {
+		return false
+	}
+	// Match known patterns from Ollama, LiteLLM, and other OpenAI-compatible
+	// gateways that reject thinking parameters.
+	return strings.Contains(body, "reasoning_effort") ||
+		strings.Contains(body, "not supported") ||
+		(strings.Contains(body, "thinking") &&
+			(strings.Contains(body, "invalid") ||
+				strings.Contains(body, "unsupported") ||
+				strings.Contains(body, "unknown") ||
+				strings.Contains(body, "not support") ||
+				strings.Contains(body, "not allow")))
 }
 
 // maxStreamReconnects bounds how many times a mid-stream connection drop is
@@ -275,15 +313,15 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 	}
 
 	out := chatRequest{
-		Model:           c.model,
-		Messages:        msgs,
-		Tools:           tools,
-		Stream:          true,
-		StreamOptions:   &streamOptions{IncludeUsage: true},
-		Temperature:     req.Temperature,
-		MaxTokens:       req.MaxTokens,
-		ReasoningEffort: c.effort,
+		Model:         c.model,
+		Messages:      msgs,
+		Tools:         tools,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
+		Temperature:   req.Temperature,
+		MaxTokens:     req.MaxTokens,
 	}
+
 	switch {
 	case c.deepseek:
 		// DeepSeek's CoT is controlled by `thinking` (always on) plus
@@ -299,7 +337,16 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		}
 		out.Thinking = &thinkingMode{Type: t}
 		out.ReasoningEffort = ""
+	default:
+		// >>>>>>> c1abf4d9 (auto-disable reasoning_effort/thinking for models that reject them on 400)
+		if !c.thinkingDisabled.Load() {
+			out.ReasoningEffort = c.effort
+			if c.deepseek {
+				out.Thinking = &thinkingMode{Type: "enabled"}
+			}
+		}
 	}
+
 	return out
 }
 
