@@ -114,8 +114,9 @@ func TestTodoPanelAllPendingDoesNotClear(t *testing.T) {
 
 // TestTodoPanelAtBottomScroll proves that when the todo panel appears and the
 // viewport was tracking the bottom, it stays at the bottom after the viewport
-// shrinks. This is the real code path: todo_write tool result sets
-// transcriptDirty so SetContent re-feeds the viewport and GotoBottom fires.
+// shrinks.  This exercises the real code path: a todo_write ToolResult event
+// arrives via agentEventMsg, sets todoArgs during update(), and the Update
+// wrapper detects the height shrinkage and calls GotoBottom.
 func TestTodoPanelAtBottomScroll(t *testing.T) {
 	ctrl := control.New(control.Options{})
 	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
@@ -134,20 +135,24 @@ func TestTodoPanelAtBottomScroll(t *testing.T) {
 		t.Fatal("viewport should be at bottom after GotoBottom")
 	}
 
-	// Add a todo panel *and* mark transcript dirty (simulating the normal
-	// collapseToolOutput → transcriptDirty flow when a tool result arrives).
-	m.todoArgs = `{"todos":[{"content":"Fix parser","status":"in_progress"}]}`
-	m.transcriptDirty = true
-
-	// A second WindowSizeMsg of the same size is a safe no-op through update()
-	// that still exercises the Update wrapper's resize + re-feed logic.
-	m0, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	// Simulate the real todo_write ToolResult path: send an agent event that
+	// triggers ingestEvent, which sets todoArgs during update().  This way
+	// prevTranscriptHeight is captured *before* the panel is known and the
+	// else-if branch in the Update wrapper sees the height drop.
+	ev := event.Event{
+		Kind: event.ToolResult,
+		Tool: event.Tool{
+			ID:   "todo-test",
+			Name: "todo_write",
+			Args: `{"todos":[{"content":"Fix parser","status":"in_progress"}]}`,
+		},
+	}
+	m0, _ = m.Update(agentEventMsg(ev))
 	m = m0.(chatTUI)
 
 	if !m.viewport.AtBottom() {
-		msg := fmt.Sprintf("viewport should stay at bottom after todo panel appears (h=%d, yoff=%d, total=%d)",
-			m.viewport.Height(), m.viewport.YOffset(), m.viewport.TotalLineCount())
-		t.Fatal(msg)
+		t.Fatal(fmt.Sprintf("viewport should stay at bottom after todo panel appears (h=%d, yoff=%d, total=%d)",
+			m.viewport.Height(), m.viewport.YOffset(), m.viewport.TotalLineCount()))
 	}
 	// The YOffset must have increased to compensate for the shorter viewport.
 	total := m.viewport.TotalLineCount()

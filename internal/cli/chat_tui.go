@@ -644,6 +644,7 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	prevLines := len(m.transcript)
 	prevWidth := m.width
 	prevYOff := m.viewport.YOffset()
+	prevTranscriptHeight := m.transcriptHeight()
 
 	next, cmd := m.update(msg)
 	cm := next.(chatTUI)
@@ -664,6 +665,12 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cm.viewport.GotoBottom() // tail-follow: stay pinned to newest output
 			cm.forceScrollBottom = false
 		}
+	} else if (wasAtBottom || cm.forceScrollBottom) && cm.transcriptHeight() < prevTranscriptHeight {
+		// Viewport shrunk (e.g. a bottom panel like todo appeared) without
+		// content change.  Re-pin to bottom so the user doesn't lose sight
+		// of the latest output.
+		cm.viewport.GotoBottom()
+		cm.forceScrollBottom = false
 	}
 	cm.transcriptDirty = false
 	// Any viewport scroll (wheel, PgUp/PgDn, edge auto-scroll, or tail-follow to
