@@ -62,6 +62,8 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		raw = effortArgItems(prior, d)
 	case "/auto-plan":
 		raw = autoPlanArgItems(prior)
+	case "/audit":
+		raw = auditArgItems(prior)
 	case "/theme":
 		raw = themeArgItems(prior)
 	case "/language":
@@ -72,6 +74,17 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		return nil, from
 	}
 	return filterSlash(raw, line, from, cur), from
+}
+
+func auditArgItems(prior []string) []SlashItem {
+	if len(prior) > 1 {
+		return nil
+	}
+	return []SlashItem{
+		{Label: "auto", Insert: "auto", Hint: "normal mode — ask before tool calls"},
+		{Label: "plan", Insert: "plan", Hint: "read-only plan mode"},
+		{Label: "yolo", Insert: "yolo", Hint: "auto-approve all tool calls"},
+	}
 }
 
 func autoPlanArgItems(prior []string) []SlashItem {

@@ -234,6 +234,10 @@ type chatTUI struct {
 	// can start successfully.
 	mcpImport *mcpImportPicker
 
+	// modePicker is the interactive mode-switch overlay (/audit). Non-nil while
+	// the user browses Auto / Plan / YOLO with ↑/↓ and confirms with Enter.
+	modePicker *modePicker
+
 	// host is the running MCP servers (nil when no plugins). The TUI reads
 	// prompts (slash commands), resources (@-references), and server status
 	// (/mcp) from it.
@@ -890,6 +894,10 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.skillPick != nil {
 			return m.handleSkillPickerKey(msg)
 		}
+		// The mode picker is modal while open: keys navigate it.
+		if m.modePicker != nil {
+			return m.handleModePickerKey(msg)
+		}
 		// A pending tool approval is modal: keystrokes answer it (y/a/n, Enter,
 		// Esc) rather than reaching the input.
 		if m.pendingApproval != nil {
@@ -1446,6 +1454,7 @@ func (m chatTUI) bottomRows() int {
 		m.renderApprovalBanner(),
 		m.renderChooser(),
 		m.renderRewind(),
+		m.renderModePicker(),
 		m.renderMCPImport(),
 		m.renderResumePicker(),
 		m.renderCompletion(),
@@ -1485,6 +1494,11 @@ func (m chatTUI) bottomRows() int {
 // blank/bordered area at the bottom of the TUI.
 func (m chatTUI) hideComposer() bool {
 	if m.mcp != nil || m.clearConfirm != nil || m.mcpImport != nil || m.skillPick != nil || m.resumePick != nil || m.rewind != nil || m.pendingApproval != nil {
+		return true
+	}
+
+	// 246e4d46 (add /audit auto/plan/yoto)
+	if m.modePicker != nil {
 		return true
 	}
 	return m.chooser != nil && !m.chooser.typing
@@ -2227,6 +2241,10 @@ func (m chatTUI) View() tea.View {
 		rowsAboveBox += strings.Count(card, "\n") + 1
 	}
 	if card := m.renderRewind(); card != "" {
+		parts = append(parts, card)
+		rowsAboveBox += strings.Count(card, "\n") + 1
+	}
+	if card := m.renderModePicker(); card != "" {
 		parts = append(parts, card)
 		rowsAboveBox += strings.Count(card, "\n") + 1
 	}
@@ -3346,6 +3364,14 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 	case "/auto-plan":
 		m.echoLocalCommand(input)
 		m.runAutoPlanCommand(input)
+	case "/audit":
+		m.echoLocalCommand(input)
+		args := tokenizeArgs(input)
+		if len(args) >= 2 {
+			m.setModeByArg(args[1])
+		} else {
+			m.openModePicker()
+		}
 	case "/rewind":
 		m.echoLocalCommand(input)
 		m.openRewind()
