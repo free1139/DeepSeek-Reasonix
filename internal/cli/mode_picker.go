@@ -75,6 +75,22 @@ func (m *chatTUI) applyModePickerSelection() {
 	m.setModeByArg(modeLabels[sel])
 }
 
+// parseAuditLine checks whether the trimmed input is "/audit auto", "/audit plan"
+// or "/audit yolo" and returns the full line and the mode argument. Returns
+// ("", "") for anything else (including bare "/audit").
+func (m *chatTUI) parseAuditLine() (line, arg string) {
+	line = strings.TrimSpace(m.input.Value())
+	args := tokenizeArgs(line)
+	if len(args) != 2 || args[0] != "/audit" {
+		return "", ""
+	}
+	arg = strings.ToLower(args[1])
+	if arg != "auto" && arg != "plan" && arg != "yolo" {
+		return "", ""
+	}
+	return line, arg
+}
+
 // setModeByArg switches the TUI mode based on the argument (auto/plan/yolo),
 // case-insensitive. Unknown values are ignored silently.
 func (m *chatTUI) setModeByArg(arg string) {

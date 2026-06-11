@@ -926,11 +926,19 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.completion = completion{}
 					break // fall through to regular Enter
 				}
-				// For /audit descend, accept the selection and submit in one Enter.
+				// For /audit descend, accept the selection and dispatch immediately
+				// (like shift+tab), without falling through to the Enter handler
+				// which would queue the message during tuiRunning.
 				if msg.String() == "enter" && m.auditCompletionActive() {
 					m.acceptCompletion()
 					m.completion = completion{}
-					break // fall through to regular Enter to submit
+					m.rememberSubmittedInput(m.input.Value())
+					if _, arg := m.parseAuditLine(); arg != "" {
+						m.input.Reset()
+						m.pastedBlocks = nil
+						m.setModeByArg(arg)
+					}
+					return m, finalize(m, cmds)
 				}
 				m.acceptCompletion()
 				return m, nil
@@ -1068,6 +1076,15 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cycleMode()
 			return m, nil
 		case "enter":
+			// /audit auto|plan|yolo is a local mode switch, execute immediately
+			// regardless of turn state (like shift+tab).
+			if auditLine, auditArg := m.parseAuditLine(); auditArg != "" {
+				m.rememberSubmittedInput(auditLine)
+				m.input.Reset()
+				m.pastedBlocks = nil
+				m.setModeByArg(auditArg)
+				return m, finalize(m, cmds)
+			}
 			if m.state == tuiRunning {
 				line := strings.TrimSpace(m.input.Value())
 				if line == "" {
