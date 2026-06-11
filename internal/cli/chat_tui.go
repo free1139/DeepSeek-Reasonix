@@ -926,6 +926,12 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.completion = completion{}
 					break // fall through to regular Enter
 				}
+				// For /audit descend, accept the selection and submit in one Enter.
+				if msg.String() == "enter" && m.auditCompletionActive() {
+					m.acceptCompletion()
+					m.completion = completion{}
+					break // fall through to regular Enter to submit
+				}
 				m.acceptCompletion()
 				return m, nil
 			case "esc":
@@ -3365,11 +3371,12 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 		m.echoLocalCommand(input)
 		m.runAutoPlanCommand(input)
 	case "/audit":
-		m.echoLocalCommand(input)
 		args := tokenizeArgs(input)
 		if len(args) >= 2 {
+			// Silent mode switch: no echo to transcript, just switch.
 			m.setModeByArg(args[1])
 		} else {
+			m.echoLocalCommand(input)
 			m.openModePicker()
 		}
 	case "/rewind":

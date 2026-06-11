@@ -462,6 +462,20 @@ func (m *chatTUI) moveCompletion(delta int) {
 	m.completion.sel = ((m.completion.sel+delta)%n + n) % n
 }
 
+// auditCompletionActive reports whether the open completion menu is showing
+// the sub-options for /audit (auto/plan/yolo), so pressing Enter can accept the
+// selection and submit the command in a single keystroke.
+func (m *chatTUI) auditCompletionActive() bool {
+	if !m.completion.active || m.completion.sel >= len(m.completion.items) {
+		return false
+	}
+	rf := m.completion.replaceFrom
+	if rf <= 0 || rf > len(m.input.Value()) {
+		return false
+	}
+	return strings.TrimSpace(m.input.Value()[:rf]) == "/audit"
+}
+
 func (m *chatTUI) completionExactLabel() bool {
 	if !m.completion.active || m.completion.sel >= len(m.completion.items) {
 		return false

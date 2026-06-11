@@ -86,6 +86,7 @@ func (m *chatTUI) setModeByArg(arg string) {
 		m.notice("mode: Auto")
 	case "plan":
 		m.planMode = true
+		m.ctrl.ClearGoal()
 		m.ctrl.SetPlanMode(true)
 		m.ctrl.SetBypass(false)
 		m.notice("mode: Plan")
