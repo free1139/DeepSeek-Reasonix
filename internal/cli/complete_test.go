@@ -36,12 +36,12 @@ func TestSlashCompletionFilterAndAccept(t *testing.T) {
 	if !m.completion.active || m.completion.kind != compSlash {
 		t.Fatalf("typing /co should open the slash menu: %+v", m.completion)
 	}
-	// /compact and /continue both match "/co" prefix.
-	if len(m.completion.items) != 2 || !hasLabel(m.completion.items, "/compact") || !hasLabel(m.completion.items, "/continue") {
-		t.Fatalf("filter = %v, want /compact and /continue", labels(m.completion.items))
+	// /compact matches "/co" prefix.
+	if len(m.completion.items) != 1 || !hasLabel(m.completion.items, "/compact") {
+		t.Fatalf("filter = %v, want /compact", labels(m.completion.items))
 	}
 
-	// Accept the first item (/compact comes before /continue alphabetically).
+	// Accept the item.
 	m.acceptCompletion()
 	if got := m.input.Value(); got != "/compact " {
 		t.Errorf("accept first should fill /compact, got %q", got)
@@ -59,20 +59,6 @@ func TestSlashCompletionIncludesCustomCommands(t *testing.T) {
 
 	if !hasLabel(m.completion.items, "/review") {
 		t.Errorf("custom command should appear in completion: %v", labels(m.completion.items))
-	}
-}
-
-func TestSlashCompletionIncludesContinue(t *testing.T) {
-	m := newTestChatTUI()
-	m.input.SetValue("/cont")
-	m.updateCompletion()
-
-	if !hasLabel(m.completion.items, "/continue") {
-		t.Errorf("/continue should appear in completion: %v", labels(m.completion.items))
-	}
-	m.acceptCompletion()
-	if got := m.input.Value(); got != "/continue" {
-		t.Errorf("accept should fill the input, got %q", got)
 	}
 }
 

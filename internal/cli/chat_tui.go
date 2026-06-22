@@ -3756,9 +3756,6 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 		return tea.Quit
 	case "/forget":
 		m.forgetMemory(strings.TrimSpace(strings.TrimPrefix(input, cmd)))
-	case "/continue":
-		m.echoLocalCommand(input)
-		return m.startTurn("继续", input, input)
 	default:
 		// A custom command wins over a skill of the same name; both resolve to a turn.
 		if sent, ok := m.ctrl.CustomCommand(input); ok {

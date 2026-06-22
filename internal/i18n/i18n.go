@@ -178,7 +178,6 @@ type Messages struct {
 	CmdAutoPlan     string // /auto-plan
 	CmdReasonLang   string // /reasoning-language
 	CmdHelp         string // /help
-	CmdContinue     string // /continue
 	CmdTodo         string // /todo
 	CmdQuit         string // /quit (also accepts /exit as hidden alias)
 	ArgSkillList    string // /skills list

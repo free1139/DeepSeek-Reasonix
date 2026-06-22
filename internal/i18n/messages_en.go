@@ -189,7 +189,6 @@ var English = Messages{
 	CmdAutoPlan:     "configure automatic plan mode",
 	CmdReasonLang:   "set visible reasoning language",
 	CmdHelp:         "list commands",
-	CmdContinue:     "resume a truncated response",
 	CmdTodo:         "dismiss the task list",
 	CmdQuit:         "exit the session",
 	ArgSkillList:    "list skills",

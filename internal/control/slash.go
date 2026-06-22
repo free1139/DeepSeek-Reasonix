@@ -77,8 +77,6 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		raw = themeArgItems(prior)
 	case "/language":
 		raw = languageArgItems(prior)
-	case "/continue":
-		raw = continueArgItems(prior)
 	default:
 		return nil, from
 	}
@@ -103,15 +101,6 @@ func autoPlanArgItems(prior []string) []SlashItem {
 	return []SlashItem{
 		{Label: "off", Insert: "off", Hint: "manual plan mode only"},
 		{Label: "on", Insert: "on", Hint: "auto-enter plan mode for complex tasks"},
-	}
-}
-
-func continueArgItems(prior []string) []SlashItem {
-	if len(prior) > 1 {
-		return nil
-	}
-	return []SlashItem{
-		{Label: "continue", Insert: "continue", Hint: "继续生成被截断的响应"},
 	}
 }
 

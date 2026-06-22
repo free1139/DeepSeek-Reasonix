@@ -87,7 +87,6 @@ func (m *chatTUI) slashItems() []compItem {
 		{label: "/theme", insert: "/theme ", hint: i18n.M.CmdTheme, descend: true},
 		{label: "/language", insert: "/language ", hint: i18n.M.CmdLanguage, descend: true},
 		{label: "/help", insert: "/help ", hint: i18n.M.CmdHelp},
-		{label: "/continue", insert: "/continue", hint: i18n.M.CmdContinue},
 		{label: "/memory", insert: "/memory ", hint: i18n.M.CmdMemory},
 		{label: "/migrate", insert: "/migrate", hint: i18n.M.CmdMigrate},
 		{label: "/goal", insert: "/goal ", hint: i18n.M.CmdGoal},

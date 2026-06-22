@@ -190,7 +190,6 @@ var Chinese = Messages{
 	CmdAutoPlan:     "配置自动计划模式",
 	CmdReasonLang:   "设置可见思考语言",
 	CmdHelp:         "查看命令列表",
-	CmdContinue:     "继续被截断的响应",
 	CmdTodo:         "清除任务清单",
 	CmdQuit:         "退出会话",
 	ArgSkillList:    "列出 skills",

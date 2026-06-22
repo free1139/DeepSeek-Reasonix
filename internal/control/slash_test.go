@@ -166,18 +166,6 @@ func TestSlashArgItems(t *testing.T) {
 	if items, _ := SlashArgItems("/skills li", data); len(items) != 0 {
 		t.Errorf("/skills li should not offer hidden list suggestion; got %v", labelsOf(items))
 	}
-	// /continue command: empty args yields one item, extra args hide it
-	items, from = SlashArgItems("/continue ", data)
-	if !has(items, "continue") {
-		t.Errorf("/continue  should offer 'continue'; got %v", labelsOf(items))
-	}
-	if len(items) != 1 {
-		t.Errorf("/continue  yielded %d items, expected 1; got %v", len(items), labelsOf(items))
-	}
-	// multi-arg hide: "/continue extra" -> nil
-	if items, _ := SlashArgItems("/continue extra", data); len(items) != 0 {
-		t.Errorf("/continue extra (multi-arg) should yield nothing; got %v", labelsOf(items))
-	}
 }
 
 func TestMemoryListTextIncludesSavedMemories(t *testing.T) {
