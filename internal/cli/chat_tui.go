@@ -2427,7 +2427,7 @@ func (m chatTUI) View() tea.View {
 			Width(boxW).Render(tag)
 		// Separator line with the same accent color theme
 		separator = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#d97757")). // match input box border
+			Foreground(lipgloss.Color(inputBoxAccent.hex)).
 			Width(boxW).Render(strings.Repeat("─", boxW))
 	}
 	//  end (refactor(mainArea): adjust height for top status bar and align with input box color)
