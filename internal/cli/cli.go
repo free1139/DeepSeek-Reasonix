@@ -486,7 +486,7 @@ func chatREPL(args []string) int {
 		}
 		resumePath = path
 	case *cont:
-		sessions, err := agent.ListSessions(resolveCLISessionDir())
+		sessions, err := agent.ListSessions(config.ResolveSessionDir(cwd))
 		if err != nil || len(sessions) == 0 {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 			return 1
