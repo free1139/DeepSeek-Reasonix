@@ -101,24 +101,6 @@ func verifyTodoCompletionTransitions(ctx context.Context, todos []todoItem) erro
 	if !hasBaseline || len(missing) == 0 {
 		return nil
 	}
-
-	// Cross-turn fallback: the per-turn ledger was reset between turns, so
-	// complete_step receipts from a prior turn won't appear in it. Scan the
-	// full conversation history for a matching complete_step call.
-	if msgs, ok := evidence.SessionMessagesFromContext(ctx); ok {
-		evTodos := toEvidenceTodos(todos)
-		var stillMissing []evidence.TodoStepMatch
-		for _, m := range missing {
-			if !evidence.HasCompleteStepInSession(msgs, m.Index, evTodos) {
-				stillMissing = append(stillMissing, m)
-			}
-		}
-		missing = stillMissing
-		if len(missing) == 0 {
-			return nil
-		}
-	}
-
 	const hint = "; sign each finished item off with complete_step first, then re-send this todo_write"
 	if len(missing) == 1 {
 		m := missing[0]

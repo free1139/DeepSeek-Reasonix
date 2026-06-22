@@ -55,6 +55,9 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 	prior := strings.Fields(line[:from]) // committed tokens, including the command word
 	var raw []SlashItem
 	switch line[:cmdEnd] {
+	case "/audit":
+		raw = auditArgItems(prior)
+
 	case "/mcp":
 		raw = mcpArgItems(prior, cur, d)
 	case "/model":
@@ -69,8 +72,6 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		raw = effortArgItems(prior, d)
 	case "/auto-plan":
 		raw = autoPlanArgItems(prior)
-	case "/audit":
-		raw = auditArgItems(prior)
 	case "/reasoning-language":
 		raw = reasoningLanguageArgItems(prior)
 	case "/theme":

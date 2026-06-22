@@ -796,53 +796,6 @@ func stepTextContains(a, b string) bool {
 	return strings.Contains(a, b) || strings.Contains(b, a)
 }
 
-// HasCompleteStepInSession checks if a complete_step call with a step
-// matching the given todo index exists and was EXECUTED (has a tool result
-// message) in the session's conversation history. This enables cross-turn
-// verification: a complete_step from a prior turn authorizes a completion in
-// the current turn when the per-turn ledger has been reset and no longer holds
-// the receipt. Only calls that have a corresponding tool result are counted,
-// so unexecuted calls in the current turn's assistant message are ignored.
-func HasCompleteStepInSession(msgs []provider.Message, index int, current []TodoItem) bool {
-	// Collect executed tool call IDs (those with a tool result message).
-	executed := make(map[string]bool)
-	for _, msg := range msgs {
-		if msg.Role == provider.RoleTool {
-			executed[msg.ToolCallID] = true
-		}
-	}
-
-	for _, msg := range msgs {
-		for _, tc := range msg.ToolCalls {
-			if tc.Name != "complete_step" || !executed[tc.ID] {
-				continue
-			}
-			var p struct {
-				Step string `json:"step"`
-			}
-			if err := json.Unmarshal([]byte(tc.Arguments), &p); err != nil {
-				continue
-			}
-			step := strings.TrimSpace(p.Step)
-			if step == "" {
-				continue
-			}
-			// Match by index (e.g. step "2" matches todo at index 2).
-			if n, ok := parseStepIndex(step); ok && n == index {
-				return true
-			}
-			// Fuzzy content match (case-insensitive, space-trimmed).
-			if index >= 1 && index <= len(current) {
-				t := current[index-1]
-				if sameStepText(step, t.Content) || sameStepText(step, t.ActiveForm) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
 func pathSet(paths []string) map[string]bool {
 	out := map[string]bool{}
 	for _, p := range paths {

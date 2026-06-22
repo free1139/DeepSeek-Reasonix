@@ -77,9 +77,11 @@ func builtinHelpItems() []compItem {
 		{label: "/verbose", hint: i18n.M.CmdVerbose},
 		{label: "/language", hint: i18n.M.CmdLanguage},
 		{label: "/auto-plan", hint: i18n.M.CmdAutoPlan},
-		{label: "/audit", hint: "switch mode (Auto/Plan/YOLO)"},
 		{label: "/reasoning-language", hint: i18n.M.CmdReasonLang},
 		{label: "/help", hint: i18n.M.CmdHelp},
+
+		// add by free1139, it can be used in some phone shell
+		{label: "/audit", hint: "switch mode (Auto/Plan/YOLO)"},
 	}
 }
 

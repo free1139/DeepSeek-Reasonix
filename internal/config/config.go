@@ -40,6 +40,9 @@ func SkillNameKey(name string) string {
 
 // Config is Reasonix's runtime configuration.
 type Config struct {
+	// add by free1139
+	Keybindings KeybindingsConfig `toml:"keybindings"`
+
 	ConfigVersion    int                 `toml:"config_version"`
 	DefaultModel     string              `toml:"default_model"`
 	Language         string              `toml:"language"` // ui/model language tag (e.g. "zh"); empty = auto-detect from $LANG / $REASONIX_LANG
@@ -58,9 +61,6 @@ type Config struct {
 	Statusline       StatuslineConfig    `toml:"statusline"`
 	LSP              LSPConfig           `toml:"lsp"`
 	Bot              BotConfig           `toml:"bot"`
-
-	// add by free1139
-	Keybindings KeybindingsConfig `toml:"keybindings"`
 
 	providerSources          map[string]providerSourceScope
 	shadowedProjectProviders []ProviderEntry

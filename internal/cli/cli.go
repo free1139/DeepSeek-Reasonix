@@ -84,8 +84,7 @@ func Run(args []string, version string) int {
 	case "run":
 		return runAgent(rest)
 	case "chat", "code": // "code" is the v0.x name for the interactive session
-		configureCLIThemeFromConfigForTTYOutput()
-		return chatREPL(rest)
+		return runInteractiveSession(rest)
 	case "serve":
 		return runServe(rest)
 	case "setup":
@@ -456,7 +455,6 @@ func chatREPL(args []string) int {
 	// Resolve the session directory. If the project directory isn't initialized
 	// for local session storage, prompt the user to do so (n exits).
 	cwd, _ := os.Getwd()
-	sessionDir := config.ResolveSessionDir(cwd)
 	if !config.IsProjectInitialized(cwd) {
 		if !isInteractive() {
 			fmt.Fprintln(os.Stderr, "not a terminal — run from an interactive shell or use --dir")
@@ -471,11 +469,9 @@ func chatREPL(args []string) int {
 		if answer != "" && answer != "y" && answer != "yes" {
 			return 0
 		}
-		if dir, err := config.InitProject(cwd); err != nil {
+		if _, err := config.InitProject(cwd); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			return 1
-		} else {
-			sessionDir = dir
 		}
 	}
 
@@ -490,12 +486,8 @@ func chatREPL(args []string) int {
 		}
 		resumePath = path
 	case *cont:
-		sessions, err := agent.ListSessions(sessionDir)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-			return 1
-		}
-		if len(sessions) == 0 {
+		sessions, err := agent.ListSessions(resolveCLISessionDir())
+		if err != nil || len(sessions) == 0 {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 			return 1
 		}

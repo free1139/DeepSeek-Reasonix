@@ -796,6 +796,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	sessionDir = config.ResolveSessionDir(root) // add init project and move global session to project sessoin
 
 	ctrlOpts := control.Options{
+		LSPManager: lspMgr,
+
 		Runner:                 runner,
 		Executor:               executor,
 		Sink:                   sink,
@@ -805,7 +807,6 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		SystemPrompt:           sysPrompt,
 		SessionDir:             sessionDir,
 		Host:                   pluginHost,
-		LSPManager:             lspMgr,
 		Commands:               cmds,
 		Skills:                 skills,
 		AllSkills:              allSkills,

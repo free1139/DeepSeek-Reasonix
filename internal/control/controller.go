@@ -58,6 +58,9 @@ var ErrTurnRunning = errors.New("turn already running")
 // Controller drives one chat session. Construct with New; drive with the command
 // methods; observe through the Sink passed in Options.
 type Controller struct {
+	// f275ea01 (feat: 显示 MCP/LSP 服务状态信息, by free1139)
+	lspManager *lsp.Manager // LSP server manager; nil when LSP is disabled
+
 	runner   agent.Runner
 	executor *agent.Agent
 	sink     event.Sink
@@ -85,9 +88,6 @@ type Controller struct {
 	classifier             autoPlanClassifier
 	startedOnce            bool                             // guards the one-shot SessionStart hook on first turn
 	onRemember             func(rule string) RememberResult // set via Options; invoked when user picks "always allow"
-
-	// f275ea01 (feat: 显示 MCP/LSP 服务状态信息)
-	lspManager *lsp.Manager // LSP server manager; nil when LSP is disabled
 
 	// balanceURL/balanceKey target the active provider's optional wallet-balance
 	// endpoint (empty when the provider declares none). Captured at build so a

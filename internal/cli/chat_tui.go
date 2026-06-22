@@ -185,10 +185,6 @@ type chatTUI struct {
 	wrappedLines []string // transcript wrapped to viewport width (rendered each frame)
 	viewport     viewport.Model
 	sel          selection
-	// forceScrollBottom forces the viewport to scroll to the bottom after the next
-	// Update. Set when the user submits a message (Enter) or starts a new session
-	// (/new), so the new content is visible even if the user had scrolled up.
-	forceScrollBottom bool
 	// autoScroll drives edge-drag scrolling: -1 up, +1 down, 0 off. dragX is the
 	// column the drag is held at, so the ticker can extend the selection head.
 	autoScroll int
@@ -697,16 +693,16 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wrapped := wrapTranscript(strings.Join(cm.transcript, "\n"), contentW)
 		cm.viewport.SetContent(wrapped)
 		cm.wrappedLines = strings.Split(wrapped, "\n")
-		if wasAtBottom || cm.forceScrollBottom {
+		if wasAtBottom || cm.forceGotoBottom {
 			cm.viewport.GotoBottom() // tail-follow: stay pinned to newest output
-			cm.forceScrollBottom = false
+			cm.forceGotoBottom = false
 		}
-	} else if (wasAtBottom || cm.forceScrollBottom) && cm.transcriptHeight() < prevTranscriptHeight {
+	} else if (wasAtBottom || cm.forceGotoBottom) && cm.transcriptHeight() < prevTranscriptHeight {
 		// Viewport shrunk (e.g. a bottom panel like todo appeared) without
 		// content change.  Re-pin to bottom so the user doesn't lose sight
 		// of the latest output.
 		cm.viewport.GotoBottom()
-		cm.forceScrollBottom = false
+		cm.forceGotoBottom = false
 	}
 	cm.transcriptDirty = false
 	// Any viewport scroll (wheel, PgUp/PgDn, edge auto-scroll, or tail-follow to
@@ -1220,7 +1216,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Force scroll to bottom on any user-initiated turn (normal submit or
 			// @-references); the user is actively engaging, not browsing history.
-			m.forceScrollBottom = true
+			m.forceGotoBottom = true
 
 			// @references (local files / MCP resources, including inline image
 			// attachments) are resolved off the event loop by the controller; the turn
@@ -1300,7 +1296,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case modelSwitchMsg:
-		m.forceScrollBottom = true
+		m.forceGotoBottom = true
 		m.modelSwitchPending = false
 		m.pendingModelSwitch = nil
 		if msg.err != nil {
@@ -2291,7 +2287,7 @@ func (m chatTUI) View() tea.View {
 	case m.ctrl.AutoApproveTools():
 		status = "  " + modeTag + " · " + i18n.M.ChatStatusYoloIdle + " " + dim("("+m.cycleHint()+")")
 	default:
-		status = "  " + modeTag + " · " + i18n.M.ChatStatusIdle + " " + dim("("+i18n.M.ChatStatusCycleHint+")") // no LSP tag, shown in window header instead
+		status = "  " + modeTag + " · " + i18n.M.ChatStatusIdle + " " + dim("("+m.cycleHint()+")")
 	}
 	if et := m.effortTag(); et != "" {
 		status += " · " + et
@@ -3631,7 +3627,7 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 		m.resetFreshContextView(false)
 		m.notice(i18n.M.SlashNewDone)
 
-		m.forceScrollBottom = true // (feat: force scroll to bottom after new message or /new command)
+		m.forceGotoBottom = true // (feat: force scroll to bottom after new message or /new command)
 
 	case "/clear":
 		m.echoLocalCommand(input)
