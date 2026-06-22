@@ -2,10 +2,13 @@ package control
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"reasonix/internal/config"
+	"reasonix/internal/hook"
 	"reasonix/internal/i18n"
+	"reasonix/internal/migration"
 	"reasonix/internal/skill"
 )
 
@@ -32,14 +35,16 @@ type ArgData struct {
 	DisconnectedMCP []string
 	ModelRefs       []string
 	CurrentModel    string
+	ProviderNames   []string
+	CurrentProvider string
 }
 
 // SlashArgItems completes the arguments of a management slash command
 // (everything after the command word). It returns the suggestions filtered by
 // the token being typed and the byte offset where that token begins, so a caller
 // replaces just that token. Only structured commands participate (/mcp /model
-// /skills /hooks /effort /auto-plan /theme /language); others yield nil. Single
-// source of truth for CLI + desktop.
+// /skills /hooks /effort /auto-plan /reasoning-language /theme /language);
+// others yield nil. Single source of truth for CLI + desktop.
 func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 	cmdEnd := strings.IndexAny(line, " \t")
 	if cmdEnd < 0 {
@@ -54,6 +59,8 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		raw = mcpArgItems(prior, cur, d)
 	case "/model":
 		raw = modelArgItems(prior, d)
+	case "/provider":
+		raw = providerArgItems(prior, d)
 	case "/skill", "/skills":
 		raw = skillArgItems(prior, d)
 	case "/hooks":
@@ -64,6 +71,8 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		raw = autoPlanArgItems(prior)
 	case "/audit":
 		raw = auditArgItems(prior)
+	case "/reasoning-language":
+		raw = reasoningLanguageArgItems(prior)
 	case "/theme":
 		raw = themeArgItems(prior)
 	case "/language":
@@ -103,6 +112,17 @@ func continueArgItems(prior []string) []SlashItem {
 	}
 	return []SlashItem{
 		{Label: "continue", Insert: "continue", Hint: "继续生成被截断的响应"},
+	}
+}
+
+func reasoningLanguageArgItems(prior []string) []SlashItem {
+	if len(prior) > 1 {
+		return nil
+	}
+	return []SlashItem{
+		{Label: "auto", Insert: "auto", Hint: "follow conversation language"},
+		{Label: "zh", Insert: "zh", Hint: "prefer Chinese visible reasoning"},
+		{Label: "en", Insert: "en", Hint: "prefer English visible reasoning"},
 	}
 }
 
@@ -193,7 +213,7 @@ func mcpArgItems(prior []string, cur string, d ArgData) []SlashItem {
 			{Label: "show", Insert: "show ", Hint: "show MCP server details", Descend: true},
 			{Label: "tools", Insert: "tools ", Hint: "show MCP server tools", Descend: true},
 			{Label: "remove", Insert: "remove ", Hint: i18n.M.ArgMcpRemove, Descend: true},
-			{Label: "import", Insert: "import", Hint: "import Codex-enabled servers from cc-switch"},
+			{Label: "import", Insert: "import", Hint: "import MCP servers from cc-switch"},
 		}
 	}
 	switch prior[1] {
@@ -267,6 +287,21 @@ func modelArgItems(prior []string, d ArgData) []SlashItem {
 	return items
 }
 
+func providerArgItems(prior []string, d ArgData) []SlashItem {
+	if len(prior) != 1 { // the single name arg is already placed
+		return nil
+	}
+	var items []SlashItem
+	for _, name := range d.ProviderNames {
+		hint := ""
+		if name == d.CurrentProvider {
+			hint = i18n.M.ArgModelCurrent
+		}
+		items = append(items, SlashItem{Label: name, Insert: name, Hint: hint})
+	}
+	return items
+}
+
 func skillArgItems(prior []string, d ArgData) []SlashItem {
 	if len(prior) <= 1 {
 		return []SlashItem{
@@ -332,11 +367,11 @@ func filterSlash(items []SlashItem, line string, from int, cur string) []SlashIt
 	return out
 }
 
-// managementNotice handles the read-only management slash commands on the Submit
-// path (used by the desktop and HTTP frontends, which route raw input through
-// Submit — the chat TUI has its own richer handlers). It emits a Notice listing
-// and reports whether it handled the verb. Skills and custom commands are NOT
-// here — those resolve to a turn in Submit.
+// managementNotice handles management slash commands on the Submit path (used by
+// the desktop and HTTP frontends, which route raw input through Submit — the chat
+// TUI has its own richer handlers). It emits Notice output and reports whether
+// it handled the verb. Skills and custom commands are NOT here — those resolve
+// to a turn in Submit.
 func (c *Controller) managementNotice(trimmed string) bool {
 	fields := strings.Fields(trimmed)
 	if len(fields) == 0 {
@@ -345,8 +380,16 @@ func (c *Controller) managementNotice(trimmed string) bool {
 	switch fields[0] {
 	case "/model":
 		c.notice(c.modelListText())
+	case "/provider":
+		if len(fields) >= 2 {
+			c.notice(c.providerSwitchText(fields[1]))
+		} else {
+			c.notice(c.providerListText())
+		}
 	case "/memory":
 		c.notice(c.memoryListText())
+	case "/migrate", "/migration":
+		migration.RunLegacyRescue(c.sink)
 	case "/skill", "/skills":
 		sub := ""
 		if len(fields) >= 2 {
@@ -365,7 +408,26 @@ func (c *Controller) managementNotice(trimmed string) bool {
 		}
 		c.notice(c.skillListText())
 	case "/hooks":
-		c.notice(c.hookListText())
+		sub := ""
+		if len(fields) >= 2 {
+			sub = strings.ToLower(fields[1])
+		}
+		switch sub {
+		case "", "list", "ls":
+			c.notice(c.hookListText())
+		case "trust":
+			root := c.cpRoot
+			if root == "" {
+				root, _ = os.Getwd()
+			}
+			if err := hook.Trust(root, ""); err != nil {
+				c.notice("hooks trust: " + err.Error())
+			} else {
+				c.notice("trusted this project's hooks — restart Reasonix to load them")
+			}
+		default:
+			c.notice("unknown /hooks subcommand " + fields[1] + " — try: /hooks, /hooks trust")
+		}
 	case "/mcp":
 		if len(fields) >= 3 && fields[1] == "connect" {
 			n, err := c.ConnectConfiguredMCPServer(fields[2])
@@ -403,16 +465,116 @@ func (c *Controller) modelListText() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+func (c *Controller) providerListText() string {
+	cfg, err := config.Load()
+	if err != nil {
+		return "provider: " + err.Error()
+	}
+	curProvider := ""
+	if parts := strings.Fields(c.label); len(parts) > 0 {
+		curProvider = parts[0]
+	}
+	var b strings.Builder
+	b.WriteString(i18n.M.ProviderListHeader + "\n")
+	for i := range cfg.Providers {
+		p := &cfg.Providers[i]
+		if !p.Configured() {
+			continue
+		}
+		models := p.ChatModelList()
+		if len(models) == 0 {
+			models = p.ModelList()
+		}
+		suffix := ""
+		if p.Name == curProvider {
+			suffix = " (active)"
+		}
+		fmt.Fprintf(&b, "  %s — %d models%s\n", p.Name, len(models), suffix)
+	}
+	b.WriteString("switch with /provider <name>")
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (c *Controller) providerSwitchText(name string) string {
+	cfg, err := config.Load()
+	if err != nil {
+		return "provider: " + err.Error()
+	}
+	for i := range cfg.Providers {
+		p := &cfg.Providers[i]
+		if p.Name == name && p.Configured() {
+			models := p.ChatModelList()
+			if len(models) == 0 {
+				models = p.ModelList()
+			}
+			if len(models) == 0 {
+				return fmt.Sprintf(i18n.M.ProviderNoModelsFmt, name)
+			}
+			if len(models) == 1 {
+				return fmt.Sprintf("provider %s — model: %s (switch with /model %s/%s)", name, models[0], name, models[0])
+			}
+			var b strings.Builder
+			fmt.Fprintf(&b, "provider %s — %d models:\n", name, len(models))
+			for _, m := range models {
+				fmt.Fprintf(&b, "  %s/%s\n", name, m)
+			}
+			fmt.Fprintf(&b, "switch with /model %s/<model>", name)
+			return strings.TrimRight(b.String(), "\n")
+		}
+	}
+	return fmt.Sprintf(i18n.M.ProviderUnknownFmt, name)
+}
+
 func (c *Controller) memoryListText() string {
-	if c.mem == nil || len(c.mem.Docs) == 0 {
+	if c.mem == nil {
+		return i18n.M.ListMemoryNone
+	}
+	saved := c.mem.Store.List()
+	archived := c.mem.Store.ListArchived()
+	if len(c.mem.Docs) == 0 && len(saved) == 0 && len(archived) == 0 {
 		return i18n.M.ListMemoryNone
 	}
 	var b strings.Builder
-	b.WriteString(i18n.M.ListMemoryHeader + "\n")
-	for _, d := range c.mem.Docs {
-		fmt.Fprintf(&b, "  (%s) %s\n", d.Scope, d.Path)
+	if len(c.mem.Docs) > 0 {
+		b.WriteString(i18n.M.ListMemoryHeader + "\n")
+		for _, d := range c.mem.Docs {
+			fmt.Fprintf(&b, "  (%s) %s\n", d.Scope, d.Path)
+		}
+	}
+	if len(saved) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(i18n.M.ListMemorySaved + "\n")
+		for _, m := range saved {
+			fmt.Fprintf(&b, "  [%s](%s.md) (%s) %s\n", memoryDisplayTitle(m.Title, m.Name), m.Name, m.Type, memoryOneLine(m.Description))
+		}
+	}
+	if len(archived) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(i18n.M.ListMemoryArchived + "\n")
+		for _, m := range archived {
+			when := ""
+			if !m.ArchivedAt.IsZero() {
+				when = " — " + m.ArchivedAt.Format("2006-01-02 15:04:05Z")
+			}
+			fmt.Fprintf(&b, "  [%s](%s) (%s)%s %s\n", memoryDisplayTitle(m.Title, m.Name), m.Path, m.Type, when, memoryOneLine(m.Description))
+		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func memoryDisplayTitle(title, name string) string {
+	if t := memoryOneLine(title); t != "" {
+		return t
+	}
+	return strings.ReplaceAll(name, "-", " ")
+}
+
+func memoryOneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func (c *Controller) skillListText() string {

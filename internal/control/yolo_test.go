@@ -104,7 +104,7 @@ func TestRequestApprovalHonorsAutoApproveTools(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file")
+		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file", nil)
 		if err != nil {
 			t.Errorf("requestApproval: %v", err)
 		}
@@ -122,6 +122,59 @@ func TestRequestApprovalHonorsAutoApproveTools(t *testing.T) {
 
 	if approvalRequested {
 		t.Fatal("tool auto-approval must not emit an ApprovalRequest event")
+	}
+}
+
+func TestMemoryApprovalIgnoresAutoApproveTools(t *testing.T) {
+	approvalRequests := make(chan event.Approval, 1)
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				approvalRequests <- e.Approval
+			}
+		}),
+	})
+	c.SetAutoApproveTools(true)
+
+	done := make(chan bool, 1)
+	errs := make(chan error, 1)
+	go func() {
+		allow, _, err := c.requestApproval(context.Background(), "remember", "", nil)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- allow
+	}()
+
+	var approval event.Approval
+	select {
+	case approval = <-approvalRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("memory approval request was not emitted under tool auto-approval")
+	}
+	if approval.Tool != "remember" {
+		t.Fatalf("approval tool = %q, want remember", approval.Tool)
+	}
+
+	select {
+	case err := <-errs:
+		t.Fatalf("requestApproval: %v", err)
+	case allow := <-done:
+		t.Fatalf("memory approval must wait for manual approval, got allow=%v", allow)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	c.Approve(approval.ID, true, true, true)
+	select {
+	case err := <-errs:
+		t.Fatalf("requestApproval: %v", err)
+	case allow := <-done:
+		if !allow {
+			t.Fatal("manual approval should allow memory write")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("memory approval stayed blocked after Approve")
 	}
 }
 
@@ -146,6 +199,18 @@ func TestToolApprovalModeAutoKeepsAskRules(t *testing.T) {
 	}
 }
 
+func TestToolApprovalModeAutoForcesMemoryAskRules(t *testing.T) {
+	c := New(Options{})
+	c.SetToolApprovalMode(ToolApprovalAuto)
+
+	gate := c.newInteractiveGate()
+	for _, toolName := range []string{"remember", "forget"} {
+		if got := gate.Policy.Decide(toolName, false, json.RawMessage(`{}`)); got != permission.Ask {
+			t.Fatalf("%s under auto mode = %v, want ask", toolName, got)
+		}
+	}
+}
+
 func TestToolApprovalModeAutoDrainsPendingFallbackApproval(t *testing.T) {
 	approvalRequests := make(chan event.Approval, 1)
 	c := New(Options{
@@ -160,7 +225,7 @@ func TestToolApprovalModeAutoDrainsPendingFallbackApproval(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file")
+		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -205,7 +270,7 @@ func TestToolApprovalModeAutoDoesNotDrainPendingExplicitAsk(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "bash", "git commit -m x")
+		allow, _, err := c.requestApproval(context.Background(), "bash", "git commit -m x", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -250,7 +315,7 @@ func TestToolApprovalModeYoloBypassesApprovalPrompts(t *testing.T) {
 	if !c.AutoApproveTools() {
 		t.Fatal("YOLO mode should satisfy legacy AutoApproveTools")
 	}
-	allow, remember, err := c.requestApproval(context.Background(), "bash", "go test ./...")
+	allow, remember, err := c.requestApproval(context.Background(), "bash", "go test ./...", nil)
 	if err != nil || !allow || remember {
 		t.Fatalf("requestApproval in YOLO = (%v,%v,%v), want allow without remember", allow, remember, err)
 	}
@@ -270,7 +335,7 @@ func TestPlanApprovalIgnoresAutoApproveTools(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), planApprovalTool, "")
+		allow, _, err := c.requestApproval(context.Background(), planApprovalTool, "", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -318,7 +383,7 @@ func TestSetAutoApproveToolsAllowsPendingApproval(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file")
+		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -362,7 +427,7 @@ func TestSetAutoApproveToolsDoesNotDrainPendingPlanApproval(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), planApprovalTool, "")
+		allow, _, err := c.requestApproval(context.Background(), planApprovalTool, "", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -404,6 +469,57 @@ func TestSetAutoApproveToolsDoesNotDrainPendingPlanApproval(t *testing.T) {
 	}
 }
 
+func TestSetAutoApproveToolsDoesNotDrainPendingMemoryApproval(t *testing.T) {
+	approvalRequests := make(chan event.Approval, 1)
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				approvalRequests <- e.Approval
+			}
+		}),
+	})
+
+	done := make(chan bool, 1)
+	errs := make(chan error, 1)
+	go func() {
+		allow, _, err := c.requestApproval(context.Background(), "forget", "", nil)
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- allow
+	}()
+
+	var approval event.Approval
+	select {
+	case approval = <-approvalRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("memory approval request was not emitted")
+	}
+
+	c.SetAutoApproveTools(true)
+
+	select {
+	case err := <-errs:
+		t.Fatalf("requestApproval: %v", err)
+	case allow := <-done:
+		t.Fatalf("SetAutoApproveTools must not auto-answer pending memory approval; got allow=%v", allow)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	c.Approve(approval.ID, true, true, true)
+	select {
+	case err := <-errs:
+		t.Fatalf("requestApproval: %v", err)
+	case allow := <-done:
+		if !allow {
+			t.Fatal("manual approval should allow memory archive")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("memory approval stayed blocked after Approve")
+	}
+}
+
 // TestSetModeYoloDrainsPendingApproval is the SetMode-path twin of the
 // SetAutoApproveTools case: applying YOLO atomically must also unblock an
 // approval already waiting.
@@ -412,7 +528,7 @@ func TestSetModeYoloDrainsPendingApproval(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() {
-		allow, _, _ := c.requestApproval(context.Background(), "multi_edit", "/tmp/file")
+		allow, _, _ := c.requestApproval(context.Background(), "multi_edit", "/tmp/file", nil)
 		done <- allow
 	}()
 

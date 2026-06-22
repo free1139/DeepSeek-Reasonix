@@ -7,7 +7,7 @@ var English = Messages{
 	WelcomeTitleFmt: "Welcome to %s",
 	NoConfigYet:     "No configuration found yet — let's set it up.",
 	StartingChatFmt: "Starting %s…",
-	SetKeyHint:      "Set your API key, then run `reasonix chat`.",
+	SetKeyHint:      "Set your API key, then run `reasonix`.",
 	ConfigLabel:     "config",
 	ModelsLabel:     "models",
 	ConfigNotFound:  "not found — using built-in defaults",
@@ -18,7 +18,7 @@ var English = Messages{
 	StepScaffold:    "scaffold reasonix.toml",
 	StepSetKey:      "set API key",
 
-	InitHint:       "Project memory (AGENTS.md) is generated in-session: run `reasonix chat`, then `/init` — the model analyzes the codebase and writes it. For configuration, use `reasonix setup`.",
+	InitHint:       "Project memory (AGENTS.md) is generated in-session: run `reasonix`, then `/init` — the model analyzes the codebase and writes it. For configuration, use `reasonix setup`.",
 	StepSetKeyHint: "run `reasonix setup`, or export DEEPSEEK_API_KEY=…",
 	StepChatDesc:   "interactive session",
 	StepRunDesc:    "one-shot task",
@@ -26,7 +26,7 @@ var English = Messages{
 
 	ChatTip:           "Context is kept across turns. Type 'exit' or Ctrl-D to quit.",
 	TurnCancelled:     "cancelled — back to prompt",
-	NoSessionToResume: "no saved session to resume — start a new one with `reasonix chat`",
+	NoSessionToResume: "no saved session to resume — start a new one with `reasonix`",
 	ResumeRequiresTTY: "--resume needs an interactive terminal; pass --continue for the most recent session",
 	PickSessionLabel:  "Resume which session?",
 
@@ -35,8 +35,12 @@ var English = Messages{
 	ResumeBadIndexFmt:   "pick a session 1–%d (run /resume to list)",
 	ResumeAlreadyActive: "already in that session",
 	ResumedTitle:        "resumed session",
-	ResumePickTitle:     "Resume a saved session",
-	ResumePickHint:      "↑/↓ move · Enter resume · Esc cancel",
+
+	RenameUsage:     "usage: /rename <new title>  or  /rename <n> <new title>",
+	RenameNoSession: "no active session to rename",
+	RenameDoneFmt:   "session renamed to %q",
+	ResumePickTitle: "Resume a saved session",
+	ResumePickHint:  "↑/↓ move · Enter resume · Esc cancel",
 
 	ChatThinking:                "thinking…",
 	ChatThoughtForFmt:           "thought for %ds",
@@ -45,7 +49,7 @@ var English = Messages{
 	ChatStatusRetryingFmt:       "%s retrying (%d/%d)… (Esc cancels)",
 	ChatStatusIdle:              "ready",
 	ChatStatusYoloIdle:          "tool approvals skipped",
-	ChatStatusCycleHint:         "shift+tab toggles plan",
+	ChatStatusCycleHint:         "shift+tab toggles plan · ctrl+y yolo",
 	ChatStatusCacheNowFmt:       "turn hit %s",
 	ChatStatusCacheAvgFmt:       "avg %s",
 	ChatStatusPlanApproval:      "Enter/y approves & executes · n/Esc keeps planning · PgUp/PgDn/Ctrl+Home/End scrolls",
@@ -69,6 +73,8 @@ var English = Messages{
 	PermissionAlreadyAllowedFmt: "permission already covered in %s: %s",
 	PermissionSaveFailedFmt:     "permission save failed for %s: %v",
 	DiffFoldedFmt:               "… +%d more lines",
+	DiffFoldEnabledFmt:          "diff folded to %d lines (/diff-fold to expand)",
+	DiffFoldDisabled:            "diff expanded — showing all lines (/diff-fold to fold)",
 
 	OutputStyleNone:    "no output styles available",
 	OutputStyleHeader:  "output styles:",
@@ -97,7 +103,7 @@ var English = Messages{
 	SlashUnavailable:   "command unavailable in this build",
 	SlashUnknown:       "unknown command",
 	SlashTodoCleared:   "task list dismissed",
-	SlashHelp:          "commands: /compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model (switch model) · /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /goal · /remember · /quit · /help · plus skills (/init, /explore, …)",
+	SlashHelp:          "commands: /compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model (switch model) · /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /migrate · /goal · /remember · /quit · /help · plus skills (/init, /explore, …)",
 
 	SkillPickerTitle:             "Skills",
 	SkillPickerAvailableFmt:      "%d available",
@@ -162,11 +168,13 @@ var English = Messages{
 	CmdBranch:       "create a conversation branch",
 	CmdSwitchBranch: "switch conversation branch",
 	CmdResume:       "resume a saved session",
+	CmdRename:       "rename a session",
 	CmdModel:        "switch model",
 	CmdMemory:       "show memory files",
+	CmdMigrate:      "retry legacy data migration",
 	CmdGoal:         "set or clear the active goal",
 	CmdRemember:     "save a memory note",
-	CmdForget:       "delete a saved memory",
+	CmdForget:       "archive a saved memory",
 	CmdMcp:          "MCP servers",
 	CmdHooks:        "manage hooks",
 	CmdPasteImage:   "paste clipboard image",
@@ -175,9 +183,11 @@ var English = Messages{
 	CmdLanguage:     "switch CLI language",
 	CmdSkill:        "manage skills",
 	CmdVerbose:      "toggle thinking text",
+	CmdDiffFold:     "toggle diff fold/expand",
 	CmdSandbox:      "show sandbox status",
 	CmdEffort:       "set reasoning effort",
 	CmdAutoPlan:     "configure automatic plan mode",
+	CmdReasonLang:   "set visible reasoning language",
 	CmdHelp:         "list commands",
 	CmdContinue:     "resume a truncated response",
 	CmdTodo:         "dismiss the task list",
@@ -207,6 +217,8 @@ var English = Messages{
 	ListModelsHeaderFmt: "models (active: %s)",
 	ListModelsHint:      "switch with the model switcher, or type /model <provider/model>",
 	ListMemoryHeader:    "memory files",
+	ListMemorySaved:     "saved memories",
+	ListMemoryArchived:  "archived memories",
 	ListMemoryNone:      "memory: none — add with “/remember <note>” or run /init to generate AGENTS.md",
 	ListSkillsHeaderFmt: "skills (%d)",
 	ListSkillsNone:      "skills: none defined — invoke a built-in like /init, or author one with install_skill",
@@ -217,11 +229,11 @@ var English = Messages{
 
 	MemoryNone:             "memory: none — add with “/remember <note>” or create REASONIX.md in the project root",
 	MemoryLoaded:           "memory loaded:",
-	MemorySavedHeader:      "  saved memories (delete with “/forget <name>”):",
+	MemorySavedHeader:      "  saved memories (archive with “/forget <name>”):",
 	MemoryStoredUnderFmt:   "  stored under %s",
 	MemoryEditHint:         "edit doc files or use “/remember <note>”; doc edits apply next session",
 	ForgetUsage:            "usage: /forget <name> — the slug shown under “saved memories” in /memory",
-	ForgetDoneFmt:          "forgot memory: %s",
+	ForgetDoneFmt:          "forgot and archived memory: %s",
 	QuickRememberEmpty:     "nothing to remember",
 	QuickRememberDoneFmt:   "remembered → %s",
 	GoalEmpty:              "goal: none — set one with /goal <objective>",
@@ -309,40 +321,76 @@ var English = Messages{
 	WriteEnvErr:               "write .env:",
 
 	ProviderErrBadRequest:          "Malformed request (HTTP 400): the request body was rejected. This is likely a bug — please report it if it persists.",
-	ProviderErrAuth:                "Authentication failed (HTTP 401): your API key is missing, wrong, or expired. Check the key in .env or run `reasonix setup`.",
+	ProviderErrAuth:                "Authentication failed (HTTP 401): your API key is missing or unset. Add it to .env or run `reasonix setup`.",
+	ProviderErrAuthRejected:        "Authentication failed (HTTP 401): the server rejected your API key. It may be wrong or expired, or the provider hit a transient auth/quota issue — retried with backoff and still failed. Try again shortly, or check the key in .env / run `reasonix setup`.",
 	ProviderErrInsufficientBalance: "Insufficient balance (HTTP 402): your account is out of credit. Top up your account, then retry.",
 	ProviderErrUnprocessable:       "Invalid parameters (HTTP 422): a request parameter was rejected. This is likely a bug — please report it if it persists.",
 	ProviderErrRateLimited:         "Rate limit reached (HTTP 429): too many requests (TPM/RPM). Retried with backoff — slow down or try again shortly.",
 	ProviderErrServer:              "Server error (HTTP 500): the provider hit an internal fault. Retried with backoff; if it keeps failing, try again later.",
 	ProviderErrServerBusy:          "Server busy (HTTP 503): the provider is overloaded. Retried with backoff; please try again shortly.",
 
-	SelectOneHint:  "(↑/↓ · Enter · q to cancel)",
-	SelectManyHint: "(↑/↓ · Space · Enter · q)",
+	SelectOneHint:  "(↑/↓ · Enter · q to cancel; / to search)",
+	SelectManyHint: "(↑/↓ · Space · Enter · q; / to search)",
+
+	SelectMoreAboveFmt: "  ↑ %d more above",
+	SelectMoreBelowFmt: "  ↓ %d more below",
+	SelectSearchHint:   "/ to search · type to filter · Esc cancel search",
+
+	CmdProvider:          "switch provider",
+	ProviderListHeader:   "providers (/provider <name> to switch)",
+	ProviderAlreadyOnFmt: "already using provider %s",
+	ProviderUnknownFmt:   "unknown provider %q",
+	ProviderPickLabel:    "Select a model from %s",
+	ProviderNoModelsFmt:  "provider %s has no configured models",
+
+	// self-update
+	UpgradeChecking:            "Checking for updates…",
+	UpgradeDevBuild:            "dev builds cannot self-update",
+	UpgradeFetchFailed:         "failed to check for updates: %v",
+	UpgradeInvalidVersion:      "remote version is not valid semver",
+	UpgradeAlreadyLatest:       "Already on the latest version.",
+	UpgradeForcing:             "Reinstalling the same version…",
+	UpgradeAvailableFmt:        "Current: %s → Latest: %s",
+	UpgradeNoAssetFmt:          "no binary found for %s",
+	UpgradeDownloadingFmt:      "Downloading %s (%s)…",
+	UpgradeDownloadFailed:      "download failed: %v",
+	UpgradeVerifying:           "Verifying checksum…",
+	UpgradeChecksumFailed:      "could not fetch checksum file: %v",
+	UpgradeChecksumMismatchFmt: "SHA256 mismatch: got %s, want %s",
+	UpgradeChecksumNotFoundFmt: "%s not found in SHA256SUMS",
+	UpgradeExtractFailed:       "failed to extract binary: %v",
+	UpgradeApplying:            "Replacing binary…",
+	UpgradeApplyFailed:         "failed to apply update: %v",
+	UpgradeSuccessFmt:          "Updated %s → %s",
 
 	UsageBody: `reasonix — a config- and plugin-driven coding agent (multi-model)
 
 Usage:
-  reasonix chat [--model NAME] [-c|--continue] [--resume]   interactive session (multi-turn; -c resumes the latest, --resume picks one)
+  reasonix [--model NAME] [-c|--continue] [--resume] [--yolo] [--dir PATH]   interactive session (multi-turn; -c resumes the latest, --resume picks one)
   reasonix run  [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] <task>   run one task and exit
+  reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI-powered code review on local diffs
   reasonix serve [--model NAME] [--addr HOST:PORT]      serve the session over HTTP+SSE (browser client at /)
   reasonix acp [--model NAME]                           serve Agent Client Protocol over stdio (also: reasonix --acp)
   reasonix setup [path]                                 interactive config wizard; writes reasonix.toml (+ .env)
   reasonix config auto-plan [off|on]                    configure automatic plan mode
-  reasonix mcp <add|remove|list>                        manage MCP servers in reasonix.toml
+  reasonix config reasoning-language [auto|zh|en]        configure visible reasoning language
+  reasonix mcp <add|remove|list|import>                 manage MCP servers in reasonix.toml
+  reasonix init                                         show how to generate project memory (AGENTS.md)
   reasonix doctor [--json]                              print redacted local diagnostics
   reasonix bot start|doctor|weixin-login                multi-channel IM bot gateway
+  reasonix upgrade [--check] [--force]                   self-update to the latest release (also: reasonix update)
   reasonix version
   reasonix help
 
 Examples:
-  reasonix chat
-  reasonix chat --continue
+  reasonix
+  reasonix --continue
   reasonix run "implement the TODOs in main.go"
   reasonix run --model mimo-pro "add unit tests for this function"
   echo "explain this code" | reasonix run
 
 Configuration:
-  Resolution: flag > ./reasonix.toml > ~/.config/reasonix/config.toml > built-in defaults
+  Resolution: flag > ./reasonix.toml > ~/.reasonix/config.toml > built-in defaults
   Secrets come from the environment via api_key_env (e.g. DEEPSEEK_API_KEY).
   Run 'reasonix setup' to scaffold a config; see docs/SPEC.md.
 `,

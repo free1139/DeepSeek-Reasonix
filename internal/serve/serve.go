@@ -24,6 +24,7 @@ import (
 	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
+	"reasonix/internal/jobs"
 	"reasonix/internal/nilutil"
 	"reasonix/internal/provider"
 )
@@ -34,11 +35,12 @@ var indexHTML []byte
 // Server wires a controller to its HTTP surface. The Broadcaster must be the
 // same sink the controller was constructed with, so events reach SSE clients.
 type Server struct {
-	mu        sync.RWMutex // guards ctrl, which switchModel swaps at runtime
-	ctrl      *control.Controller
-	bc        *Broadcaster
-	titleProv provider.Provider // lightweight flash provider for session titles
-	titles    *titleCache
+	mu         sync.RWMutex // guards ctrl, which switchModel swaps at runtime
+	ctrl       *control.Controller
+	bc         *Broadcaster
+	titleProv  provider.Provider // lightweight flash provider for session titles
+	titlePrice *provider.Pricing
+	titles     *titleCache
 }
 
 // New builds a Server. bc must be the controller's event sink.
@@ -79,6 +81,7 @@ func (s *Server) initTitleProvider() {
 		return
 	}
 	s.titleProv = prov
+	s.titlePrice = entry.Price
 }
 
 // switchModel rebuilds the controller with a new model, carrying over the
@@ -204,6 +207,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("POST /rewind", s.rewind)
 	mux.HandleFunc("POST /fork", s.fork)
 	mux.HandleFunc("POST /summarize", s.summarize)
+	mux.HandleFunc("POST /tool-approval-mode", s.toolApprovalMode)
 	mux.HandleFunc("POST /auto-approve-tools", s.autoApproveTools)
 	mux.HandleFunc("POST /bypass", s.bypass)
 	mux.HandleFunc("POST /answer", s.answer)
@@ -355,6 +359,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	trimmed := strings.TrimSpace(body.Input)
+	if strings.HasPrefix(trimmed, "!") {
+		http.Error(w, "shell commands are unavailable over HTTP", http.StatusForbidden)
+		return
+	}
 	// Intercept /model <ref> for runtime model switching (the controller's
 	// Submit path only lists models — switching is frontend-specific).
 	if strings.HasPrefix(trimmed, "/model ") {
@@ -380,7 +388,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.ctl().Submit(body.Input)
+	s.ctl().SubmitHTTP(body.Input)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -395,13 +403,12 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		Allow   bool   `json:"allow"`
 		Session bool   `json:"session"`
 		Persist bool   `json:"persist"`
-		Scope   string `json:"scope"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
 	}
-	s.ctl().ApproveWithScope(body.ID, body.Allow, body.Session, body.Persist, body.Scope)
+	s.ctl().Approve(body.ID, body.Allow, body.Session, body.Persist)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -455,6 +462,13 @@ type historyMessage struct {
 func historyMessages(msgs []provider.Message) []historyMessage {
 	out := make([]historyMessage, 0, len(msgs))
 	for _, m := range msgs {
+		// Steer messages are surfaced as a notice, not a user message.
+		if m.Role == provider.RoleUser {
+			if steerText, isSteer := agent.SteerText(m.Content); isSteer {
+				out = append(out, historyMessage{Role: "notice", Content: "↪ " + steerText})
+				continue
+			}
+		}
 		hm := historyMessage{Role: string(m.Role), Content: m.Content}
 		if m.Role == provider.RoleAssistant {
 			hm.Reasoning = m.ReasoningContent
@@ -654,6 +668,26 @@ func (s *Server) autoApproveTools(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// toolApprovalMode selects ask, auto, or yolo approval behavior for interactive
+// frontends. Plan remains a separate read-only gate.
+func (s *Server) toolApprovalMode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad body", http.StatusBadRequest)
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(body.Mode)) {
+	case control.ToolApprovalAsk, control.ToolApprovalAuto, control.ToolApprovalYolo:
+		s.ctl().SetToolApprovalMode(body.Mode)
+	default:
+		http.Error(w, "mode must be ask, auto, or yolo", http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // bypass is the legacy HTTP endpoint for YOLO/full-access tool auto-approval.
 func (s *Server) bypass(w http.ResponseWriter, r *http.Request) {
 	s.autoApproveTools(w, r)
@@ -682,16 +716,45 @@ func (s *Server) resume(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing path", http.StatusBadRequest)
 		return
 	}
+	dir := s.ctl().SessionDir()
+	if dir == "" {
+		http.Error(w, "sessions disabled", http.StatusBadRequest)
+		return
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		http.Error(w, "invalid session dir", http.StatusBadRequest)
+		return
+	}
+	realDir, err := filepath.EvalSymlinks(absDir)
+	if err != nil {
+		http.Error(w, "invalid session dir", http.StatusBadRequest)
+		return
+	}
+	absPath, err := filepath.Abs(strings.TrimSpace(body.Path))
+	if err != nil || filepath.Ext(absPath) != ".jsonl" {
+		http.Error(w, "invalid session path", http.StatusBadRequest)
+		return
+	}
+	realPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		http.Error(w, "invalid session path", http.StatusBadRequest)
+		return
+	}
+	if realPath == realDir || !strings.HasPrefix(realPath, realDir+string(os.PathSeparator)) {
+		http.Error(w, "path outside session dir", http.StatusForbidden)
+		return
+	}
 	// Snapshot the current session before switching away.
 	if err := s.ctl().Snapshot(); err != nil {
 		slog.Warn("serve: snapshot before resume", "err", err)
 	}
-	loaded, err := agent.LoadSession(body.Path)
+	loaded, err := agent.LoadSession(realPath)
 	if err != nil {
 		http.Error(w, "load session: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.ctl().Resume(loaded, body.Path)
+	s.ctl().Resume(loaded, realPath)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -791,13 +854,19 @@ func (s *Server) generateTitle(ctx context.Context, firstMsg string) string {
 		return ""
 	}
 	var text strings.Builder
+	var usage *provider.Usage
 	for chunk := range ch {
 		switch chunk.Type {
 		case provider.ChunkText:
 			text.WriteString(chunk.Text)
+		case provider.ChunkUsage:
+			// Title usage is intentionally not broadcast on the shared chat SSE stream.
 		case provider.ChunkError:
 			return ""
 		}
+	}
+	if usage != nil && usage.TotalTokens > 0 && s.bc != nil {
+		s.bc.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: s.titlePrice, UsageSource: event.UsageSourceTitle})
 	}
 	title := strings.TrimSpace(text.String())
 	if len(title) >= 2 && ((title[0] == '"' && title[len(title)-1] == '"') || (title[0] == '\'' && title[len(title)-1] == '\'')) {
@@ -894,15 +963,32 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cannot delete active session", http.StatusConflict)
 		return
 	}
+	destroy := s.ctl().BeginDestroySession(abs)
 	if err := os.Remove(abs); err != nil {
+		go finishSessionDestroy(destroy)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if err := agent.DeleteSubagentsByParent(dir, agent.BranchID(abs)); err != nil {
+		go finishSessionDestroy(destroy)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	finishSessionDestroy(destroy)
+	if err := jobs.RemoveArtifacts(abs); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func finishSessionDestroy(destroy control.SessionDestroyHandle) {
+	if destroy.Wait != nil {
+		destroy.Wait()
+	}
+	if destroy.Finish != nil {
+		destroy.Finish()
+	}
 }
 
 // sessionTitle returns a title for a session: the cached flash-generated title
@@ -955,7 +1041,7 @@ func previewSessionFile(path string) (string, int) {
 		if m.Role == "user" {
 			turns++
 			if first == "" {
-				first = strings.TrimSpace(m.Content)
+				first = agent.UserPreviewText(m.Content)
 			}
 		}
 	}

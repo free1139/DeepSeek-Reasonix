@@ -9,6 +9,8 @@ package feishu
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,8 +25,10 @@ import (
 	"reasonix/internal/config"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larknormalize "github.com/larksuite/oapi-sdk-go/v3/channel/normalize"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
@@ -33,6 +37,8 @@ import (
 type textContent struct {
 	Text string `json:"text"`
 }
+
+const feishuPendingReactionEmoji = "OnIt"
 
 // feishuEvent 飞书事件结构。
 type feishuEvent struct {
@@ -119,6 +125,9 @@ func (a *adapter) Start(ctx context.Context) error {
 		}
 		go a.runWebhook(ctx)
 	default:
+		if _, err := a.appSecret(); err != nil {
+			return err
+		}
 		go a.runWebSocket(ctx)
 	}
 	return nil
@@ -161,35 +170,73 @@ func (a *adapter) runWebSocket(ctx context.Context) {
 		a.logger.Error("feishu websocket config error", "err", err)
 		return
 	}
-	eventHandler := dispatcher.NewEventDispatcher(a.cfg.VerificationToken, "").
+	eventHandler := a.newEventDispatcher()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		opts := []larkws.ClientOption{
+			larkws.WithEventHandler(eventHandler),
+			larkws.WithLogLevel(larkcore.LogLevelError),
+			larkws.WithAutoReconnect(true),
+			larkws.WithOnReady(func() { a.logger.Info("feishu sdk websocket connected") }),
+			larkws.WithOnReconnecting(func() { a.logger.Warn("feishu sdk websocket reconnecting") }),
+			larkws.WithOnReconnected(func() { a.logger.Info("feishu sdk websocket reconnected") }),
+			larkws.WithOnError(func(err error) { a.logger.Error("feishu sdk websocket error", "err", err) }),
+		}
+		if feishuDomain(a.cfg.Domain) == "lark" {
+			opts = append(opts, larkws.WithDomain(lark.LarkBaseUrl))
+		}
+		client := larkws.NewClient(a.cfg.AppID, secret, opts...)
+		a.wsClient = client
+		errCh := make(chan error, 1)
+		go func() { errCh <- client.Start(ctx) }()
+		select {
+		case <-ctx.Done():
+			client.Close()
+			return
+		case err := <-errCh:
+			client.Close()
+			if err != nil {
+				a.logger.Error("feishu sdk websocket stopped", "err", err)
+			} else {
+				a.logger.Warn("feishu sdk websocket stopped without error")
+			}
+		}
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (a *adapter) newEventDispatcher() *dispatcher.EventDispatcher {
+	return dispatcher.NewEventDispatcher(a.cfg.VerificationToken, "").
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
 			a.handleSDKMessage(event)
 			return nil
+		}).
+		OnP2MessageReadV1(func(ctx context.Context, event *larkim.P2MessageReadV1) error {
+			return nil
+		}).
+		OnP2MessageReactionCreatedV1(func(ctx context.Context, event *larkim.P2MessageReactionCreatedV1) error {
+			return nil
+		}).
+		OnP2MessageReactionDeletedV1(func(ctx context.Context, event *larkim.P2MessageReactionDeletedV1) error {
+			return nil
+		}).
+		OnP2CardActionTrigger(func(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+			if event == nil || event.EventReq == nil || !a.handleCardAction(event.Body) {
+				a.logger.Warn("feishu card action ignored", "reason", "invalid_payload")
+				return cardActionToast("warning", "操作无效或已过期"), nil
+			}
+			return cardActionToast("success", "操作已提交"), nil
 		})
-	opts := []larkws.ClientOption{
-		larkws.WithEventHandler(eventHandler),
-		larkws.WithLogLevel(larkcore.LogLevelError),
-		larkws.WithAutoReconnect(true),
-		larkws.WithOnReady(func() { a.logger.Info("feishu sdk websocket connected") }),
-		larkws.WithOnReconnecting(func() { a.logger.Warn("feishu sdk websocket reconnecting") }),
-		larkws.WithOnReconnected(func() { a.logger.Info("feishu sdk websocket reconnected") }),
-		larkws.WithOnError(func(err error) { a.logger.Error("feishu sdk websocket error", "err", err) }),
-	}
-	if feishuDomain(a.cfg.Domain) == "lark" {
-		opts = append(opts, larkws.WithDomain(lark.LarkBaseUrl))
-	}
-	client := larkws.NewClient(a.cfg.AppID, secret, opts...)
-	a.wsClient = client
-	errCh := make(chan error, 1)
-	go func() { errCh <- client.Start(ctx) }()
-	select {
-	case <-ctx.Done():
-		client.Close()
-	case err := <-errCh:
-		if err != nil {
-			a.logger.Error("feishu sdk websocket stopped", "err", err)
-		}
-	}
 }
 
 func (a *adapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
@@ -207,16 +254,19 @@ func (a *adapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 	}
 	msg := event.Event.Message
 	if stringPtrValue(msg.MessageType) != "text" {
+		a.logger.Info("feishu message ignored", "reason", "non_text", "msg_type", stringPtrValue(msg.MessageType), "chat_type", stringPtrValue(msg.ChatType), "message", logHash(stringPtrValue(msg.MessageId)))
 		return
 	}
 	var content textContent
 	if err := json.Unmarshal([]byte(stringPtrValue(msg.Content)), &content); err != nil {
+		a.logger.Warn("feishu message ignored", "reason", "bad_content", "message", logHash(stringPtrValue(msg.MessageId)), "err", err)
 		return
 	}
 	chatType := bot.ChatDM
 	if stringPtrValue(msg.ChatType) == "group" || stringPtrValue(msg.ChatType) == "topic_group" {
 		chatType = bot.ChatGroup
 		if a.cfg.RequireMention && len(msg.Mentions) == 0 {
+			a.logger.Info("feishu message ignored", "reason", "missing_mention", "chat", logHash(stringPtrValue(msg.ChatId)), "message", logHash(stringPtrValue(msg.MessageId)))
 			return
 		}
 	}
@@ -241,6 +291,7 @@ func (a *adapter) handleSDKMessage(event *larkim.P2MessageReceiveV1) {
 	}
 	select {
 	case a.msgCh <- ib:
+		a.logger.Info("feishu inbound queued", "chat_type", chatType, "chat", logHash(ib.ChatID), "user", logHash(ib.UserID), "message", logHash(ib.MessageID), "text_chars", len([]rune(ib.Text)))
 	default:
 		a.logger.Warn("feishu message channel full")
 	}
@@ -271,6 +322,9 @@ func (a *adapter) handleCardAction(raw []byte) bool {
 		Header feishuHeader `json:"header"`
 		Event  struct {
 			Operator struct {
+				UserID     string `json:"user_id"`
+				OpenID     string `json:"open_id"`
+				UnionID    string `json:"union_id"`
 				OperatorID struct {
 					UserID  string `json:"user_id"`
 					OpenID  string `json:"open_id"`
@@ -293,16 +347,28 @@ func (a *adapter) handleCardAction(raw []byte) bool {
 	if command == "" || payload.Event.Context.OpenChatID == "" {
 		return false
 	}
+	if a.markSeen(payload.Header.EventID) {
+		return true
+	}
 	chatType := cardActionChatType(payload.Event.Action.Value["chat_type"])
-	userID := firstNonEmpty(payload.Event.Operator.OperatorID.UnionID, payload.Event.Operator.OperatorID.OpenID, payload.Event.Operator.OperatorID.UserID)
+	operatorID := firstNonEmpty(
+		payload.Event.Operator.OperatorID.UnionID,
+		payload.Event.Operator.OperatorID.OpenID,
+		payload.Event.Operator.OperatorID.UserID,
+		payload.Event.Operator.UnionID,
+		payload.Event.Operator.OpenID,
+		payload.Event.Operator.UserID,
+	)
+	routeUserID := firstNonEmpty(payload.Event.Action.Value["user_id"], operatorID)
 	ib := bot.InboundMessage{
-		Platform:  bot.PlatformFeishu,
-		ChatType:  chatType,
-		ChatID:    payload.Event.Context.OpenChatID,
-		UserID:    userID,
-		UserName:  userID,
-		Text:      command,
-		MessageID: payload.Event.Context.OpenMessageID,
+		Platform:   bot.PlatformFeishu,
+		ChatType:   chatType,
+		ChatID:     payload.Event.Context.OpenChatID,
+		UserID:     routeUserID,
+		UserName:   routeUserID,
+		OperatorID: operatorID,
+		Text:       command,
+		MessageID:  payload.Event.Context.OpenMessageID,
 	}
 	select {
 	case a.msgCh <- ib:
@@ -341,6 +407,15 @@ func cardActionChatType(raw string) bot.ChatType {
 	}
 }
 
+func cardActionToast(toastType, content string) *callback.CardActionTriggerResponse {
+	return &callback.CardActionTriggerResponse{
+		Toast: &callback.Toast{
+			Type:    toastType,
+			Content: content,
+		},
+	}
+}
+
 func (a *adapter) verificationTokenValid(token string) bool {
 	return a.cfg.VerificationToken == "" || token == a.cfg.VerificationToken
 }
@@ -354,22 +429,33 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+func logHash(id string) string {
+	if id == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 func (a *adapter) handleMessage(msg feishuMsgEvent) {
 	if msg.MsgType != "text" {
+		a.logger.Info("feishu message ignored", "reason", "non_text", "msg_type", msg.MsgType, "chat_type", msg.ChatType, "message", logHash(msg.MessageID))
 		return
 	}
 
 	// 解析文本内容
 	var content textContent
 	if err := json.Unmarshal([]byte(msg.Content), &content); err != nil {
+		a.logger.Warn("feishu message ignored", "reason", "bad_content", "message", logHash(msg.MessageID), "err", err)
 		return
 	}
 
 	// @mention gating：仅在群聊中检查是否 @了 bot
 	chatType := bot.ChatDM
-	if msg.ChatType == "group" {
+	if msg.ChatType == "group" || msg.ChatType == "topic_group" {
 		chatType = bot.ChatGroup
 		if a.cfg.RequireMention && len(msg.Mentions) == 0 {
+			a.logger.Info("feishu message ignored", "reason", "missing_mention", "chat", logHash(msg.ChatID), "message", logHash(msg.MessageID))
 			return
 		}
 	}
@@ -391,12 +477,13 @@ func (a *adapter) handleMessage(msg feishuMsgEvent) {
 
 	select {
 	case a.msgCh <- ib:
+		a.logger.Info("feishu inbound queued", "chat_type", chatType, "chat", logHash(ib.ChatID), "user", logHash(ib.UserID), "message", logHash(ib.MessageID), "text_chars", len([]rune(ib.Text)))
 	default:
 		a.logger.Warn("feishu message channel full")
 	}
 }
 
-// SendText sends one plain text message to a Feishu/Lark chat_id using the SDK.
+// SendText sends one markdown-rendered message to a Feishu/Lark chat_id using the SDK.
 // It is used by the desktop settings panel as an actual connection test.
 func SendText(ctx context.Context, cfg config.FeishuBotConfig, chatID, text string) (bot.SendResult, error) {
 	a := &adapter{cfg: cfg, logger: slog.Default().With("platform", "feishu")}
@@ -408,8 +495,22 @@ func (a *adapter) sendMessage(ctx context.Context, msg bot.OutboundMessage) (bot
 	if msg.Card != nil {
 		return a.sendCard(ctx, msg)
 	}
-	content, _ := json.Marshal(textContent{Text: msg.Text})
-	return a.sendSDKContent(ctx, msg, larkim.MsgTypeText, string(content))
+	content, err := feishuMarkdownPostContent(msg.Text)
+	if err != nil {
+		a.logger.Warn("format feishu markdown failed, falling back to text", "err", err)
+		content = feishuTextContent(msg.Text)
+		return a.sendSDKContent(ctx, msg, larkim.MsgTypeText, content)
+	}
+	return a.sendSDKContent(ctx, msg, larkim.MsgTypePost, content)
+}
+
+func feishuMarkdownPostContent(text string) (string, error) {
+	return larknormalize.SimpleMarkdownToPost("", text, nil)
+}
+
+func feishuTextContent(text string) string {
+	content, _ := json.Marshal(textContent{Text: text})
+	return string(content)
 }
 
 func (a *adapter) sdkClient() (*lark.Client, error) {
@@ -480,6 +581,34 @@ func (a *adapter) sendSDKContent(ctx context.Context, msg bot.OutboundMessage, m
 		return bot.SendResult{}, nil
 	}
 	return bot.SendResult{MessageID: stringPtrValue(resp.Data.MessageId)}, nil
+}
+
+func (a *adapter) AddPendingReaction(ctx context.Context, messageID string) error {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return nil
+	}
+	client, err := a.sdkClient()
+	if err != nil {
+		return err
+	}
+	req := larkim.NewCreateMessageReactionReqBuilder().
+		MessageId(messageID).
+		Body(larkim.NewCreateMessageReactionReqBodyBuilder().
+			ReactionType(larkim.NewEmojiBuilder().EmojiType(feishuPendingReactionEmoji).Build()).
+			Build()).
+		Build()
+	resp, err := client.Im.MessageReaction.Create(ctx, req)
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return fmt.Errorf("feishu reaction error: empty response")
+	}
+	if !resp.Success() {
+		return fmt.Errorf("feishu reaction error: %s", feishuCodeError(resp.Code, resp.Msg))
+	}
+	return nil
 }
 
 // sendCard 发送 interactive card 消息（用于审批/问答）。

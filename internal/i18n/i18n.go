@@ -43,7 +43,7 @@ type Messages struct {
 	// `reasonix init` — points to the in-session /init skill + setup
 	InitHint       string
 	StepSetKeyHint string // step 2 desc — env var hint
-	StepChatDesc   string // reasonix chat step desc
+	StepChatDesc   string // interactive session step desc
 	StepRunDesc    string // reasonix run step desc
 	HelpFooter     string // dim footer linking to reasonix help
 
@@ -60,8 +60,12 @@ type Messages struct {
 	ResumeBadIndexFmt   string // shown when /resume gets an out-of-range index (one %d)
 	ResumeAlreadyActive string // shown when /resume targets the current session
 	ResumedTitle        string // banner title after a /resume switch
-	ResumePickTitle     string // header in the interactive resume picker
-	ResumePickHint      string // keyboard hint in the interactive resume picker
+
+	RenameUsage     string // /rename with no args
+	RenameNoSession string // /rename with no active session
+	RenameDoneFmt   string // /rename succeeded (one %s = new title)
+	ResumePickTitle string // header in the interactive resume picker
+	ResumePickHint  string // keyboard hint in the interactive resume picker
 
 	// chat TUI status line / approval banner.
 	ChatThinking                string // live reasoning marker label, e.g. "thinking…"
@@ -87,6 +91,8 @@ type Messages struct {
 	PermissionAlreadyAllowedFmt string // permission rule already covered notice: path, rule
 	PermissionSaveFailedFmt     string // permission rule save failure notice: rule, error
 	DiffFoldedFmt               string // "… +%d more lines" footer when a writer diff is folded
+	DiffFoldEnabledFmt          string // notice when /diff-fold enables folding, %d = line limit
+	DiffFoldDisabled            string // notice when /diff-fold disables folding (shows all lines)
 
 	// `ask` tool question card.
 	AskTypeSomething   string // the "type your own answer" option label
@@ -151,8 +157,10 @@ type Messages struct {
 	CmdBranch       string // /branch
 	CmdSwitchBranch string // /switch
 	CmdResume       string // /resume
+	CmdRename       string // /rename
 	CmdModel        string // /model
 	CmdMemory       string // /memory
+	CmdMigrate      string // /migrate
 	CmdGoal         string // /goal
 	CmdRemember     string // /remember
 	CmdForget       string // /forget
@@ -164,9 +172,11 @@ type Messages struct {
 	CmdLanguage     string // /language
 	CmdSkill        string // /skills
 	CmdVerbose      string // /verbose
+	CmdDiffFold     string // /diff-fold
 	CmdSandbox      string // /sandbox
 	CmdEffort       string // /effort
 	CmdAutoPlan     string // /auto-plan
+	CmdReasonLang   string // /reasoning-language
 	CmdHelp         string // /help
 	CmdContinue     string // /continue
 	CmdTodo         string // /todo
@@ -197,6 +207,8 @@ type Messages struct {
 	ListModelsHeaderFmt string // "models (active: %s)"
 	ListModelsHint      string // how to switch
 	ListMemoryHeader    string // "memory files"
+	ListMemorySaved     string // "saved memories"
+	ListMemoryArchived  string // "archived memories"
 	ListMemoryNone      string // no memory docs
 	ListSkillsHeaderFmt string // "skills (%d)"
 	ListSkillsNone      string // no skills
@@ -349,7 +361,8 @@ type Messages struct {
 
 	// provider HTTP error explanations — actionable, reason + fix per status code
 	ProviderErrBadRequest          string // 400
-	ProviderErrAuth                string // 401
+	ProviderErrAuth                string // 401 — no key configured / sent
+	ProviderErrAuthRejected        string // 401 — a key was sent but the server rejected it
 	ProviderErrInsufficientBalance string // 402
 	ProviderErrUnprocessable       string // 422
 	ProviderErrRateLimited         string // 429
@@ -357,8 +370,39 @@ type Messages struct {
 	ProviderErrServerBusy          string // 503
 
 	// selection menus
-	SelectOneHint  string // "(↑/↓ · Enter · q to cancel)"
-	SelectManyHint string // "(↑/↓ · Space · Enter · q)"
+	SelectOneHint      string // "(↑/↓ · Enter · q to cancel)"
+	SelectManyHint     string // "(↑/↓ · Space · Enter · q)"
+	SelectMoreAboveFmt string // "↑ %d more above"
+	SelectMoreBelowFmt string // "↓ %d more below"
+	SelectSearchHint   string // "/ to search · Esc to cancel"
+
+	// /provider command
+	CmdProvider          string // /provider
+	ProviderListHeader   string // header for /provider list
+	ProviderAlreadyOnFmt string // already on provider
+	ProviderUnknownFmt   string // unknown provider
+	ProviderPickLabel    string // label for provider model picker
+	ProviderNoModelsFmt  string // provider has no models
+
+	// `reasonix upgrade` / `reasonix update` — self-update
+	UpgradeChecking            string // "Checking for updates…"
+	UpgradeDevBuild            string // dev builds cannot self-update
+	UpgradeFetchFailed         string // "failed to check for updates: %v"
+	UpgradeInvalidVersion      string // remote version not valid semver
+	UpgradeAlreadyLatest       string // already on the latest version
+	UpgradeForcing             string // "Reinstalling the same version…"
+	UpgradeAvailableFmt        string // "Current: %s → Latest: %s"
+	UpgradeNoAssetFmt          string // "no binary found for %s"
+	UpgradeDownloadingFmt      string // "Downloading %s (%s)…"
+	UpgradeDownloadFailed      string // "download failed: %v"
+	UpgradeVerifying           string // "Verifying checksum…"
+	UpgradeChecksumFailed      string // "could not fetch checksum file: %v"
+	UpgradeChecksumMismatchFmt string // SHA256 mismatch detail
+	UpgradeChecksumNotFoundFmt string // asset not listed in SHA256SUMS
+	UpgradeExtractFailed       string // "failed to extract binary: %v"
+	UpgradeApplying            string // "Replacing binary…"
+	UpgradeApplyFailed         string // "failed to apply update: %v"
+	UpgradeSuccessFmt          string // "Updated %s → %s"
 
 	// usage / help
 	UsageBody string // full multi-line help text
@@ -415,6 +459,9 @@ func envCandidates() []string {
 
 func setLanguage(tag string) string {
 	switch tag {
+	case "zh-tw", "zh-TW":
+		M = ChineseTraditional
+		return "zh-TW"
 	case "zh":
 		M = Chinese
 		return "zh"
@@ -429,8 +476,12 @@ func setLanguage(tag string) string {
 // unrecognised input so DetectLanguage can fall through to the next candidate.
 func normalize(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, "_", "-") // zh_TW.UTF-8 → zh-tw.utf-8 (POSIX locales use underscores)
 	if s == "" {
 		return ""
+	}
+	if strings.HasPrefix(s, "zh-tw") || strings.HasPrefix(s, "zh-hant") || strings.Contains(s, "chinese traditional") || strings.Contains(s, "繁體") {
+		return "zh-TW"
 	}
 	if strings.HasPrefix(s, "zh") || strings.Contains(s, "chinese") || strings.Contains(s, "中文") {
 		return "zh"

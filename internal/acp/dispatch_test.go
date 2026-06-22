@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"reasonix/internal/event"
-	"reasonix/internal/permission"
 )
 
 // fakeNotifier captures Notify calls and answers Request via an injectable hook,
@@ -237,44 +236,34 @@ func TestUpdateSinkApprovalBashPrefix(t *testing.T) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			t.Fatalf("permission params: %v", err)
 		}
-		var hasExactSession, hasPrefix, hasPersistPrefix bool
+		// Bash with a safe prefix now uses the same standard options as any
+		// other tool (allow_always / allow_persistent); the old prefix-specific
+		// OptAllowPrefix/OptPersistPrefix are gone.
+		var hasSession, hasPersistent bool
 		for _, opt := range p.Options {
-			hasExactSession = hasExactSession || opt.OptionID == string(OptAllowAlways)
-			hasPrefix = hasPrefix || opt.OptionID == string(OptAllowPrefix)
-			hasPersistPrefix = hasPersistPrefix || opt.OptionID == string(OptPersistPrefix)
+			hasSession = hasSession || opt.OptionID == string(OptAllowAlways)
+			hasPersistent = hasPersistent || opt.OptionID == string(OptAllowPersistent)
 		}
-		if hasExactSession {
-			t.Fatalf("options = %+v, exact bash session choice should be omitted when a prefix is available", p.Options)
-		}
-		if !hasPrefix || !hasPersistPrefix {
-			t.Fatalf("options = %+v, want bash prefix choices", p.Options)
+		if !hasSession || !hasPersistent {
+			t.Fatalf("options = %+v, want standard session and persistent choices", p.Options)
 		}
 		if len(p.Options) != 4 {
-			t.Fatalf("options = %+v, want allow once, prefix session, prefix persistent, reject", p.Options)
+			t.Fatalf("options = %+v, want allow once, session, persistent, reject", p.Options)
 		}
 		res, _ := json.Marshal(PermissionRequestResult{
-			Outcome: PermissionOutcome{Outcome: "selected", OptionID: string(OptPersistPrefix)},
+			Outcome: PermissionOutcome{Outcome: "selected", OptionID: string(OptAllowPersistent)},
 		})
 		return res, nil
 	}}
 	sink := newUpdateSink(fn, "sess-1")
-	type scopedApproveCall struct {
-		id      string
-		allow   bool
-		session bool
-		persist bool
-		scope   string
-	}
-	got := make(chan scopedApproveCall, 1)
-	sink.bindApproveWithScope(func(id string, allow, session, persist bool, scope string) {
-		got <- scopedApproveCall{id, allow, session, persist, scope}
-	})
+	got := make(chan approveCall, 1)
+	sink.bindApprove(func(id string, allow, session, persist bool) { got <- approveCall{id, allow, session, persist} })
 
 	sink.Emit(event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{ID: "10", Tool: "bash", Subject: "go test ./..."}})
 
 	select {
 	case c := <-got:
-		want := scopedApproveCall{id: "10", allow: true, session: true, persist: true, scope: permission.ApprovalScopePrefix}
+		want := approveCall{id: "10", allow: true, session: true, persist: true}
 		if c != want {
 			t.Errorf("approve = %+v, want %+v", c, want)
 		}
@@ -314,6 +303,96 @@ func TestUpdateSinkApprovalDenied(t *testing.T) {
 				t.Fatal("approve was never called")
 			}
 		})
+	}
+}
+
+func TestUpdateSinkAskRequestUsesPermissionChoices(t *testing.T) {
+	fn := &fakeNotifier{onReq: func(method string, params any) (json.RawMessage, error) {
+		if method != "session/request_permission" {
+			t.Errorf("request method = %q, want session/request_permission", method)
+		}
+		raw, _ := json.Marshal(params)
+		var p PermissionRequestParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatalf("permission params: %v", err)
+		}
+		if p.SessionID != "sess-1" {
+			t.Errorf("sessionId = %q", p.SessionID)
+		}
+		if p.ToolCall.ToolCallID != "ask-ask-1-q1" {
+			t.Errorf("toolCallId = %q, want ask-ask-1-q1", p.ToolCall.ToolCallID)
+		}
+		if p.ToolCall.Title != "Choose a target" {
+			t.Errorf("title = %q", p.ToolCall.Title)
+		}
+		if len(p.Options) != 3 {
+			t.Fatalf("options = %+v, want two answers plus cancel", p.Options)
+		}
+		if p.Options[0].Name != "Tests - Run the suite" || p.Options[0].Kind != OptAllowOnce {
+			t.Fatalf("first option = %+v", p.Options[0])
+		}
+		res, _ := json.Marshal(PermissionRequestResult{
+			Outcome: PermissionOutcome{Outcome: "selected", OptionID: "q1:2"},
+		})
+		return res, nil
+	}}
+	sink := newUpdateSink(fn, "sess-1")
+	got := make(chan []event.AskAnswer, 1)
+	sink.bindAnswer(func(id string, answers []event.AskAnswer) {
+		if id != "ask-1" {
+			t.Errorf("answer id = %q, want ask-1", id)
+		}
+		got <- answers
+	})
+
+	sink.Emit(event.Event{Kind: event.AskRequest, Ask: event.Ask{
+		ID: "ask-1",
+		Questions: []event.AskQuestion{{
+			ID:     "q1",
+			Header: "Topic",
+			Prompt: "Choose a target",
+			Options: []event.AskOption{
+				{Label: "Tests", Description: "Run the suite"},
+				{Label: "Docs"},
+			},
+		}},
+	}})
+
+	select {
+	case answers := <-got:
+		if len(answers) != 1 || answers[0].QuestionID != "q1" || len(answers[0].Selected) != 1 || answers[0].Selected[0] != "Docs" {
+			t.Fatalf("answers = %+v, want q1 Docs", answers)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask answer was never called")
+	}
+}
+
+func TestUpdateSinkAskCancelledReturnsNoAnswers(t *testing.T) {
+	fn := &fakeNotifier{onReq: func(string, any) (json.RawMessage, error) {
+		res, _ := json.Marshal(PermissionRequestResult{Outcome: PermissionOutcome{Outcome: "cancelled"}})
+		return res, nil
+	}}
+	sink := newUpdateSink(fn, "sess-1")
+	got := make(chan []event.AskAnswer, 1)
+	sink.bindAnswer(func(_ string, answers []event.AskAnswer) { got <- answers })
+
+	sink.Emit(event.Event{Kind: event.AskRequest, Ask: event.Ask{
+		ID: "ask-2",
+		Questions: []event.AskQuestion{{
+			ID:      "q1",
+			Prompt:  "Continue?",
+			Options: []event.AskOption{{Label: "Yes"}, {Label: "No"}},
+		}},
+	}})
+
+	select {
+	case answers := <-got:
+		if answers != nil {
+			t.Fatalf("answers = %+v, want nil on cancelled ask", answers)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask cancellation was never returned")
 	}
 }
 

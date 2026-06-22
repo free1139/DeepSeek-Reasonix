@@ -83,6 +83,11 @@ const (
 	// event — or TurnDone — clears. Appended last to keep the Kind values before
 	// it wire-stable.
 	Retrying
+	// Steer fires when a mid-turn steer message is consumed from the queue and
+	// injected as a user message. Text carries the raw steer content (without the
+	// wrapper prefix), so a frontend can display it to the user as confirmation.
+	// Frontends use Steer to know a queued message has been delivered.
+	Steer
 )
 
 // Level classifies a Notice so sinks can style or filter it.
@@ -197,6 +202,15 @@ type CacheDiagnostics struct {
 	CacheHitTokens      int
 }
 
+const (
+	UsageSourceExecutor   = "executor"
+	UsageSourcePlanner    = "planner"
+	UsageSourceSubagent   = "subagent"
+	UsageSourceCompaction = "compaction"
+	UsageSourceClassifier = "classifier"
+	UsageSourceTitle      = "title"
+)
+
 // Event is one increment in a turn's event stream. Read the field(s) documented
 // for Kind; the others are zero.
 type Event struct {
@@ -206,6 +220,7 @@ type Event struct {
 	Tool             Tool              // ToolDispatch / ToolResult
 	Usage            *provider.Usage   // Usage
 	Pricing          *provider.Pricing // Usage: for cost display (nil = omit cost)
+	UsageSource      string            // Usage: billable call source; empty means executor for compatibility
 	CacheDiagnostics *CacheDiagnostics // Usage: cache-churn attribution (nil = N/A)
 	// SessionHit/SessionMiss carry cumulative cache tokens across the whole
 	// session (Usage events only), so a frontend can show the aggregate hit-rate

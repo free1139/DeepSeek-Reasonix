@@ -1,46 +1,71 @@
 import { useEffect, useRef, useState } from "react";
+import gsap from "gsap";
 import { useT } from "../lib/i18n";
 import type { WireApproval } from "../lib/types";
 import { PromptAction, PromptDetailToggle, PromptShelf } from "./PromptShelf";
+import { playAttentionChime } from "../lib/sound";
+import { DUR_FAST } from "../lib/gsapAnimations";
 
 export function ApprovalModal({
   approval,
   onAnswer,
   onRevisePlan,
   onExitPlan,
+  onStop,
 }: {
   approval: WireApproval;
-  onAnswer: (allow: boolean, session: boolean, persist: boolean, scope?: string) => void;
+  onAnswer: (allow: boolean, session: boolean, persist: boolean) => void;
   onRevisePlan?: (text: string) => void;
   onExitPlan?: () => void;
+  onStop: () => void;
 }) {
   const t = useT();
+  const isPlanApproval = approval.tool === "exit_plan_mode";
   const [revisionOpen, setRevisionOpen] = useState(false);
   const [revisionText, setRevisionText] = useState("");
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState(() => (isPlanApproval ? 1 : 0));
   const cardRef = useRef<HTMLDivElement | null>(null);
+  const shelfRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const isPlanApproval = approval.tool === "exit_plan_mode";
-  const isBashApproval = approval.tool === "bash";
+  // When consecutive approvals arrive, animate the old card out before
+  // the new one slides in.  GSAP fromTo on the shelf wrapper avoids the
+  // jarring pop when the API cycles through 4+ pending approvals.
+  const closingRef = useRef(false);
   const subject = approval.subject.trim();
-  const bashPrefix = isBashApproval ? bashCommandPrefix(subject) : "";
-  const hasBashPrefix = bashPrefix !== "";
   const subjectSummary = subject.split("\n").find((line) => line.trim())?.trim() ?? "";
 
 
+  const answerWithExit = (fn: () => void) => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    const el = shelfRef.current;
+    if (el) {
+      gsap.to(el, {
+        opacity: 0,
+        y: 8,
+        duration: DUR_FAST,
+        ease: "power2.in",
+        onComplete: fn,
+      });
+    } else {
+      fn();
+    }
+  };
+
   const choosePlanAction = (key: string) => {
     if (key === "1") setRevisionOpen((open) => !open);
-    else if (key === "2") onAnswer(true, false, false);
-    else if (key === "3" || key === "Escape") (onExitPlan ?? (() => onAnswer(false, false, false)))();
+    else if (key === "2") answerWithExit(() => onAnswer(true, false, false));
+    else if (key === "3") answerWithExit(() => (onExitPlan ?? (() => onAnswer(false, false, false)))());
+    else if (key === "Escape") answerWithExit(onStop);
   };
 
   const chooseToolAction = (key: string) => {
-    if (key === "1") onAnswer(true, false, false);
-    else if (key === "2" && hasBashPrefix) onAnswer(true, true, false, "prefix");
-    else if (key === "2") onAnswer(true, true, false);
-    else if (key === "3" && hasBashPrefix) onAnswer(true, true, true, "prefix");
-    else if (key === "3") onAnswer(true, true, true);
-    else if (key === "4" || key === "Escape") onAnswer(false, false, false);
+    if (key === "1") answerWithExit(() => onAnswer(true, false, false));
+    else if (key === "2") answerWithExit(() => onAnswer(true, true, false));
+    else if (key === "3") answerWithExit(() => onAnswer(true, true, true));
+    else if (key === "4") answerWithExit(() => onAnswer(false, false, false));
+    else if (key === "Escape") answerWithExit(onStop);
   };
 
   useEffect(() => {
@@ -48,21 +73,41 @@ export function ApprovalModal({
     setRevisionOpen(false);
     setRevisionText("");
     setDetailsOpen(false);
-  }, [approval.id]);
+    setSelectedIndex(isPlanApproval ? 1 : 0);
+    playAttentionChime();
+  }, [approval.id, isPlanApproval]);
+
+  const actionCount = isPlanApproval ? 3 : 4;
+  const selectedIndexRef = useRef(selectedIndex);
+  selectedIndexRef.current = selectedIndex;
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
+      const target = event.target instanceof Element ? event.target : null;
       const tag = target?.tagName.toLowerCase();
-      if (tag === "input" || tag === "textarea" || target?.isContentEditable) return;
-      if (event.key !== "1" && event.key !== "2" && event.key !== "3" && event.key !== "4" && event.key !== "Escape") return;
-      event.preventDefault();
-      if (isPlanApproval) choosePlanAction(event.key);
-      else chooseToolAction(event.key);
+      if (tag === "input" || tag === "textarea" || tag === "select" || (target instanceof HTMLElement && target.isContentEditable)) return;
+      const interactiveTarget = target?.closest("button, a, [role='button'], [role='link']");
+      if (interactiveTarget && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Enter")) return;
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        setSelectedIndex((i) => (i - 1 + actionCount) % actionCount);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        setSelectedIndex((i) => (i + 1) % actionCount);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        const key = String(selectedIndexRef.current + 1);
+        if (isPlanApproval) choosePlanAction(key);
+        else chooseToolAction(key);
+      } else if (event.key === "1" || event.key === "2" || event.key === "3" || event.key === "4" || event.key === "Escape") {
+        event.preventDefault();
+        if (isPlanApproval) choosePlanAction(event.key);
+        else chooseToolAction(event.key);
+      }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [hasBashPrefix, isPlanApproval, onAnswer, onExitPlan]);
+  }, [isPlanApproval, onAnswer, onExitPlan, onStop, actionCount]);
 
   useEffect(() => {
     if (revisionOpen) inputRef.current?.focus();
@@ -74,26 +119,29 @@ export function ApprovalModal({
       inputRef.current?.focus();
       return;
     }
-    onRevisePlan?.(text);
+    answerWithExit(() => onRevisePlan?.(text));
   };
 
   // The plan is already shown above as the assistant's reply; this is just the gate.
   if (isPlanApproval) {
     return (
-      <PromptShelf
-        barRef={cardRef}
+      <div ref={shelfRef}>
+        <PromptShelf
+          barRef={cardRef}
         titleId="plan-approval-title"
         title={t("approval.planReady")}
         meta={t("approval.planReadyHint")}
         actions={
           <>
-            <PromptAction keyLabel="1" label={t("approval.revisePlan")} onClick={() => setRevisionOpen((open) => !open)} />
-            <PromptAction keyLabel="2" label={t("approval.startExecution")} onClick={() => onAnswer(true, false, false)} selected />
+            <PromptAction keyLabel="1" label={t("approval.revisePlan")} onClick={() => setRevisionOpen((open) => !open)} selected={selectedIndex === 0} />
+            <PromptAction keyLabel="2" label={t("approval.startExecution")} onClick={() => answerWithExit(() => onAnswer(true, false, false))} selected={selectedIndex === 1} />
             <PromptAction
               keyLabel="3"
               label={t("approval.exitPlan")}
-              onClick={() => (onExitPlan ?? (() => onAnswer(false, false, false)))()}
+              onClick={() => answerWithExit(() => (onExitPlan ?? (() => onAnswer(false, false, false)))())}
+              selected={selectedIndex === 2}
             />
+            <PromptAction keyLabel="Esc" label={t("composer.stopShort")} onClick={() => answerWithExit(onStop)} />
           </>
         }
       >
@@ -122,12 +170,14 @@ export function ApprovalModal({
           </div>
         )}
       </PromptShelf>
+      </div>
     );
   }
 
   return (
-    <PromptShelf
-      barRef={cardRef}
+    <div ref={shelfRef}>
+      <PromptShelf
+        barRef={cardRef}
       titleId="tool-approval-title"
       title={t("approval.toolPending")}
       actionsWrap
@@ -147,36 +197,11 @@ export function ApprovalModal({
               onClick={() => setDetailsOpen((open) => !open)}
             />
           )}
-          <PromptAction keyLabel="1" label={t("approval.allowOnce")} onClick={() => onAnswer(true, false, false)} selected />
-          {hasBashPrefix ? (
-            <>
-              <PromptAction
-                keyLabel="2"
-                label={t("approval.allowRuleSession")}
-                onClick={() => onAnswer(true, true, false, "prefix")}
-              />
-              <PromptAction
-                keyLabel="3"
-                label={t("approval.allowRulePersistent")}
-                onClick={() => onAnswer(true, true, true, "prefix")}
-              />
-              <PromptAction keyLabel="4" label={t("approval.deny")} onClick={() => onAnswer(false, false, false)} />
-            </>
-          ) : (
-            <>
-              <PromptAction
-                keyLabel="2"
-                label={t("approval.allowRuleSession")}
-                onClick={() => onAnswer(true, true, false)}
-              />
-              <PromptAction
-                keyLabel="3"
-                label={t("approval.allowRulePersistent")}
-                onClick={() => onAnswer(true, true, true)}
-              />
-              <PromptAction keyLabel="4" label={t("approval.deny")} onClick={() => onAnswer(false, false, false)} />
-            </>
-          )}
+          <PromptAction keyLabel="1" label={t("approval.allowOnce")} onClick={() => answerWithExit(() => onAnswer(true, false, false))} selected={selectedIndex === 0} />
+          <PromptAction keyLabel="2" label={t("approval.allowRuleSession")} onClick={() => answerWithExit(() => onAnswer(true, true, false))} selected={selectedIndex === 1} />
+          <PromptAction keyLabel="3" label={t("approval.allowRulePersistent")} onClick={() => answerWithExit(() => onAnswer(true, true, true))} selected={selectedIndex === 2} />
+          <PromptAction keyLabel="4" label={t("approval.deny")} onClick={() => answerWithExit(() => onAnswer(false, false, false))} selected={selectedIndex === 3} />
+          <PromptAction keyLabel="Esc" label={t("composer.stopShort")} onClick={() => answerWithExit(onStop)} />
         </>
       }
     >
@@ -184,34 +209,7 @@ export function ApprovalModal({
         <pre className="approval-subject">{subject}</pre>
       )}
     </PromptShelf>
+    </div>
   );
-}
 
-
-
-function bashCommandPrefix(subject: string): string {
-  const command = subject.trim();
-  if (!command || command.includes("`") || command.includes("$(") || /[;|&<>\n]/.test(command)) return "";
-  const fields = command.split(/\s+/).filter(Boolean);
-  if (fields.length < 2) return "";
-  if (dangerousBashCommand(command)) return "";
-  const base = fields[0].toLowerCase();
-  if ((base === "npm" || base === "pnpm" || base === "yarn" || base === "bun") && fields[1]?.toLowerCase() === "run") {
-    return fields.length >= 3 ? `${fields[0]} ${fields[1]} ${fields[2]}:*` : "";
-  }
-  return `${fields[0]} ${fields[1]}:*`;
-}
-
-function dangerousBashCommand(command: string): boolean {
-  return /^rm\s+-[^\s]*[rf][^\s]*\b/.test(command)
-    || /^git\s+push\b.*\s--force\b/.test(command)
-    || /^git\s+push\b.*\s-f\b/.test(command)
-    || /^git\s+reset\s+--hard\b/.test(command)
-    || /^git\s+clean\s+-f\b/.test(command)
-    || /^chmod\s+(?:-R\s+)?777\b/.test(command)
-    || /^chown\b/.test(command)
-    || /^sudo\b/.test(command)
-    || /^mkfs\b/.test(command)
-    || /^dd\s+if=/.test(command)
-    || /^fdisk\b/.test(command);
 }

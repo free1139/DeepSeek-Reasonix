@@ -5,9 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"reasonix/internal/agent"
 
 	"reasonix/internal/command"
 	"reasonix/internal/event"
@@ -34,6 +37,15 @@ type fakeTurnRunner struct {
 func (f *fakeTurnRunner) Run(ctx context.Context, input string) error {
 	f.inputs = append(f.inputs, input)
 	return nil
+}
+
+type fakeLanguageRunner struct {
+	fakeTurnRunner
+	lang string
+}
+
+func (f *fakeLanguageRunner) SetReasoningLanguage(lang string) {
+	f.lang = lang
 }
 
 func TestCustomCommandLookup(t *testing.T) {
@@ -95,6 +107,65 @@ func TestComposePlanModeMarker(t *testing.T) {
 	got := c.Compose("hi")
 	if !strings.HasPrefix(got, PlanModeMarker) || !strings.HasSuffix(got, "hi") {
 		t.Errorf("plan on: Compose = %q, want marker-prefixed", got)
+	}
+}
+
+func TestComposeReasoningLanguagePreference(t *testing.T) {
+	auto := New(Options{ReasoningLanguage: "auto"})
+	if got := auto.Compose("hi"); got != "hi" {
+		t.Fatalf("auto reasoning language should not alter the turn, got %q", got)
+	}
+
+	zh := New(Options{ReasoningLanguage: "zh"})
+	got := zh.Compose("hi")
+	if !strings.HasPrefix(got, "<reasoning-language>") || !strings.Contains(got, "Simplified Chinese") || !strings.HasSuffix(got, "hi") {
+		t.Fatalf("zh reasoning language should ride the user turn, got %q", got)
+	}
+	if stripped := StripComposePrefixes(got); stripped != "hi" {
+		t.Fatalf("StripComposePrefixes = %q, want hi", stripped)
+	}
+}
+
+func TestRunComposesReasoningLanguagePreference(t *testing.T) {
+	runner := &fakeTurnRunner{}
+	c := New(Options{ReasoningLanguage: "zh", Runner: runner})
+
+	if err := c.Run(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.inputs) != 1 {
+		t.Fatalf("runner inputs = %d, want 1", len(runner.inputs))
+	}
+	got := runner.inputs[0]
+	if !strings.HasPrefix(got, "<reasoning-language>") || !strings.Contains(got, "Simplified Chinese") || !strings.HasSuffix(got, "hi") {
+		t.Fatalf("headless Run should compose the reasoning language preference, got %q", got)
+	}
+}
+
+func TestSetReasoningLanguageUpdatesRunner(t *testing.T) {
+	runner := &fakeLanguageRunner{}
+	c := New(Options{Runner: runner})
+
+	c.SetReasoningLanguage("zh")
+	if runner.lang != "zh" {
+		t.Fatalf("runner reasoning language = %q, want zh", runner.lang)
+	}
+
+	c.SetReasoningLanguage("auto")
+	if runner.lang != "auto" {
+		t.Fatalf("runner reasoning language = %q, want auto", runner.lang)
+	}
+}
+
+func TestComposeSyntheticReasoningLanguagePreference(t *testing.T) {
+	c := New(Options{ReasoningLanguage: "zh"})
+
+	got := c.ComposeSynthetic(planApprovedMessage)
+	if !strings.HasPrefix(got, "<reasoning-language>") || !strings.Contains(got, "Simplified Chinese") || !strings.HasSuffix(got, planApprovedMessage) {
+		t.Fatalf("ComposeSynthetic should prefix reasoning language, got %q", got)
+	}
+	if !IsSyntheticUserMessage(got) {
+		t.Fatalf("reasoning-language-prefixed plan approval should still be synthetic")
 	}
 }
 
@@ -176,6 +247,12 @@ func TestMemoryQuickAddNoteRequiresWhitespace(t *testing.T) {
 		{in: "#issue needs work", ok: false},
 		{in: "# Heading", note: "Heading", ok: true},
 		{in: "#", ok: false},
+		// Multi-line input is NOT a quick-add — it's a Markdown heading (# Context)
+		// followed by structured content. Desktop users pasting COSTAR-style prompts
+		// hit this when the first line starts with "# ".
+		{in: "# Context\n\n- file.go\n", ok: false},
+		{in: "# Heading\nmore text", ok: false},
+		{in: "  # Context\n  - file.go  ", ok: false},
 	}
 	for _, tt := range tests {
 		got, ok := MemoryQuickAddNote(tt.in)
@@ -221,6 +298,90 @@ func TestSubmitHashNumberStartsTurn(t *testing.T) {
 
 	if len(runner.inputs) != 1 || runner.inputs[0] != input {
 		t.Fatalf("#number prompt should start a model turn, inputs=%q", runner.inputs)
+	}
+}
+
+func TestSubmitSlashPathDiagnosticStartsTurnWithFileContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX absolute file path context is covered on POSIX runners")
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "app", "src", "main", "Foo.kt")
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("fun broken() = missingSymbol\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeTurnRunner{}
+	events := make(chan event.Event, 4)
+	c := New(Options{
+		AutoPlan: "off",
+		Runner:   runner,
+		Sink: event.FuncSink(func(e event.Event) {
+			events <- e
+		}),
+	})
+
+	input := file + ":12:13: error: unresolved reference: missingSymbol"
+	c.Submit(input)
+	waitForTurnDone(t, events)
+
+	if len(runner.inputs) != 1 {
+		t.Fatalf("slash path diagnostic should start a model turn, inputs=%q", runner.inputs)
+	}
+	got := runner.inputs[0]
+	if !strings.Contains(got, "Referenced context:") || !strings.Contains(got, "fun broken() = missingSymbol") {
+		t.Fatalf("slash path diagnostic should attach file context, got %q", got)
+	}
+	if !strings.Contains(got, input) {
+		t.Fatalf("slash path diagnostic should preserve original error text, got %q", got)
+	}
+}
+
+func TestSubmitMissingSlashPathDiagnosticStartsTurn(t *testing.T) {
+	runner := &fakeTurnRunner{}
+	events := make(chan event.Event, 4)
+	c := New(Options{
+		AutoPlan: "off",
+		Runner:   runner,
+		Sink: event.FuncSink(func(e event.Event) {
+			events <- e
+		}),
+	})
+
+	input := "/missing/Foo.kt:12: error: file no longer exists"
+	c.Submit(input)
+	waitForTurnDone(t, events)
+
+	if len(runner.inputs) != 1 || runner.inputs[0] != input {
+		t.Fatalf("missing slash path diagnostic should start a raw model turn, inputs=%q", runner.inputs)
+	}
+}
+
+func TestSubmitUnknownSlashCommandStillReportsNotice(t *testing.T) {
+	runner := &fakeTurnRunner{}
+	events := make(chan event.Event, 4)
+	c := New(Options{
+		AutoPlan: "off",
+		Runner:   runner,
+		Sink: event.FuncSink(func(e event.Event) {
+			events <- e
+		}),
+	})
+
+	c.Submit("/definitely-not-a-command")
+
+	if len(runner.inputs) != 0 {
+		t.Fatalf("unknown slash command should not start a model turn, inputs=%q", runner.inputs)
+	}
+	select {
+	case e := <-events:
+		if e.Kind != event.Notice || !strings.Contains(e.Text, "unknown command: /definitely-not-a-command") {
+			t.Fatalf("event = %+v, want unknown-command notice", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for unknown-command notice")
 	}
 }
 
@@ -491,6 +652,11 @@ func TestIsSyntheticUserMessage(t *testing.T) {
 			want:  true,
 		},
 		{
+			name:  "plan approved message with reasoning language",
+			input: reasoningLanguageBlock("zh") + "\n\n" + planApprovedMessage,
+			want:  true,
+		},
+		{
 			name:  "stream recovery interrupted tool",
 			input: "The previous assistant response was interrupted while a tool call was streaming. Continue the same task now.",
 			want:  true,
@@ -533,6 +699,31 @@ func TestIsSyntheticUserMessage(t *testing.T) {
 		{
 			name:  "user quoting interrupted response not synthetic",
 			input: "The previous assistant response was interrupted by my VPN, can you retry?",
+			want:  false,
+		},
+		{
+			name:  "compaction fold summary",
+			input: "<compaction-summary>\nSummary of earlier conversation (older messages were compacted to save context):\nDid things with tools.\n</compaction-summary>",
+			want:  true,
+		},
+		{
+			name:  "summarize-from fold",
+			input: "Summary of the later conversation (compacted from here on):\nDid more things.",
+			want:  true,
+		},
+		{
+			name:  "summarize-upto fold",
+			input: "Summary of earlier conversation (compacted up to here):\nDid earlier things.",
+			want:  true,
+		},
+		{
+			name:  "user mentioning a summary is not synthetic",
+			input: "Summary of what I want: fix the login bug first.",
+			want:  false,
+		},
+		{
+			name:  "mid-turn steer is not synthetic (handled separately in historyMessages)",
+			input: agent.MidTurnSteerPrefix + "\nplease use smaller diffs",
 			want:  false,
 		},
 	}

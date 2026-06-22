@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "../lib/i18n";
 import type { QuestionAnswer, WireAsk, WireAskQuestion } from "../lib/types";
 import { PromptAction, PromptBadge, PromptDetailToggle, PromptShelf } from "./PromptShelf";
+import { playAttentionChime } from "../lib/sound";
 
 // AskCard renders the `ask` tool as a compact prompt shelf near the composer. It
 // walks multi-question asks one at a time; single-select answers advance
@@ -10,10 +11,12 @@ export function AskCard({
   ask,
   onAnswer,
   onDismiss,
+  onStop,
 }: {
   ask: WireAsk;
   onAnswer: (id: string, answers: QuestionAnswer[]) => void;
   onDismiss: () => void;
+  onStop: () => void;
 }) {
   const t = useT();
   // Per-question state: selected option labels, and an optional typed answer.
@@ -37,6 +40,7 @@ export function AskCard({
     setActive(0);
     setDetailsOpen(false);
     if (advanceTimer.current != null) window.clearTimeout(advanceTimer.current);
+    playAttentionChime();
   }, [ask.id]);
 
   useEffect(() => {
@@ -116,7 +120,7 @@ export function AskCard({
 
       if (event.key === "Escape") {
         event.preventDefault();
-        onDismiss();
+        onStop();
         return;
       }
       if ((event.key === "ArrowLeft" || event.key === "Backspace") && active > 0) {
@@ -132,7 +136,7 @@ export function AskCard({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [active, custom, onDismiss, q, sel]);
+  }, [active, custom, onDismiss, onStop, q, sel]);
 
   const answeredSummary = useMemo(
     () =>
@@ -191,6 +195,10 @@ export function AskCard({
           <button className="prompt-action prompt-action--quiet" onClick={onDismiss}>
             <span className="prompt-action__label">{t("ask.justChat")}</span>
           </button>
+          <button className="prompt-action prompt-action--quiet" onClick={onStop}>
+            <span className="prompt-action__key">Esc</span>
+            <span className="prompt-action__label">{t("composer.stopShort")}</span>
+          </button>
         </>
       }
       crumbs={
@@ -234,6 +242,9 @@ export function AskCard({
               )}
               <button className="btn" onClick={onDismiss}>
                 {t("ask.justChat")}
+              </button>
+              <button className="btn" onClick={onStop}>
+                {t("composer.stopShort")}
               </button>
               {(q.multi || custom[q.id]?.trim()) && (
                 <button className="btn btn--primary" onClick={() => finishOrAdvance()} disabled={!currentAnswered}>

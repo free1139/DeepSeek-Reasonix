@@ -77,6 +77,20 @@ func (c *Config) SetAutoPlan(mode string) error {
 	return nil
 }
 
+// SetUIShortcutLayout selects the CLI keyboard shortcut layout. "classic" keeps
+// historical behavior; "desktop" enables the two-axis desktop-style shortcuts.
+func (c *Config) SetUIShortcutLayout(layout string) error {
+	switch strings.ToLower(strings.TrimSpace(layout)) {
+	case "", "classic", "default", "legacy", "off":
+		c.UI.ShortcutLayout = "classic"
+	case "desktop", "dual", "dual-axis", "dual_axis":
+		c.UI.ShortcutLayout = "desktop"
+	default:
+		return fmt.Errorf("shortcut_layout %q: must be classic|desktop", layout)
+	}
+	return nil
+}
+
 // UpsertProvider adds e, or replaces an existing provider with the same name
 // (preserving its position). Required fields (name, kind, base_url, model/models)
 // are validated; whether the kind is actually registered and the key resolves is
@@ -119,6 +133,23 @@ func (c *Config) SetLanguage(lang string) error {
 	default:
 		return fmt.Errorf("language %q: must be auto|en|zh", lang)
 	}
+	c.ApplyDeepSeekOfficialDefaultPricing()
+	return nil
+}
+
+// SetReasoningLanguage pins the preferred language for visible reasoning text.
+// Empty/auto follows the conversation language.
+func (c *Config) SetReasoningLanguage(lang string) error {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "", "auto", "follow", "conversation", "detect", "default", "model", "model-default", "model_default", "provider":
+		c.Agent.ReasoningLanguage = ""
+	case "zh", "cn", "chinese", "中文":
+		c.Agent.ReasoningLanguage = "zh"
+	case "en", "english":
+		c.Agent.ReasoningLanguage = "en"
+	default:
+		return fmt.Errorf("reasoning language %q: must be auto|zh|en", lang)
+	}
 	return nil
 }
 
@@ -135,6 +166,7 @@ func (c *Config) SetDesktopLanguage(lang string) error {
 	default:
 		return fmt.Errorf("desktop language %q: must be auto|en|zh", lang)
 	}
+	c.ApplyDeepSeekOfficialDefaultPricing()
 	return nil
 }
 
@@ -163,6 +195,20 @@ func (c *Config) SetDesktopAppearance(theme, style string) error {
 	return nil
 }
 
+// SetDesktopLayoutStyle sets the desktop layout style. UI-only; it must not
+// affect CLI output or provider-visible request data.
+func (c *Config) SetDesktopLayoutStyle(style string) error {
+	switch strings.ToLower(strings.TrimSpace(style)) {
+	case "", "classic":
+		c.Desktop.LayoutStyle = "classic"
+	case "workbench", "workspace":
+		c.Desktop.LayoutStyle = "workbench"
+	default:
+		return fmt.Errorf("desktop layout style %q: must be classic|workbench", style)
+	}
+	return nil
+}
+
 // SetDesktopCloseBehavior sets the desktop close-window preference. It is
 // intentionally UI-only and must not affect model prompts or provider-visible
 // request data.
@@ -178,9 +224,101 @@ func (c *Config) SetDesktopCloseBehavior(mode string) error {
 	return nil
 }
 
+// SetDesktopDisplayMode sets the transcript display mode. UI-only.
+func (c *Config) SetDesktopDisplayMode(mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "compact", "minimal":
+		c.Desktop.DisplayMode = "compact"
+	case "", "standard":
+		c.Desktop.DisplayMode = "standard"
+	default:
+		return fmt.Errorf("display mode %q: must be standard|compact", mode)
+	}
+	return nil
+}
+
+// SetDesktopStatusBarStyle sets the desktop status bar metric label style.
+// UI-only; it must not affect CLI output or provider-visible request data.
+func (c *Config) SetDesktopStatusBarStyle(style string) error {
+	switch strings.ToLower(strings.TrimSpace(style)) {
+	case "icon", "icons":
+		c.Desktop.StatusBarStyle = "icon"
+	case "", "text", "label", "labels":
+		c.Desktop.StatusBarStyle = "text"
+	default:
+		return fmt.Errorf("status bar style %q: must be icon|text", style)
+	}
+	return nil
+}
+
+// SetDesktopStatusBarItems sets the ordered visible desktop status bar items.
+// UI-only; it must not affect CLI output or provider-visible request data.
+func (c *Config) SetDesktopStatusBarItems(items []string) error {
+	out := make([]string, 0, len(items))
+	seen := map[string]bool{}
+	for _, raw := range items {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		if !knownDesktopStatusBarItems[id] {
+			return fmt.Errorf("status bar item %q: unknown item", id)
+		}
+		out = append(out, id)
+		seen[id] = true
+	}
+	if len(out) == 0 {
+		out = DefaultDesktopStatusBarItems()
+	}
+	c.Desktop.StatusBarItems = out
+	return nil
+}
+
+// SetDesktopCheckUpdates sets whether the desktop app checks for updates on
+// startup. Manual checks remain available in Settings regardless of this value.
+func (c *Config) SetDesktopCheckUpdates(enabled bool) error {
+	c.Desktop.CheckUpdates = &enabled
+	return nil
+}
+
+// SetColdResumePrune toggles auto-elision of stale tool results on cold resume.
+func (c *Config) SetColdResumePrune(enabled bool) error {
+	c.Agent.ColdResumePrune = &enabled
+	return nil
+}
+
+// SetDesktopTelemetry sets whether the desktop sends the anonymous launch ping.
+func (c *Config) SetDesktopTelemetry(enabled bool) error {
+	c.Desktop.Telemetry = &enabled
+	return nil
+}
+
+// SetDesktopMetrics sets whether the desktop sends aggregate desktop metrics.
+func (c *Config) SetDesktopMetrics(enabled bool) error {
+	c.Desktop.Metrics = &enabled
+	return nil
+}
+
 // SetUICloseBehavior is kept for callers compiled against the old edit API.
 func (c *Config) SetUICloseBehavior(mode string) error {
 	return c.SetDesktopCloseBehavior(mode)
+}
+
+// SetExpandThinking sets whether the desktop reasoning/thinking section is
+// expanded by default. It is desktop-only and must not affect CLI output or
+// provider-visible request data.
+func (c *Config) SetExpandThinking(on bool) error {
+	c.Desktop.ExpandThinking = on
+	return nil
+}
+
+// SetShowReasoning sets the CLI's default verbose-reasoning preference. When
+// true, thinking text is shown in the chat TUI on startup; when false (the
+// default), it stays collapsed until the user toggles it with Ctrl+O or
+// /verbose.
+func (c *Config) SetShowReasoning(on bool) error {
+	c.UI.ShowReasoning = on
+	return nil
 }
 
 // SetProviderThinking updates a provider's provider-specific thinking mode knob.
@@ -600,7 +738,8 @@ func ClearPluginAuthenticationInSource(name string) (PluginEntry, bool, string, 
 }
 
 func pluginTOMLSourcePath(name string) string {
-	for _, path := range []string{"reasonix.toml", userConfigPath()} {
+	paths := append([]string{"reasonix.toml"}, userConfigCandidatePaths()...)
+	for _, path := range paths {
 		if strings.TrimSpace(path) == "" {
 			continue
 		}
@@ -667,6 +806,22 @@ auto_plan = %q
 	return cfg.Agent.AutoPlan, writeConfigFile(path, body)
 }
 
+// SaveMinimalProjectReasoningLanguage writes a new project config that only
+// overrides [agent].reasoning_language.
+func SaveMinimalProjectReasoningLanguage(path, lang string) (string, error) {
+	cfg := Default()
+	if err := cfg.SetReasoningLanguage(lang); err != nil {
+		return "", err
+	}
+	body := fmt.Sprintf(`# Reasonix project configuration.
+# Project-local overrides are merged over the user config.
+
+[agent]
+reasoning_language = %q
+`, cfg.ReasoningLanguage())
+	return cfg.ReasoningLanguage(), writeConfigFile(path, body)
+}
+
 func writeConfigFile(path, body string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("save: empty config path")
@@ -701,16 +856,27 @@ func renderScopeForPath(path string) RenderScope {
 
 func isUserConfigPath(path string) bool {
 	path = strings.TrimSpace(path)
-	uc := strings.TrimSpace(userConfigPath())
-	if path == "" || uc == "" {
+	if path == "" {
 		return false
 	}
-	pathAbs, pathErr := filepath.Abs(path)
-	ucAbs, ucErr := filepath.Abs(uc)
-	if pathErr == nil && ucErr == nil {
-		return filepath.Clean(pathAbs) == filepath.Clean(ucAbs)
+	for _, uc := range userConfigCandidatePaths() {
+		uc = strings.TrimSpace(uc)
+		if uc == "" {
+			continue
+		}
+		pathAbs, pathErr := filepath.Abs(path)
+		ucAbs, ucErr := filepath.Abs(uc)
+		if pathErr == nil && ucErr == nil {
+			if filepath.Clean(pathAbs) == filepath.Clean(ucAbs) {
+				return true
+			}
+			continue
+		}
+		if filepath.Clean(path) == filepath.Clean(uc) {
+			return true
+		}
 	}
-	return filepath.Clean(path) == filepath.Clean(uc)
+	return false
 }
 
 // Save writes the configuration back to the file it was loaded from

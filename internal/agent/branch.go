@@ -27,6 +27,7 @@ type BranchMeta struct {
 	WorkspaceRoot    string    `json:"workspace_root,omitempty"`
 	TopicID          string    `json:"topic_id,omitempty"`
 	TopicTitle       string    `json:"topic_title,omitempty"`
+	Model            string    `json:"model,omitempty"`
 }
 
 func (m BranchMeta) DefaultScope() string {
@@ -215,4 +216,47 @@ func ListBranches(dir string) ([]BranchInfo, error) {
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
 	return out, nil
+}
+
+// RenameSession updates the TopicTitle in the session's .jsonl.meta sidecar
+// file. If no meta file exists yet, one is created. This is used by the
+// /rename CLI command and desktop UI to give sessions human-readable names.
+func RenameSession(sessionPath string, title string) error {
+	if sessionPath == "" {
+		return fmt.Errorf("empty session path")
+	}
+	m, err := EnsureBranchMeta(sessionPath)
+	if err != nil {
+		return err
+	}
+	m.TopicTitle = title
+	return SaveBranchMeta(sessionPath, m)
+}
+
+// LoadSessionModel reads the canonical provider/model ref saved beside a
+// session transcript.
+func LoadSessionModel(sessionPath string) (string, bool) {
+	meta, ok, err := LoadBranchMeta(sessionPath)
+	if err != nil || !ok {
+		return "", false
+	}
+	model := strings.TrimSpace(meta.Model)
+	if model == "" {
+		return "", false
+	}
+	return model, true
+}
+
+// SetBranchModelPreserveUpdated stores the canonical provider/model ref without
+// changing the session activity timestamp.
+func SetBranchModelPreserveUpdated(sessionPath, model string) error {
+	if sessionPath == "" {
+		return fmt.Errorf("empty session path")
+	}
+	meta, err := EnsureBranchMeta(sessionPath)
+	if err != nil {
+		return err
+	}
+	meta.Model = strings.TrimSpace(model)
+	return SaveBranchMetaPreserveUpdated(sessionPath, meta)
 }

@@ -46,7 +46,8 @@ const maxResultChars = 8000
 type updateSink struct {
 	conn      notifier
 	sessionID string
-	approve   func(id string, allow, session, persist bool, scope string)
+	approve   func(id string, allow, session, persist bool)
+	answer    func(id string, answers []event.AskAnswer)
 	mu        sync.Mutex
 	turnCtx   context.Context
 }
@@ -62,13 +63,13 @@ func (s *updateSink) bindApprove(fn func(id string, allow, session, persist bool
 		s.approve = nil
 		return
 	}
-	s.approve = func(id string, allow, session, persist bool, _ string) {
-		fn(id, allow, session, persist)
-	}
+	s.approve = fn
 }
 
-func (s *updateSink) bindApproveWithScope(fn func(id string, allow, session, persist bool, scope string)) {
-	s.approve = fn
+// bindAnswer installs the controller's AnswerQuestion callback for AskRequest
+// events.
+func (s *updateSink) bindAnswer(fn func(id string, answers []event.AskAnswer)) {
+	s.answer = fn
 }
 
 func (s *updateSink) setTurnContext(ctx context.Context) {
@@ -164,6 +165,13 @@ func (s *updateSink) Emit(e event.Event) {
 		// (the agent emits serially); the answer unblocks the loop.
 		turnCtx := s.currentTurnContext()
 		go s.requestPermission(turnCtx, e.Approval)
+
+	case event.AskRequest:
+		// ACP has no separate "ask the user a business question" method. Reuse
+		// the standard permission round-trip with the question options as choices;
+		// clients such as Zed already know how to render this interaction.
+		turnCtx := s.currentTurnContext()
+		go s.requestAsk(turnCtx, e.Ask)
 	}
 }
 
@@ -235,7 +243,6 @@ func (s *updateSink) requestPermission(ctx context.Context, a event.Approval) {
 	}
 
 	allow, session, persist := false, false, false
-	scope := permission.ApprovalScopeExact
 	if raw, err := s.conn.Request(ctx, "session/request_permission", params); err == nil {
 		var res PermissionRequestResult
 		if json.Unmarshal(raw, &res) == nil && res.Outcome.Outcome == "selected" {
@@ -246,52 +253,98 @@ func (s *updateSink) requestPermission(ctx context.Context, a event.Approval) {
 				allow, session = true, true
 			case OptAllowPersistent:
 				allow, session, persist = true, true, true
-			case OptAllowPrefix:
-				allow, session = true, true
-				scope = permission.ApprovalScopePrefix
-			case OptPersistPrefix:
-				allow, session, persist = true, true, true
-				scope = permission.ApprovalScopePrefix
 			}
 		}
 	}
-	s.approve(a.ID, allow, session, persist, scope)
+	s.approve(a.ID, allow, session, persist)
+}
+
+func (s *updateSink) requestAsk(ctx context.Context, a event.Ask) {
+	if s.answer == nil {
+		return
+	}
+	answers := make([]event.AskAnswer, 0, len(a.Questions))
+	for _, q := range a.Questions {
+		selected, ok := s.requestAskQuestion(ctx, a.ID, q)
+		if !ok {
+			s.answer(a.ID, nil)
+			return
+		}
+		answers = append(answers, event.AskAnswer{QuestionID: q.ID, Selected: []string{selected}})
+	}
+	s.answer(a.ID, answers)
+}
+
+func (s *updateSink) requestAskQuestion(ctx context.Context, askID string, q event.AskQuestion) (string, bool) {
+	title := strings.TrimSpace(q.Prompt)
+	if title == "" {
+		title = strings.TrimSpace(q.Header)
+	}
+	if title == "" {
+		title = "Question"
+	}
+	content := []toolContent(nil)
+	if q.Header != "" && q.Header != title {
+		content = append(content, toolContent{Type: "content", Content: textBlock(q.Header)})
+	}
+	options := make([]PermissionOption, 0, len(q.Options)+1)
+	labelsByID := make(map[string]string, len(q.Options))
+	for i, opt := range q.Options {
+		id := fmt.Sprintf("%s:%d", q.ID, i+1)
+		name := strings.TrimSpace(opt.Label)
+		if strings.TrimSpace(opt.Description) != "" {
+			name += " - " + strings.TrimSpace(opt.Description)
+		}
+		options = append(options, PermissionOption{OptionID: id, Name: name, Kind: OptAllowOnce})
+		labelsByID[id] = opt.Label
+	}
+	options = append(options, PermissionOption{OptionID: q.ID + ":cancel", Name: "Cancel", Kind: OptRejectOnce})
+
+	rawInput, _ := json.Marshal(map[string]any{
+		"id":       q.ID,
+		"question": title,
+		"options":  q.Options,
+		"multi":    q.Multi,
+	})
+	params := PermissionRequestParams{
+		SessionID: s.sessionID,
+		ToolCall: PermissionToolCall{
+			ToolCallID: "ask-" + askID + "-" + q.ID,
+			Title:      title,
+			Kind:       "other",
+			Status:     "pending",
+			Content:    content,
+			RawInput:   rawInput,
+		},
+		Options: options,
+	}
+
+	raw, err := s.conn.Request(ctx, "session/request_permission", params)
+	if err != nil {
+		return "", false
+	}
+	var res PermissionRequestResult
+	if json.Unmarshal(raw, &res) != nil || res.Outcome.Outcome != "selected" {
+		return "", false
+	}
+	label, ok := labelsByID[res.Outcome.OptionID]
+	return label, ok
 }
 
 func approvalOptionNames(tool, subject string) (session, persistent string) {
-	sessionRule := permission.SessionGrantRuleForScope(tool, subject, permission.ApprovalScopeExact)
-	persistentRule := permission.RememberRuleForScope(tool, subject, permission.ApprovalScopeExact)
-	switch {
-	case tool == "bash" && strings.TrimSpace(subject) != "":
-		return "Allow " + sessionRule + " for this session", "Always allow " + persistentRule + " (save to config)"
-	case permission.IsFileMutationTool(tool):
-		if strings.TrimSpace(subject) != "" {
-			return "Allow " + sessionRule + " for this session", "Always allow " + persistentRule + " (save to config)"
-		}
-		return "Allow " + sessionRule + " for this session", "Always allow " + persistentRule + " (save to config)"
-	default:
-		return "Allow " + sessionRule + " for this session", "Always allow " + persistentRule + " (save to config)"
-	}
+	sessionRule := permission.SessionGrantRuleForScope(tool, subject)
+	persistentRule := permission.RememberRuleForScope(tool, subject)
+	return "Allow " + sessionRule + " for this session", "Always allow " + persistentRule + " (save to config)"
 }
 
 func approvalOptions(tool, subject string) []PermissionOption {
 	allowSessionName, allowPersistentName := approvalOptionNames(tool, subject)
 	options := []PermissionOption{
 		{OptionID: string(OptAllowOnce), Name: "Allow", Kind: OptAllowOnce},
+		{OptionID: string(OptAllowAlways), Name: allowSessionName, Kind: OptAllowAlways},
+		{OptionID: string(OptAllowPersistent), Name: allowPersistentName, Kind: OptAllowPersistent},
+		{OptionID: string(OptRejectOnce), Name: "Reject", Kind: OptRejectOnce},
 	}
-	if tool == "bash" && permission.BashCommandPrefix(subject) != "" {
-		prefixRule := permission.RememberRuleForScope(tool, subject, permission.ApprovalScopePrefix)
-		options = append(options,
-			PermissionOption{OptionID: string(OptAllowPrefix), Name: "Allow " + prefixRule + " for this session", Kind: OptAllowAlways},
-			PermissionOption{OptionID: string(OptPersistPrefix), Name: "Always allow " + prefixRule + " (save to config)", Kind: OptAllowPersistent},
-		)
-	} else {
-		options = append(options,
-			PermissionOption{OptionID: string(OptAllowAlways), Name: allowSessionName, Kind: OptAllowAlways},
-			PermissionOption{OptionID: string(OptAllowPersistent), Name: allowPersistentName, Kind: OptAllowPersistent},
-		)
-	}
-	options = append(options, PermissionOption{OptionID: string(OptRejectOnce), Name: "Reject", Kind: OptRejectOnce})
 	return options
 }
 
@@ -330,7 +383,7 @@ func toolKindFor(name string) string {
 		return "read"
 	case "grep":
 		return "search"
-	case "edit_file", "multiedit", "write_file":
+	case "edit_file", "move_file", "multiedit", "write_file":
 		return "edit"
 	case "bash":
 		return "execute"

@@ -47,6 +47,7 @@ func PlannerPromptWithContext(context string) string {
 type Coordinator struct {
 	planner        provider.Provider
 	plannerSess    *Session
+	plannerSystem  string
 	plannerPricing *provider.Pricing
 	plannerAgent   *Agent
 	executor       *Agent
@@ -66,10 +67,15 @@ func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerP
 	if nilutil.IsNil(sink) {
 		sink = event.Discard
 	}
+	if plannerSession == nil {
+		plannerSession = NewSession("")
+	}
+	plannerSystem := sessionSystemPrompt(plannerSession)
 	var plannerAgent *Agent
 	if plannerTools != nil {
 		plannerOptions.Temperature = temperature
 		plannerOptions.Pricing = plannerPricing
+		plannerOptions.UsageSource = event.UsageSourcePlanner
 		plannerAgent = New(planner, plannerTools, plannerSession, plannerOptions, plannerSink(sink))
 	}
 	if executor != nil {
@@ -78,12 +84,75 @@ func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerP
 	return &Coordinator{
 		planner:        planner,
 		plannerSess:    plannerSession,
+		plannerSystem:  plannerSystem,
 		plannerPricing: plannerPricing,
 		plannerAgent:   plannerAgent,
 		executor:       executor,
 		temperature:    temperature,
 		sink:           sink,
 		shouldPlan:     shouldPlan,
+	}
+}
+
+func sessionSystemPrompt(s *Session) string {
+	if s == nil {
+		return ""
+	}
+	for _, m := range s.Snapshot() {
+		if m.Role == provider.RoleSystem {
+			return m.Content
+		}
+	}
+	return ""
+}
+
+// ResetPlannerSession discards turn-local planner history when the owning
+// controller moves to a different executor session. Saved transcripts only
+// persist executor-visible conversation; carrying the old planner transcript
+// into a new/resumed session can make the next plan reuse unrelated tasks.
+func (c *Coordinator) ResetPlannerSession() {
+	if c == nil {
+		return
+	}
+	system := c.plannerSystem
+	if system == "" {
+		system = sessionSystemPrompt(c.plannerSess)
+	}
+	next := NewSession(system)
+	c.plannerSess = next
+	if c.plannerAgent != nil {
+		c.plannerAgent.SetSession(next)
+	}
+}
+
+// SetReasoningLanguage updates both agents in two-model mode. The raw planner
+// path receives controller-composed input directly, but a tool-enabled planner
+// owns its own Agent and must clear stale zh/en preferences on live changes.
+func (c *Coordinator) SetReasoningLanguage(lang string) {
+	if c == nil {
+		return
+	}
+	if c.plannerAgent != nil {
+		c.plannerAgent.SetReasoningLanguage(lang)
+	}
+	if c.executor != nil {
+		c.executor.SetReasoningLanguage(lang)
+	}
+}
+
+// SetPlanMode propagates the read-only gate to both planner and executor agents
+// in two-model mode. Callers that only set the controller's executor would miss
+// the planner agent inside the Coordinator, causing stale plan-mode state after
+// approvals or manual mode switches.
+func (c *Coordinator) SetPlanMode(v bool) {
+	if c == nil {
+		return
+	}
+	if c.plannerAgent != nil {
+		c.plannerAgent.SetPlanMode(v)
+	}
+	if c.executor != nil {
+		c.executor.SetPlanMode(v)
 	}
 }
 
@@ -134,7 +203,7 @@ func (c *Coordinator) plan(ctx context.Context, input string) (string, error) {
 	}
 	// Closes the planner's raw text block (no markdown redraw) and prints its
 	// usage line, mirroring the old Fprintln + printUsage tail.
-	c.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: c.plannerPricing})
+	c.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: c.plannerPricing, UsageSource: event.UsageSourcePlanner})
 
 	plan := text.String()
 	c.plannerSess.Add(provider.Message{Role: provider.RoleAssistant, Content: plan})
@@ -189,6 +258,31 @@ Executor instructions:
 - Do not ask the user how to trigger the executor. You are already in the executor phase.
 - If the task requires changes, call the appropriate tools (for example write/edit/bash) instead of only restating the plan.
 - If a target path is outside the writable workspace or otherwise blocked, explain that specific blocker and ask for the needed path/approval.
+- **Serial workflow**: establish the task list with one todo_write (first sub-task in_progress), then for EACH sub-task execute it and call complete_step with evidence. The host advances the list for you — it marks the sub-task completed and moves the next to in_progress, so you don't need another todo_write to mark completions. Sign off one sub-task at a time; never batch completions.
 
 Carry out the task, adapting the plan as needed.`, executorHandoffMarker, task, plan)
+}
+
+// HandoffTask returns the original user task embedded in an executor handoff
+// message, or s unchanged when it is not one. Session previews and auto-titles
+// use it so dual-model sessions surface the user's words, not the handoff
+// boilerplate (#3860).
+func HandoffTask(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "# "+executorHandoffMarker) {
+		return s
+	}
+	const header = "Original task:\n"
+	i := strings.Index(trimmed, header)
+	if i < 0 {
+		return s
+	}
+	rest := trimmed[i+len(header):]
+	if j := strings.Index(rest, "\n\nPlanner output:"); j >= 0 {
+		rest = rest[:j]
+	}
+	if task := strings.TrimSpace(rest); task != "" {
+		return task
+	}
+	return s
 }

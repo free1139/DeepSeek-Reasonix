@@ -1,7 +1,8 @@
 // Package sandbox wraps a shell command in an OS-level jail so the model's
 // `bash` calls are confined: it may read freely but write only inside the
-// workspace (plus temp and toolchain caches) and reach the network only when
-// allowed. This is the *enforcement* layer beneath the permission rules
+// writable roots (workspace, configured extras, plus temp and toolchain caches)
+// and reach the network only when allowed. This is the *enforcement* layer
+// beneath the permission rules
 // (*policy*): a permitted command still cannot escape the box.
 //
 // Only macOS (Seatbelt via sandbox-exec) is implemented; on every other OS, or
@@ -24,6 +25,10 @@ type Spec struct {
 	// command cannot exfiltrate or fetch; many dev commands (module/package
 	// downloads) need it, so it defaults on at the config layer.
 	Network bool
+	// Shell is the interpreter the bash tool runs under. A zero value (empty
+	// Path) means the tool resolves one itself; the composition root sets it from
+	// [tools.shell] so the configured choice rides along with the spec.
+	Shell Shell
 }
 
 // enforce reports whether the spec asks for confinement.

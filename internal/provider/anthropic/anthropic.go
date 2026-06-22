@@ -71,8 +71,10 @@ func New(cfg provider.Config) (provider.Provider, error) {
 		baseURL = defaultBaseURL
 	}
 	keyEnv, _ := cfg.Extra["api_key_env"].(string) // for actionable auth errors
+	keySource, _ := cfg.Extra["api_key_source"].(string)
 	thinking, _ := cfg.Extra["thinking"].(string)
 	effort, _ := cfg.Extra["effort"].(string)
+	vision, _ := cfg.Extra["vision"].(bool)
 	httpClient, err := newHTTPClient(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: network: %w", err)
@@ -96,10 +98,12 @@ func New(cfg provider.Config) (provider.Provider, error) {
 		name:        name,
 		apiKey:      cfg.APIKey,
 		keyEnv:      keyEnv,
+		keySource:   keySource,
 		baseURL:     root,
 		model:       cfg.Model,
 		thinking:    thinking,
 		effort:      effort,
+		vision:      vision,
 		http:        httpClient, // no overall timeout; lifecycle is ctx-driven
 		idleTimeout: defaultStreamIdleTimeout,
 	}, nil
@@ -114,15 +118,28 @@ type client struct {
 	name        string
 	apiKey      string
 	keyEnv      string // api_key_env name, surfaced in auth errors
+	keySource   string // source of keyEnv, surfaced in auth errors
 	baseURL     string
 	model       string
 	thinking    string // "adaptive" enables extended thinking; "" = off (config-driven)
 	effort      string // output_config.effort: low|medium|high|xhigh|max; "" = provider default
+	vision      bool   // model accepts image input — embed attached images as base64 image blocks
 	http        *http.Client
 	idleTimeout time.Duration // SSE stall watchdog window; defaultStreamIdleTimeout unless a test overrides
+	authed      atomic.Bool   // a request has succeeded — gate transient-401 retry
 }
 
 func (c *client) Name() string { return c.name }
+
+func (c *client) sendOpts() provider.SendOptions {
+	return provider.SendOptions{
+		Provider:   c.name,
+		KeyEnv:     c.keyEnv,
+		KeySource:  c.keySource,
+		KeyPresent: c.apiKey != "",
+		RetryAuth:  c.authed.Load(),
+	}
+}
 
 // bufPool reuses byte buffers for JSON-marshalled request bodies, reducing GC
 // churn from repeated alloc/free of ~10-100KB buffers per turn.
@@ -152,7 +169,7 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 		httpReq.Header.Set("anthropic-version", anthropicVersion)
 		return httpReq, nil
 	}
-	resp, err := provider.SendWithRetry(ctx, c.http, c.name, c.keyEnv, newReq)
+	resp, err := provider.SendWithRetry(ctx, c.http, c.sendOpts(), newReq)
 	if err != nil {
 		var apiErr *provider.APIError
 		if errors.As(err, &apiErr) && apiErr.Status == 400 {
@@ -160,6 +177,7 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 		}
 		return nil, err
 	}
+	c.authed.Store(true)
 
 	out := make(chan provider.Chunk)
 	go c.readStream(resp, out)
@@ -197,6 +215,13 @@ func (c *client) buildRequest(req provider.Request) anthRequest {
 		case provider.RoleUser:
 			if m.Content != "" {
 				appendBlocks("user", contentBlock{Type: "text", Text: m.Content})
+			}
+			if c.vision {
+				for _, url := range m.Images {
+					if mt, data, ok := provider.ParseImageDataURL(url); ok {
+						appendBlocks("user", contentBlock{Type: "image", Source: &imageSource{Type: "base64", MediaType: mt, Data: data}})
+					}
+				}
 			}
 		case provider.RoleTool:
 			content := m.Content
@@ -500,7 +525,14 @@ type contentBlock struct {
 	Input        json.RawMessage `json:"input,omitempty"`       // tool_use
 	ToolUseID    string          `json:"tool_use_id,omitempty"` // tool_result
 	Content      string          `json:"content,omitempty"`     // tool_result
+	Source       *imageSource    `json:"source,omitempty"`      // image
 	CacheControl *cacheControl   `json:"cache_control,omitempty"`
+}
+
+type imageSource struct {
+	Type      string `json:"type"` // "base64"
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
 type anthTool struct {

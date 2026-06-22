@@ -80,14 +80,6 @@ type Rule struct {
 	Literal bool
 }
 
-const (
-	// ApprovalScopeExact grants only the concrete tool subject being approved.
-	ApprovalScopeExact = "exact"
-	// ApprovalScopePrefix grants a conservative command prefix for bash
-	// approvals, such as "go test:*". Non-bash tools fall back to exact scope.
-	ApprovalScopePrefix = "prefix"
-)
-
 // ParseRule parses "ToolName", "ToolName(glob)", or the legacy
 // "ToolName=literal" form. Surrounding whitespace is trimmed. The "=literal"
 // form (taken when the '=' precedes any '(') matches the rest of the string
@@ -153,10 +145,12 @@ func New(mode string, allow, ask, deny []string) Policy {
 
 // Decide evaluates a tool call. readOnly is the tool's own classification; args
 // is the raw JSON the model sent, from which the call's subject is extracted
-// for glob matching. Precedence: deny > ask > allow > fallback (Allow for
-// readers, Mode for writers).
+// for glob matching. Calls with multiple subjects, such as move_file's source
+// and destination paths, must be safe for every subject before the call is
+// allowed. Precedence: deny > ask > allow > fallback (Allow for readers, Mode
+// for writers).
 func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Decision {
-	return p.DecideSubject(toolName, readOnly, Subject(args))
+	return p.DecideSubjects(toolName, readOnly, Subjects(args))
 }
 
 // DecideSubject evaluates a tool call when the caller already extracted the
@@ -174,6 +168,26 @@ func (p Policy) DecideSubject(toolName string, readOnly bool, subject string) De
 	default:
 		return p.Mode
 	}
+}
+
+// DecideSubjects evaluates a tool call against every subject the call touches.
+// This keeps two-path operations honest: a move is denied if either endpoint is
+// denied, asks if either endpoint requires approval, and is allowed only when
+// every endpoint is allowed under the same policy.
+func (p Policy) DecideSubjects(toolName string, readOnly bool, subjects []string) Decision {
+	if len(subjects) == 0 {
+		return p.DecideSubject(toolName, readOnly, "")
+	}
+	out := Allow
+	for _, subject := range subjects {
+		switch p.DecideSubject(toolName, readOnly, subject) {
+		case Deny:
+			return Deny
+		case Ask:
+			out = Ask
+		}
+	}
+	return out
 }
 
 // matchAny reports whether any rule matches the (toolName, subject) pair. A
@@ -255,24 +269,52 @@ func bashRulePrefixBaseMatches(existing, candidate Rule) bool {
 // call's "subject" — the thing a Subject glob matches against. Generic so tools
 // need not implement a permission-specific method: bash exposes command, the
 // file tools expose path / file_path, grep & glob expose pattern.
-var subjectKeys = []string{"command", "file_path", "path", "pattern"}
+var subjectKeys = []string{"command", "file_path", "path", "source_path", "destination_path", "pattern"}
 
-// Subject extracts the matchable subject string from a call's raw JSON args,
-// returning "" when none of the known keys is present (such a call only matches
-// bare "ToolName" rules).
+// Subject extracts the primary matchable subject string from a call's raw JSON
+// args, returning "" when none of the known keys is present (such a call only
+// matches bare "ToolName" rules). Use Subjects for permission decisions that
+// must account for every touched endpoint.
 func Subject(args json.RawMessage) string {
+	subjects := Subjects(args)
+	if len(subjects) > 0 {
+		return subjects[0]
+	}
+	return ""
+}
+
+// Subjects extracts every matchable subject from a call's raw JSON args. Most
+// tools expose one subject; move_file exposes both source_path and
+// destination_path so path-scoped permission rules can protect either endpoint.
+func Subjects(args json.RawMessage) []string {
 	if len(args) == 0 {
-		return ""
+		return nil
 	}
 	var m map[string]any
 	if err := json.Unmarshal(args, &m); err != nil {
-		return ""
+		return nil
+	}
+	src := stringArg(m, "source_path")
+	dst := stringArg(m, "destination_path")
+	if src != "" && dst != "" {
+		out := []string{src}
+		if dst != src {
+			out = append(out, dst)
+		}
+		return out
 	}
 	for _, k := range subjectKeys {
-		if v, ok := m[k]; ok {
-			if s, ok := v.(string); ok && s != "" {
-				return s
-			}
+		if s := stringArg(m, k); s != "" {
+			return []string{s}
+		}
+	}
+	return nil
+}
+
+func stringArg(m map[string]any, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s
 		}
 	}
 	return ""
@@ -379,49 +421,49 @@ func (g *Gate) Check(ctx context.Context, toolName string, args json.RawMessage,
 }
 
 // rememberRule builds the rule string persisted when the user picks "always
-// allow". Bash commands and file paths stay subject-scoped; other tools are
-// remembered by tool name. Deny and ask rules keep their higher precedence.
+// allow". Bash commands prefer a safe command prefix (e.g. go test:*) so
+// "always allow" covers similar invocations with different arguments. File
+// mutation tools are remembered tool-wide ("Edit") so approving one file edit
+// covers all files. Other tools are remembered by tool name. Deny and ask rules keep their higher precedence.
 func rememberRule(toolName, subject string) string {
-	return RememberRuleForScope(toolName, subject, ApprovalScopeExact)
+	return RememberRuleForScope(toolName, subject)
 }
 
 // RememberRuleForScope builds the rule string persisted when the user chooses
-// an always-allow option for a given approval scope.
-func RememberRuleForScope(toolName, subject, scope string) string {
+// an always-allow option. Bash commands prefer a safe prefix (go test:*) so
+// similar invocations (different search terms, different test packages) match;
+// when no safe prefix can be extracted the exact command is used. File
+// mutation tools are always remembered tool-wide (Edit). Other tools use their
+// bare tool name. Deny rules still take precedence on every call.
+func RememberRuleForScope(toolName, subject string) string {
 	subject = strings.TrimSpace(subject)
 	if subject != "" && toolName == "bash" {
-		if scope == ApprovalScopePrefix {
-			if pattern := BashCommandPrefix(subject); pattern != "" {
-				return "Bash(" + pattern + ")"
-			}
+		if pattern := BashCommandPrefix(subject); pattern != "" {
+			return "Bash(" + pattern + ")"
 		}
 		return "Bash(" + subject + ")"
 	}
 	if IsFileMutationTool(toolName) {
-		if subject != "" {
-			return "Edit(" + subject + ")"
-		}
 		return "Edit"
 	}
 	return toolName
 }
 
 // SessionGrantKey returns the in-memory rule for "allow this session". Bash
-// follows Claude Code's command-scoped behavior by default; file mutation tools
-// share a session grant so edit-heavy turns do not pause on every file operation.
+// prefers a command prefix when one is available, falling back to the exact
+// command when unsafe. File mutation tools share a single Edit grant.
 func SessionGrantKey(toolName, subject string) string {
-	return SessionGrantRuleForScope(toolName, subject, ApprovalScopeExact)
+	return SessionGrantRuleForScope(toolName, subject)
 }
 
-// SessionGrantRuleForScope returns the in-memory rule for a scoped session
-// grant. Prefix grants are intentionally bash-only.
-func SessionGrantRuleForScope(toolName, subject, scope string) string {
+// SessionGrantRuleForScope returns the in-memory rule for a session grant.
+// Bash prefers a command prefix when one is available; file mutation tools
+// share a single Edit grant; all other tools return the bare tool name.
+func SessionGrantRuleForScope(toolName, subject string) string {
 	subject = strings.TrimSpace(subject)
 	if toolName == "bash" && subject != "" {
-		if scope == ApprovalScopePrefix {
-			if pattern := BashCommandPrefix(subject); pattern != "" {
-				return "Bash(" + pattern + ")"
-			}
+		if pattern := BashCommandPrefix(subject); pattern != "" {
+			return "Bash(" + pattern + ")"
 		}
 		return "Bash(" + subject + ")"
 	}
@@ -466,7 +508,7 @@ func isPackageManagerRun(base string) bool {
 // IsFileMutationTool reports whether a built-in tool mutates workspace files.
 func IsFileMutationTool(toolName string) bool {
 	switch toolName {
-	case "write_file", "edit_file", "multi_edit", "notebook_edit", "delete_range", "delete_symbol":
+	case "write_file", "edit_file", "multi_edit", "move_file", "notebook_edit", "delete_range", "delete_symbol":
 		return true
 	default:
 		return false

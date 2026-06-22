@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
-import { ArrowUp, Eye, FileText, Folder, List, MessageSquare, Search, Shield, ShieldAlert, ShieldCheck, SlidersHorizontal, Square, Target, Trash2, X } from "lucide-react";
+import { ArrowUp, Check, Eye, FileText, Folder, Gauge, List, MessageSquare, MoreHorizontal, Search, Shield, ShieldAlert, ShieldCheck, SlidersHorizontal, Square, Target, Trash2, X } from "lucide-react";
 import { asArray } from "../lib/array";
+import { filterAtMatches } from "../lib/atMatches";
 import { DedupIndex, sha256 } from "../lib/attachDedup";
 import { app, onFilesDropped } from "../lib/bridge";
+import { canUsePromptHistory, isFnKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
+import { cacheGeneration, loadOlder } from "../lib/composerHistory";
 import { SPINNER_WORDS, useI18n } from "../lib/i18n";
+import { detectShortcutPlatform, matchesShortcut } from "../lib/keyboardShortcuts";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
 import { useToast } from "../lib/toast";
-import { type CollaborationMode, type CommandInfo, type ComposerInsertRequest, type DirEntry, type EffortInfo, type HistoryMessage, type Mode, type SessionMeta, type SessionReference, type SlashArgItem, type SlashArgsResult, type ToolApprovalMode } from "../lib/types";
+import { type CollaborationMode, type CommandInfo, type ComposerInsertRequest, type DirEntry, type EffortInfo, type HistoryMessage, type Mode, type PromptHistoryEntry, type SessionMeta, type SessionReference, type SlashArgItem, type SlashArgsResult, type TokenMode, type ToolApprovalMode } from "../lib/types";
 import {
   formatWorkspaceReference,
   parseWorkspaceReference,
@@ -21,10 +25,12 @@ import { ANCHORED_POPOVER_CLOSE_MS, AnchoredPopover } from "./AnchoredPopover";
 import { EffortSwitcher } from "./EffortSwitcher";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { Tooltip } from "./Tooltip";
+import { ComposerContextCard } from "./ComposerContextCard";
 
 interface Attachment {
   path: string;
   previewUrl?: string;
+  displayName?: string;
 }
 
 interface AttachmentDedupKey {
@@ -43,6 +49,7 @@ const COMPOSER_MIN_HEIGHT = 104;
 const COMPOSER_MAX_HEIGHT = 360;
 const COMPOSER_MAX_VIEWPORT_RATIO = 0.4;
 const COMPOSER_AUTO_RESERVED_HEIGHT = 58;
+const PROMPT_HISTORY_PREFETCH_REMAINING = 3;
 // Grace after compositionend to swallow a confirm-Enter that lands just after
 // it; the real gap is a few ms, so keep it short or a deliberate quick second
 // Enter (submit) gets eaten too.
@@ -71,8 +78,33 @@ function renderPastedBlock(block: PastedBlock): string {
 }
 
 function baseName(path: string): string {
-  const clean = path.replace(/\/$/, "");
-  return clean.split("/").filter(Boolean).pop() ?? path;
+  const clean = path.replace(/[\\/]+$/, "");
+  return clean.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+function attachmentName(attachment: Attachment): string {
+  return (attachment.displayName || baseName(attachment.path) || "attachment").trim();
+}
+
+function attachmentExt(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 ? name.slice(dot + 1).toUpperCase() : "";
+}
+
+function displayRefName(name: string): string {
+  return name.replace(/[\[\]\(\)\r\n]+/g, " ").replace(/\s+/g, " ").trim() || "attachment";
+}
+
+function formatAttachmentDisplayReference(attachment: Attachment): string {
+  return `@[${displayRefName(attachmentName(attachment))}](${attachment.path})`;
+}
+
+function sortComposerAttachments(items: Attachment[]): Attachment[] {
+  return [...items].sort((a, b) => {
+    const ai = a.previewUrl ? 0 : 1;
+    const bi = b.previewUrl ? 0 : 1;
+    return ai - bi;
+  });
 }
 
 function workspaceReferenceKey(ref: WorkspaceReference): string {
@@ -291,6 +323,7 @@ export function Composer({
   running,
   collaborationMode,
   toolApprovalMode,
+  tokenMode,
   goal,
   cwd,
   modelLabel,
@@ -302,12 +335,15 @@ export function Composer({
   onSetMode,
   onSetCollaborationMode,
   onSetToolApprovalMode,
+  onToggleYoloApprovalMode,
   onSetGoal,
   onClearGoal,
   onSwitchModel,
   onSetEffort,
+  onSetTokenMode,
   insertRequest,
   disabled,
+  readOnly = false,
   decisionPending = false,
   ready,
   turnStartAt,
@@ -318,6 +354,7 @@ export function Composer({
   running: boolean;
   collaborationMode: CollaborationMode;
   toolApprovalMode: ToolApprovalMode;
+  tokenMode: TokenMode;
   goal?: string;
   cwd?: string;
   modelLabel: string;
@@ -331,12 +368,15 @@ export function Composer({
   onSetMode: (mode: Mode) => void;
   onSetCollaborationMode: (mode: CollaborationMode) => void;
   onSetToolApprovalMode: (mode: ToolApprovalMode) => void;
+  onToggleYoloApprovalMode: () => void;
   onSetGoal: (goal: string) => void;
   onClearGoal: () => void;
   onSwitchModel: (name: string) => void;
   onSetEffort: (level: string) => void;
+  onSetTokenMode: (mode: TokenMode) => void;
   insertRequest?: ComposerInsertRequest | null;
   disabled?: boolean;
+  readOnly?: boolean;
   decisionPending?: boolean;
   // ready/cwd/running re-trigger the command fetch: Commands() returns only
   // built-ins until boot.Build finishes (the controller, hence skills/custom/MCP,
@@ -350,6 +390,7 @@ export function Composer({
 }) {
   const { t, locale } = useI18n();
   const { showToast } = useToast();
+  const shortcutPlatform = useMemo(() => detectShortcutPlatform(), []);
   const now = useTick(running);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -368,6 +409,8 @@ export function Composer({
   const [textareaAutoOverflow, setTextareaAutoOverflow] = useState(false);
   const [intentMenuOpen, setIntentMenuOpen] = useState(false);
   const [intentMenuClosing, setIntentMenuClosing] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [moreMenuClosing, setMoreMenuClosing] = useState(false);
   const [showPastChats, setShowPastChats] = useState(false);
   const [pastChats, setPastChats] = useState<SessionMeta[]>([]);
   const [pastChatQuery, setPastChatQuery] = useState("");
@@ -375,10 +418,23 @@ export function Composer({
   const [loadingPastChats, setLoadingPastChats] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [composerPrompt, setComposerPrompt] = useState<string | null>(null);
+  // Prompt history navigation (plain ↑/↓)
+  // Use refs for values read inside async closures to avoid stale captures
+  // on rapid key presses (the React closure trap).
+  const historyIndexRef = useRef(-1);
+  const historyEntriesRef = useRef<PromptHistoryEntry[]>([]);
+  const historyLoadRef = useRef<Promise<void> | null>(null);
+  const historyGenerationRef = useRef(cacheGeneration());
+  // historyIndex state is written (via setHistoryIndex) for potential future
+  // UI feedback (e.g. "3/200" indicator); currently unused in render.
+  const [, setHistoryIndex] = useState(-1);
+  const savedTextRef = useRef("");
   const taRef = useRef<HTMLTextAreaElement>(null);
   const composerCardRef = useRef<HTMLDivElement>(null);
   const intentMenuAnchorRef = useRef<HTMLButtonElement>(null);
+  const moreMenuAnchorRef = useRef<HTMLButtonElement>(null);
   const intentCloseTimerRef = useRef<number | null>(null);
+  const moreCloseTimerRef = useRef<number | null>(null);
   const wasRunning = useRef(running);
   const composingRef = useRef(false);
   const lastCompositionEndAt = useRef(0);
@@ -558,13 +614,7 @@ export function Composer({
   const atMatches = useMemo(
     () => {
       if (atRaw === null) return [];
-      const local = entries.filter((e) => e.name.toLowerCase().includes(atFrag));
-      const seen = new Set(local.map((e) => e.name));
-      const searched = searchEntries.filter((e) => {
-        const basename = e.name.split("/").pop()?.toLowerCase() ?? "";
-        return basename.includes(atFrag) && !seen.has(e.name);
-      });
-      return [...local, ...searched];
+      return filterAtMatches(entries, searchEntries, atFrag);
     },
     [atRaw, atFrag, entries, searchEntries],
   );
@@ -628,6 +678,46 @@ export function Composer({
     }
   }, [menuMode]);
 
+  const resetPromptHistoryNavigation = () => {
+    if (historyIndexRef.current === -1) return;
+    historyIndexRef.current = -1;
+    setHistoryIndex(-1);
+  };
+
+  const syncPromptHistoryGeneration = () => {
+    const nextGeneration = cacheGeneration();
+    if (historyGenerationRef.current === nextGeneration) return;
+    historyGenerationRef.current = nextGeneration;
+    historyEntriesRef.current = [];
+    historyLoadRef.current = null;
+    historyIndexRef.current = -1;
+    setHistoryIndex(-1);
+  };
+
+  const ensurePromptHistoryIndex = async (index: number): Promise<boolean> => {
+    if (index < historyEntriesRef.current.length) return true;
+    if (historyLoadRef.current) await historyLoadRef.current;
+    while (index >= historyEntriesRef.current.length) {
+      let loaded = 0;
+      const task = loadOlder().then((entries) => {
+        loaded = entries.length;
+        if (loaded > 0) {
+          historyEntriesRef.current = historyEntriesRef.current.concat(entries);
+        }
+      });
+      historyLoadRef.current = task;
+      await task;
+      historyLoadRef.current = null;
+      if (loaded === 0) return index < historyEntriesRef.current.length;
+    }
+    return true;
+  };
+
+  const prefetchPromptHistoryTail = () => {
+    if (historyLoadRef.current) return;
+    void ensurePromptHistoryIndex(historyEntriesRef.current.length);
+  };
+
   const setTextCaretEnd = (next: string) => {
     setText(next);
     requestAnimationFrame(() => {
@@ -667,6 +757,16 @@ export function Composer({
     });
   };
 
+  const replaceComposerText = (next: string) => {
+    clearAttachments();
+    setWorkspaceRefs([]);
+    setSessionRefs([]);
+    pastedBlocksRef.current = [];
+    setPastedBlocks([]);
+    setOpenPastedLabels([]);
+    setTextCaretEnd(next);
+  };
+
   const addWorkspaceReference = (ref: WorkspaceReference) => {
     setWorkspaceRefs((prev) => {
       const key = workspaceReferenceKey(ref);
@@ -679,6 +779,10 @@ export function Composer({
   useEffect(() => {
     if (!insertRequest || insertRequest.id === consumedInsertIdRef.current) return;
     consumedInsertIdRef.current = insertRequest.id;
+    if (insertRequest.mode === "replace") {
+      replaceComposerText(insertRequest.text);
+      return;
+    }
     const ref = parseWorkspaceReference(insertRequest.text);
     if (ref) {
       addWorkspaceReference(ref);
@@ -748,6 +852,32 @@ export function Composer({
 
   useEffect(() => () => clearIntentCloseTimer(), [clearIntentCloseTimer]);
 
+  const clearMoreCloseTimer = useCallback(() => {
+    if (moreCloseTimerRef.current === null) return;
+    window.clearTimeout(moreCloseTimerRef.current);
+    moreCloseTimerRef.current = null;
+  }, []);
+
+  const openMoreMenu = useCallback(() => {
+    clearMoreCloseTimer();
+    setMoreMenuClosing(false);
+    setMoreMenuOpen(true);
+  }, [clearMoreCloseTimer]);
+
+  const closeMoreMenu = useCallback((afterClose?: () => void) => {
+    clearMoreCloseTimer();
+    setMoreMenuClosing(true);
+    window.requestAnimationFrame(() => setMoreMenuOpen(false));
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    moreCloseTimerRef.current = window.setTimeout(() => {
+      moreCloseTimerRef.current = null;
+      setMoreMenuClosing(false);
+      afterClose?.();
+    }, reduceMotion ? 0 : ANCHORED_POPOVER_CLOSE_MS);
+  }, [clearMoreCloseTimer]);
+
+  useEffect(() => () => clearMoreCloseTimer(), [clearMoreCloseTimer]);
+
   const fileDedupKey = async (file: File): Promise<AttachmentDedupKey> => ({
     hash: await sha256(file),
     source: `file:${file.name}:${file.size}:${file.lastModified}`,
@@ -756,9 +886,10 @@ export function Composer({
   const planModeOn = collaborationMode === "plan";
   const activeGoal = (goal ?? "").trim();
   const goalModeOn = collaborationMode === "goal";
+  const tokenModeOn = tokenMode === "economy";
 
   const submit = async () => {
-    if (disabled || submittingRef.current) return;
+    if (disabled || readOnly || submittingRef.current) return;
     const trimmedText = text.trim();
     if (pendingPaste > 0) return;
     if (!trimmedText && attachments.length === 0 && workspaceRefs.length === 0) {
@@ -772,11 +903,16 @@ export function Composer({
     submittingRef.current = true;
     setSubmitting(true);
     try {
+    const orderedAttachments = sortComposerAttachments(attachments);
     const refs = [
       ...workspaceRefs.map((ref) => formatWorkspaceReference(ref.path, ref.isDir)),
-      ...attachments.map((a) => `@${a.path}`),
+      ...orderedAttachments.map((a) => `@${a.path}`),
     ].join(" ");
-    const displayText = [trimmedText, refs].filter(Boolean).join(trimmedText && refs ? " " : "");
+    const displayRefs = [
+      ...workspaceRefs.map((ref) => formatWorkspaceReference(ref.path, ref.isDir)),
+      ...orderedAttachments.map(formatAttachmentDisplayReference),
+    ].join(" ");
+    const displayText = [trimmedText, displayRefs].filter(Boolean).join(trimmedText && displayRefs ? " " : "");
     // PR-B: when past:chats refs are attached, prepend their formatted transcript
     // to submitText only (displayText stays unchanged so the user still sees their
     // original prompt in the input preview). With no refs we keep the original
@@ -786,6 +922,8 @@ export function Composer({
     const submitText = sessionContext ? `${sessionContext}${baseSubmitText}` : baseSubmitText;
     onSend(displayText, submitText);
     setText("");
+    historyIndexRef.current = -1;
+    setHistoryIndex(-1);
     clearAttachments();
     setWorkspaceRefs([]);
     setSessionRefs([]);
@@ -815,7 +953,7 @@ export function Composer({
         const path = await app.SavePastedImage(dataUrl);
         const previewUrl = await app.AttachmentDataURL(path);
         rememberAttachment(path, key);
-        setAttachments((prev) => [...prev, { path, previewUrl }]);
+        setAttachments((prev) => [...prev, { path, previewUrl, displayName: file.name }]);
       } catch (error) {
         console.warn("[composer] failed to attach pasted image", error);
         showToast(t("composer.attachImageFailed"), "warn");
@@ -839,7 +977,7 @@ export function Composer({
         const dataUrl = await readFileAsDataURL(file);
         const path = await app.SavePastedFile(file.name, dataUrl);
         rememberAttachment(path, key);
-        setAttachments((prev) => [...prev, { path }]);
+        setAttachments((prev) => [...prev, { path, displayName: file.name }]);
       } catch {
         // non-fatal: a failed attach must not block normal text input
       } finally {
@@ -885,7 +1023,7 @@ export function Composer({
           addWorkspaceReference({ path: item.path, isDir: item.isDir });
         } else {
           rememberAttachment(item.path, key);
-          setAttachments((prev) => [...prev, { path: item.path, previewUrl: item.previewUrl }]);
+          setAttachments((prev) => [...prev, { path: item.path, previewUrl: item.previewUrl, displayName: baseName(path) }]);
         }
       } catch {
         // non-fatal: a failed drop attach must not block normal text input
@@ -1080,7 +1218,10 @@ export function Composer({
     };
     window.addEventListener("resize", update);
     const observer = new MutationObserver(update);
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-text-size"] });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-text-size", "data-font-family", "data-mono-font-family", "style"],
+    });
     return () => {
       if (frame) window.cancelAnimationFrame(frame);
       window.removeEventListener("resize", update);
@@ -1290,7 +1431,21 @@ export function Composer({
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     const composing = isImeKeyEvent(e, composingRef.current, lastCompositionEndAt.current);
+    const native = e.nativeEvent as globalThis.KeyboardEvent & {
+      keyCode?: number;
+      which?: number;
+      code?: string;
+    };
+    const fnKey = isFnKeyEvent(native);
+    const historyDirection = promptHistoryDirectionFromEvent({
+      key: e.key,
+      code: native.code,
+      keyCode: native.keyCode,
+      which: native.which,
+    });
+
     if (e.key === "Enter" && composing) return;
+    if (fnKey) return;
 
     if (isPasteShortcut(e) && !composing) {
       clearNativeClipboardPasteTimer();
@@ -1305,6 +1460,76 @@ export function Composer({
     if (e.key === "Tab" && e.shiftKey && !composing) {
       e.preventDefault();
       onCycleMode();
+      return;
+    }
+
+    if (matchesShortcut(e.nativeEvent, "toolApproval.yolo", shortcutPlatform) && !composing) {
+      e.preventDefault();
+      onToggleYoloApprovalMode();
+      return;
+    }
+
+    syncPromptHistoryGeneration();
+
+    const canUseCurrentPromptHistory = () => canUsePromptHistory({
+      direction: historyDirection,
+      menuOpen: Boolean(menuMode),
+      composing,
+      altKey: e.altKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      shiftKey: e.shiftKey,
+      fnKey,
+      value: e.currentTarget.value,
+      selectionStart: e.currentTarget.selectionStart,
+      selectionEnd: e.currentTarget.selectionEnd,
+      historyIndex: historyIndexRef.current,
+    });
+
+    // Prompt history navigation: plain ↑/↓ only. Fn/Page/Home/End are left to
+    // the native textarea/OS so macOS dictation and text navigation keep working.
+
+    // When navigating history, any other key (letter, Backspace, etc.) resets
+    // back to the saved draft when another key is used.
+    if (historyIndexRef.current !== -1 && !canUseCurrentPromptHistory()) {
+      historyIndexRef.current = -1;
+      setHistoryIndex(-1);
+    }
+
+    if (canUseCurrentPromptHistory()) {
+      e.preventDefault();
+      void (async () => {
+        // Use refs for all mutable reads inside the async closure so rapid
+        // successive key presses always see the latest values.
+        if (historyIndexRef.current === -1) {
+          savedTextRef.current = text; // save current draft
+        }
+        const target =
+          historyDirection === "up"
+            ? historyIndexRef.current + 1
+            : historyDirection === "down"
+              ? historyIndexRef.current - 1
+              : historyIndexRef.current;
+        if (target >= historyEntriesRef.current.length && !(await ensurePromptHistoryIndex(target))) {
+          return;
+        }
+        const next =
+          historyDirection === "up"
+            ? Math.min(target, historyEntriesRef.current.length - 1)
+            : historyDirection === "down"
+              ? Math.max(target, -1)
+              : historyIndexRef.current;
+        historyIndexRef.current = next;
+        setHistoryIndex(next);
+        if (next === -1) {
+          setTextCaretEnd(savedTextRef.current);
+        } else {
+          setTextCaretEnd(historyEntriesRef.current[next].text);
+          if (historyDirection === "up" && historyEntriesRef.current.length - 1 - next <= PROMPT_HISTORY_PREFETCH_REMAINING) {
+            prefetchPromptHistoryTail();
+          }
+        }
+      })();
       return;
     }
 
@@ -1344,7 +1569,7 @@ export function Composer({
     }
     // Esc interrupts the in-flight turn (matches the Stop button's hint), and
     // restores the text if the server hadn't replied yet.
-    if (e.key === "Escape" && running && !decisionPending) {
+    if (e.key === "Escape" && running) {
       e.preventDefault();
       handleCancel();
     }
@@ -1411,6 +1636,21 @@ export function Composer({
       requestAnimationFrame(() => taRef.current?.focus());
     });
   };
+  const chooseTokenMode = () => {
+    closeIntentMenu(() => {
+      onSetTokenMode(tokenModeOn ? "full" : "economy");
+      requestAnimationFrame(() => taRef.current?.focus());
+    });
+  };
+  const effortLevels = asArray(effort?.levels);
+  const currentEffort = effort?.current || "auto";
+  const hasEffort = Boolean(effort?.supported && effortLevels.length > 0);
+  const chooseEffortLevel = (level: string) => {
+    closeMoreMenu(() => {
+      if (level !== currentEffort) onSetEffort(level);
+      requestAnimationFrame(() => taRef.current?.focus());
+    });
+  };
   const runActivity = retry
     ? t("status.retrying", { attempt: retry.attempt, max: retry.max })
     : running && turnStartAt
@@ -1422,11 +1662,10 @@ export function Composer({
           return `${word}… ${fmtElapsed(elapsedMs)}${tok}`;
         })()
       : null;
-  const hasEffort = Boolean(effort?.supported);
   const composerMetaClass = [
     "composer-meta",
     hasEffort ? "composer-meta--has-effort" : "composer-meta--no-effort",
-    planModeOn || goalModeOn ? "composer-meta--has-intent-chip" : "composer-meta--no-intent-chip",
+    planModeOn || goalModeOn || tokenModeOn ? "composer-meta--has-intent-chip" : "composer-meta--no-intent-chip",
   ].join(" ");
 
   return (
@@ -1477,7 +1716,54 @@ export function Composer({
               <span />
             </span>
           </button>
+          <button
+            type="button"
+            className={`composer-access-menu__item composer-intent-menu__item${tokenModeOn ? " composer-access-menu__item--active" : ""}`}
+            onClick={chooseTokenMode}
+            disabled={disabled || running}
+            title={tokenModeOn ? t("composer.tokenEconomyOnDesc") : t("composer.tokenEconomyDesc")}
+          >
+            <Gauge size={16} />
+            <span className="composer-access-menu__copy">
+              <span className="composer-access-menu__title">{t("composer.tokenEconomy")}</span>
+              <span className="composer-access-menu__desc">{tokenModeOn ? t("composer.tokenEconomyOnDesc") : t("composer.tokenEconomyDesc")}</span>
+            </span>
+            <span className={`composer-intent-switch${tokenModeOn ? " composer-intent-switch--on" : ""}`} aria-hidden="true">
+              <span />
+            </span>
+          </button>
         </div>
+      </AnchoredPopover>
+      <AnchoredPopover
+        open={moreMenuOpen && !disabled && !running}
+        closing={moreMenuClosing}
+        anchorRef={moreMenuAnchorRef}
+        onClose={() => closeMoreMenu()}
+        className="composer-access-menu composer-more-menu"
+        align="end"
+      >
+        {hasEffort && (
+          <div className="composer-access-menu__section">
+            <div className="composer-access-menu__label">{t("status.effortTitle")}</div>
+            <div className="composer-more-menu__items" role="listbox" aria-label={t("status.effortTitle")}>
+              {effortLevels.map((level) => (
+                <button
+                  key={level}
+                  type="button"
+                  role="option"
+                  aria-selected={level === currentEffort}
+                  className={`composer-more-menu__item${level === currentEffort ? " composer-more-menu__item--active" : ""}`}
+                  onClick={() => chooseEffortLevel(level)}
+                  disabled={running}
+                >
+                  <Gauge size={14} />
+                  <span>{level}</span>
+                  {level === currentEffort && <Check size={13} />}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </AnchoredPopover>
       {menuMode === "slash" && (
         <SlashMenu items={slashMatches} activeIndex={active} onPick={pickCommand} onHover={setActive} />
@@ -1624,7 +1910,7 @@ export function Composer({
             <span className="composer-runstatus__dot" />
             <span className="composer-runstatus__text">{runActivity}</span>
             <Tooltip label={t("composer.stop")}>
-              <button className="composer-runstatus__stop" type="button" onClick={handleCancel} disabled={decisionPending}>
+              <button className="composer-runstatus__stop" type="button" onClick={handleCancel}>
                 <Square size={10} fill="currentColor" />
                 <span>{t("composer.stopShort")}</span>
               </button>
@@ -1634,47 +1920,32 @@ export function Composer({
       )}
       {(attachments.length > 0 || workspaceRefs.length > 0 || sessionRefs.length > 0) && (
         <div className="composer-context" aria-label={t("composer.contextItems")}>
-          {attachments.map((a) => (
-            <div
-              className={`composer-context__item${a.previewUrl ? " composer-context__item--image" : " composer-context__item--attachment"}`}
-              key={a.path}
-            >
-              <Tooltip label={a.path}>
-                <span className="composer-context__label">
-                  {a.previewUrl ? <img src={a.previewUrl} alt="" draggable={false} /> : <FileText size={15} />}
-                  <span>{a.path.split("/").pop()}</span>
-                </span>
-              </Tooltip>
-              <Tooltip label={t("composer.removeImage")}>
-                <button
-                  type="button"
-                  onClick={() => removeAttachment(a.path)}
-                >
-                  <X size={14} />
-                </button>
-              </Tooltip>
-            </div>
-          ))}
+          {sortComposerAttachments(attachments).map((a) => {
+            const imageOnly = Boolean(a.previewUrl) && attachments.every((item) => item.previewUrl) && workspaceRefs.length === 0 && sessionRefs.length === 0;
+            return (
+              <ComposerContextCard
+                key={a.path}
+                variant="attachment"
+                tooltipLabel={a.path}
+                removeLabel={t("composer.removeImage")}
+                onRemove={() => removeAttachment(a.path)}
+                previewUrl={a.previewUrl}
+                imageOnly={imageOnly}
+                name={attachmentName(a)}
+                meta={attachmentExt(attachmentName(a)) || t("msg.fileAttachment")}
+              />
+            );
+          })}
           {workspaceRefs.map((ref) => (
-            <div
-              className={`composer-context__item composer-context__item--workspace${ref.isDir ? " composer-context__item--folder" : " composer-context__item--file"}`}
+            <ComposerContextCard
               key={workspaceReferenceKey(ref)}
-            >
-              <Tooltip label={formatWorkspaceReference(ref.path, ref.isDir)}>
-                <span className="composer-context__label">
-                  {ref.isDir ? <Folder size={15} /> : <FileText size={15} />}
-                  <span>{ref.isDir ? `${baseName(ref.path)}/` : baseName(ref.path)}</span>
-                </span>
-              </Tooltip>
-              <Tooltip label={t("composer.removeReference")}>
-                <button
-                  type="button"
-                  onClick={() => removeWorkspaceReference(ref)}
-                >
-                  <X size={13} />
-                </button>
-              </Tooltip>
-            </div>
+              variant="workspace"
+              tooltipLabel={formatWorkspaceReference(ref.path, ref.isDir)}
+              removeLabel={t("composer.removeReference")}
+              onRemove={() => removeWorkspaceReference(ref)}
+              folder={Boolean(ref.isDir)}
+              label={ref.isDir ? `${baseName(ref.path)}/` : baseName(ref.path)}
+            />
           ))}
           {sessionRefs.map((ref) => (
             <div
@@ -1750,17 +2021,20 @@ export function Composer({
           onDoubleClick={resetComposerHeight}
         />
         <div
-          className={`composer${dragOver ? " composer--dragover" : ""}${disabled ? " composer--disabled" : ""}${shellModeActive ? " composer--shell" : ""}`}
+          className={`composer${dragOver ? " composer--dragover" : ""}${disabled || readOnly ? " composer--disabled" : ""}${shellModeActive ? " composer--shell" : ""}`}
           onDrop={onDrop}
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
         >
           <span className="composer__caret">{shellModeActive ? "$" : "›"}</span>
           <textarea
+            id="composer-input"
             ref={taRef}
             className="composer__input"
+            aria-label={t("composer.placeholder")}
             value={text}
             onChange={(e) => {
+              resetPromptHistoryNavigation();
               setText(e.target.value);
               if (composerPrompt) setComposerPrompt(null);
             }}
@@ -1778,9 +2052,9 @@ export function Composer({
               lastCompositionEndAt.current = Date.now();
             }}
             style={textareaStyle}
-            placeholder={disabled ? t("common.loading") : goalModeOn && !activeGoal ? t("composer.goalInputPlaceholder") : t("composer.placeholder")}
+            placeholder={readOnly ? t("composer.readOnlyChannel") : disabled ? t("common.loading") : goalModeOn && !activeGoal ? t("composer.goalInputPlaceholder") : t("composer.placeholder")}
             rows={1}
-            disabled={disabled}
+            disabled={disabled || readOnly}
           />
           {composerPrompt && (
             <span className="composer__prompt" role="status">
@@ -1792,7 +2066,7 @@ export function Composer({
               <button
                 className="composer__btn composer__btn--send"
                 onClick={submit}
-                disabled={submitting || pendingPaste > 0 || ((!text.trim() && attachments.length === 0 && workspaceRefs.length === 0) && !(goalModeOn && !activeGoal)) || disabled}
+                disabled={submitting || pendingPaste > 0 || ((!text.trim() && attachments.length === 0 && workspaceRefs.length === 0) && !(goalModeOn && !activeGoal)) || disabled || readOnly}
               >
                 <ArrowUp size={16} />
               </button>
@@ -1857,6 +2131,26 @@ export function Composer({
                   </button>
                 </Tooltip>
               )}
+              {tokenModeOn && (
+                <Tooltip label={t("composer.tokenEconomyOnDesc")}>
+                  <button
+                    type="button"
+                    className="composer-mode-chip composer-mode-chip--token"
+                    onClick={chooseTokenMode}
+                    disabled={disabled || running}
+                    title={t("composer.tokenEconomyExitTitle")}
+                    aria-label={t("composer.tokenEconomyExitTitle")}
+                  >
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--mode" aria-hidden="true">
+                      <Gauge size={14} />
+                    </span>
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--dismiss" aria-hidden="true">
+                      <X size={11} />
+                    </span>
+                    <span className="composer-mode-chip__label">{t("composer.tokenEconomyShort")}</span>
+                  </button>
+                </Tooltip>
+              )}
             </div>
             <div className="composer-meta__control composer-meta__control--approval">
               <div className="composer-modebar composer-modebar--approval" data-mode={toolApprovalMode} title={t("composer.accessMenuTitle")}>
@@ -1899,9 +2193,29 @@ export function Composer({
             <div className="composer-meta__control composer-meta__control--model">
               <ModelSwitcher label={modelLabel} tabId={tabId} onPick={onSwitchModel} />
             </div>
-            {effort?.supported && (
+            {hasEffort && (
               <div className="composer-meta__control composer-meta__control--effort">
                 <EffortSwitcher effort={effort} disabled={running} onPick={onSetEffort} />
+              </div>
+            )}
+            {hasEffort && (
+              <div className="composer-meta__control composer-meta__control--more">
+                <Tooltip label={t("composer.moreControls")} disabled={moreMenuOpen || moreMenuClosing}>
+                  <button
+                    ref={moreMenuAnchorRef}
+                    type="button"
+                    className={`composer-more-trigger${moreMenuOpen || moreMenuClosing ? " composer-more-trigger--open" : ""}`}
+                    onClick={() => (moreMenuOpen || moreMenuClosing ? closeMoreMenu() : openMoreMenu())}
+                    disabled={disabled || running}
+                    aria-haspopup="menu"
+                    aria-expanded={moreMenuOpen && !moreMenuClosing}
+                    aria-label={t("composer.moreControls")}
+                    title={moreMenuOpen || moreMenuClosing ? undefined : t("composer.moreControls")}
+                  >
+                    <MoreHorizontal size={16} />
+                    <span>{t("topicBar.more")}</span>
+                  </button>
+                </Tooltip>
               </div>
             )}
           </div>

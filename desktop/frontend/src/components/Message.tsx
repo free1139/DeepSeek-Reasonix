@@ -1,15 +1,64 @@
-import { memo, useState } from "react";
-import { ChevronDown, FileText, Folder, GitBranch, Image, RotateCcw, ScrollText } from "lucide-react";
+import { memo, useEffect, useRef, useState } from "react";
+import type { FormEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
+import { ChevronDown, ChevronRight, FileText, Folder, GitBranch, Image, MessageSquare, Pencil, RotateCcw, ScrollText } from "lucide-react";
 import { Markdown } from "./Markdown";
 import { CopyButton } from "./CopyButton";
-import { ProcessBrainIcon, ProcessCard, ProcessStatusIcon } from "./ProcessCard";
-import { parseAttachmentRefsForDisplay } from "../lib/attachmentDisplay";
+import { ProcessBrainIcon } from "./ProcessCard";
+import { ComposerContextCard } from "./ComposerContextCard";
+import { formatAttachmentRefForDisplay, formatAttachmentRefForSubmit, parseAttachmentRefsForDisplay, sortDisplayAttachments } from "../lib/attachmentDisplay";
+import type { DisplayAttachment } from "../lib/attachmentDisplay";
+import { app } from "../lib/bridge";
+import { replaySubmitText } from "../lib/editReplay";
 import { useT } from "../lib/i18n";
+import { useGSAPCollapse } from "../lib/useGSAPCollapse";
+import { displayReasoningText } from "../lib/reasoningDisplay";
 import type { Item, MessageActionScope } from "../lib/useController";
 import type { CheckpointMeta } from "../lib/types";
 
 type AssistantItem = Extract<Item, { kind: "assistant" }>;
 export type TurnActionMenu = "summary" | "rewind";
+type ImSourceMessage = {
+  provider: string;
+  label: string;
+  sender: string;
+  chat: string;
+  text: string;
+};
+
+const IM_SOURCE_START = "[[reasonix-im]]";
+const IM_SOURCE_END = "[[/reasonix-im]]";
+
+function parseImSourceMessage(text: string): ImSourceMessage | null {
+  // Display-only metadata: keep IM sender/chat details out of model prompts.
+  if (!text.startsWith(IM_SOURCE_START)) return null;
+  const end = text.indexOf(IM_SOURCE_END);
+  if (end < 0) return null;
+  const metaBlock = text.slice(IM_SOURCE_START.length, end).trim();
+  const body = text.slice(end + IM_SOURCE_END.length).replace(/^\r?\n/, "");
+  const meta: Record<string, string> = {};
+  for (const line of metaBlock.split(/\r?\n/)) {
+    const index = line.indexOf("=");
+    if (index <= 0) continue;
+    const key = line.slice(0, index).trim().toLowerCase();
+    const value = line.slice(index + 1).trim();
+    if (key) meta[key] = value;
+  }
+  return {
+    provider: meta.provider || "",
+    label: meta.label || "",
+    sender: meta.sender || meta.senderid || "",
+    chat: meta.chat || meta.chat_type || "",
+    text: body,
+  };
+}
+
+function imSourceLabel(source: ImSourceMessage, t: ReturnType<typeof useT>): string {
+  if (source.label.trim()) return source.label.trim();
+  const provider = source.provider.trim().toLowerCase();
+  if (provider === "lark") return "Lark";
+  if (provider === "weixin" || provider === "wechat") return t("settings.botWeixin");
+  return t("settings.botFeishu");
+}
 
 function attachmentIcon(kind: "image" | "file" | "folder") {
   if (kind === "image") return <Image size={15} />;
@@ -17,27 +66,246 @@ function attachmentIcon(kind: "image" | "file" | "folder") {
   return <FileText size={15} />;
 }
 
+function mergeDisplayAttachments(existing: DisplayAttachment[], incoming: DisplayAttachment[]): DisplayAttachment[] {
+  if (incoming.length === 0) return existing;
+  const seen = new Set(existing.map((attachment) => attachment.path));
+  const merged = [...existing];
+  for (const attachment of incoming) {
+    if (seen.has(attachment.path)) continue;
+    seen.add(attachment.path);
+    merged.push(attachment);
+  }
+  return merged;
+}
+
+function messageDate(value?: number): Date {
+  return new Date(typeof value === "number" && Number.isFinite(value) && value > 0 ? value : Date.now());
+}
+
+function formatMessageTime(date: Date): string {
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${hours}:${minutes}`;
+}
+
 export function UserMessage({
   text,
+  submitText,
+  failed,
   turn,
   anchorId,
+  id,
+  createdAt,
+  onEdit,
+  editDisabled = false,
 }: {
   text: string;
+  submitText?: string;
+  failed?: boolean;
   turn?: number;
   anchorId?: string;
+  id?: string;
+  createdAt?: number;
+  onEdit?: (turn: number, displayText: string, submitText?: string) => boolean | void | Promise<boolean | void>;
+  editDisabled?: boolean;
 }) {
   const t = useT();
-  const { text: displayText, attachments } = parseAttachmentRefsForDisplay(text);
+  const imSource = parseImSourceMessage(text);
+  const actionText = imSource?.text ?? text;
+  const { text: displayText, attachments } = parseAttachmentRefsForDisplay(actionText);
+  const orderedAttachments = sortDisplayAttachments(attachments);
+  const sourceLabel = imSource ? imSourceLabel(imSource, t) : "";
+  const sentAt = createdAt === undefined ? null : messageDate(createdAt);
+  const canEdit = turn !== undefined && onEdit !== undefined && !editDisabled;
+  const [editing, setEditing] = useState(false);
+  const [draftText, setDraftText] = useState(displayText);
+  const [draftAttachments, setDraftAttachments] = useState<DisplayAttachment[]>(attachments);
+  const [editSubmitting, setEditSubmitting] = useState(false);
+  const editRef = useRef<HTMLTextAreaElement>(null);
+  const [imagePreviews, setImagePreviews] = useState<Record<string, string>>({});
+  const orderedDraftAttachments = sortDisplayAttachments(draftAttachments);
+  const imagePreviewKey = orderedAttachments
+    .concat(orderedDraftAttachments)
+    .filter((attachment) => attachment.kind === "image" && attachment.source === "attachment")
+    .map((attachment) => attachment.path)
+    .join("\n");
+
+  useEffect(() => {
+    if (editing) return;
+    const parsed = parseAttachmentRefsForDisplay(actionText);
+    setDraftText(parsed.text);
+    setDraftAttachments(parsed.attachments);
+  }, [actionText, editing]);
+
+  useEffect(() => {
+    if (!editing) return;
+    requestAnimationFrame(() => {
+      const node = editRef.current;
+      if (!node) return;
+      node.focus();
+      node.selectionStart = node.selectionEnd = node.value.length;
+    });
+  }, [editing]);
+
+  const startEdit = () => {
+    if (!canEdit) return;
+    const parsed = parseAttachmentRefsForDisplay(actionText);
+    setDraftText(parsed.text);
+    setDraftAttachments(parsed.attachments);
+    setEditing(true);
+  };
+
+  const cancelEdit = () => {
+    const parsed = parseAttachmentRefsForDisplay(actionText);
+    setDraftText(parsed.text);
+    setDraftAttachments(parsed.attachments);
+    setEditing(false);
+  };
+
+  const updateDraftText = (value: string) => {
+    const parsed = parseAttachmentRefsForDisplay(value);
+    if (parsed.attachments.length > 0) {
+      setDraftText(parsed.text);
+      setDraftAttachments((prev) => mergeDisplayAttachments(prev, parsed.attachments));
+      return;
+    }
+    setDraftText(value);
+  };
+
+  const removeDraftAttachment = (path: string) => {
+    setDraftAttachments((prev) => prev.filter((attachment) => attachment.path !== path));
+  };
+
+  const submitEdit = async (event?: FormEvent) => {
+    event?.preventDefault();
+    if (!canEdit || editSubmitting) return;
+    const parsedDraft = parseAttachmentRefsForDisplay(draftText);
+    const nextAttachments = sortDisplayAttachments(mergeDisplayAttachments(draftAttachments, parsedDraft.attachments));
+    const bodyText = parsedDraft.text.trim();
+    const displayRefs = nextAttachments.map(formatAttachmentRefForDisplay).join(" ");
+    const submitRefs = nextAttachments.map(formatAttachmentRefForSubmit).join(" ");
+    const next = [bodyText, displayRefs].filter(Boolean).join(bodyText && displayRefs ? " " : "");
+    const fallbackSubmit = [bodyText, submitRefs].filter(Boolean).join(bodyText && submitRefs ? " " : "");
+    const submit = replaySubmitText(submitText, actionText, next, fallbackSubmit);
+    if (!next) return;
+    setEditSubmitting(true);
+    try {
+      const ok = await onEdit?.(turn as number, next, submit);
+      if (ok !== false) setEditing(false);
+    } finally {
+      setEditSubmitting(false);
+    }
+  };
+
+  const onEditKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEdit();
+      return;
+    }
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      void submitEdit();
+    }
+  };
+
+  useEffect(() => {
+    const paths = imagePreviewKey ? imagePreviewKey.split("\n") : [];
+    if (paths.length === 0) return;
+    let cancelled = false;
+    for (const path of paths) {
+      if (imagePreviews[path]) continue;
+      app.AttachmentDataURL(path)
+        .then((url) => {
+          if (cancelled) return;
+          setImagePreviews((prev) => (prev[path] ? prev : { ...prev, [path]: url }));
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [imagePreviewKey]);
   return (
-    <div className="msg msg--user" id={anchorId} data-question-anchor={anchorId} data-turn={turn}>
-      <div className="msg__body">
-        {displayText && <div className="msg__text">{displayText}</div>}
-        {attachments.length > 0 && (
+    <div
+      className={`msg msg--user${imSource ? " msg--im-source" : ""}${failed ? " msg--user-failed" : ""}`}
+      id={anchorId}
+      data-question-anchor={anchorId}
+      data-turn={turn}
+      data-im-source={imSource?.provider || undefined}
+      data-history-restore={id && id.startsWith("h") ? "" : undefined}
+      data-entrance={id || undefined}
+    >
+      <div className={`msg__body${editing ? " msg__body--editing" : ""}`}>
+        {editing ? (
+          <form className="msg-edit" onSubmit={(event) => void submitEdit(event)}>
+            {orderedDraftAttachments.length > 0 && (
+              <div className="msg-edit__attachments composer-context" aria-label={t("composer.contextItems")}>
+                {orderedDraftAttachments.map((attachment) => {
+                  const imagePreview = attachment.kind === "image" ? imagePreviews[attachment.path] : undefined;
+                  const imageOnly = Boolean(imagePreview) && orderedDraftAttachments.every((item) => item.kind === "image" && imagePreviews[item.path]);
+                  return (
+                    <ComposerContextCard
+                      key={attachment.path}
+                      variant={attachment.source === "workspace" ? "workspace" : "attachment"}
+                      tooltipLabel={attachment.source === "workspace" ? formatAttachmentRefForSubmit(attachment) : attachment.path}
+                      removeLabel={attachment.source === "workspace" ? t("composer.removeReference") : t("composer.removeImage")}
+                      removeDisabled={editSubmitting}
+                      onRemove={() => removeDraftAttachment(attachment.path)}
+                      previewUrl={imagePreview}
+                      imageOnly={imageOnly}
+                      folder={attachment.kind === "folder"}
+                      label={attachment.kind === "folder" ? `${attachment.name}/` : attachment.name}
+                      name={attachment.name}
+                      meta={attachment.ext || t("msg.fileAttachment")}
+                      icon={attachment.kind === "image" ? <Image size={20} /> : undefined}
+                    />
+                  );
+                })}
+              </div>
+            )}
+            <textarea
+              ref={editRef}
+              className="msg-edit__input"
+              value={draftText}
+              rows={Math.max(2, Math.min(8, draftText.split(/\r?\n/).length))}
+              aria-label={t("common.edit")}
+              disabled={editSubmitting}
+              onChange={(event) => updateDraftText(event.target.value)}
+              onKeyDown={onEditKeyDown}
+            />
+            <div className="msg-edit__actions">
+              <button className="msg-edit__btn" type="button" disabled={editSubmitting} onClick={cancelEdit}>
+                {t("common.cancel")}
+              </button>
+              <button className="msg-edit__btn msg-edit__btn--primary" type="submit" disabled={editSubmitting || (draftText.trim() === "" && draftAttachments.length === 0)}>
+                {t("msg.editSend")}
+              </button>
+            </div>
+          </form>
+        ) : imSource ? (
+          <div className="im-source-card">
+            <div className="im-source-card__head">
+              <MessageSquare size={14} />
+              <span>{t("msg.fromIm", { source: sourceLabel })}</span>
+            </div>
+            {displayText && <div className="im-source-card__text">{displayText}</div>}
+            {(imSource.sender || imSource.chat) && (
+              <div className="im-source-card__meta">
+                {imSource.sender && <span>{t("msg.imSender", { id: imSource.sender })}</span>}
+                {imSource.chat && <span>{imSource.chat}</span>}
+              </div>
+            )}
+          </div>
+        ) : (
+          displayText && <div className="msg__text">{displayText}</div>
+        )}
+        {failed && <div className="msg__send-failed">{t("msg.sendFailed")}</div>}
+        {orderedAttachments.length > 0 && (
           <div className="msg-attachments" aria-label={t("msg.attachments")}>
-            {attachments.map((attachment, index) => (
-              <div className="msg-attachment" key={`${attachment.path}:${index}`} title={attachment.path}>
+            {orderedAttachments.map((attachment, index) => (
+              <div className={`msg-attachment msg-attachment--${attachment.kind}`} key={`${attachment.path}:${index}`} title={attachment.path}>
                 <span className={`msg-attachment__icon msg-attachment__icon--${attachment.kind}`} aria-hidden="true">
-                  {attachmentIcon(attachment.kind)}
+                  {attachment.kind === "image" && imagePreviews[attachment.path] ? <img src={imagePreviews[attachment.path]} alt="" draggable={false} /> : attachmentIcon(attachment.kind)}
                 </span>
                 <span className="msg-attachment__main">
                   <span className="msg-attachment__name">{attachment.name}</span>
@@ -52,6 +320,28 @@ export function UserMessage({
           </div>
         )}
       </div>
+      {!editing && (
+        <div className="msg-meta" role="group" aria-label={t("rewind.label")}>
+          {sentAt && (
+            <time className="msg-meta__time" dateTime={sentAt.toISOString()} title={sentAt.toLocaleString()}>
+              {formatMessageTime(sentAt)}
+            </time>
+          )}
+          <CopyButton text={actionText} label={t("msg.copy")} showInlineLabel={false} className="msg-meta__btn msg-meta__copy" />
+          {onEdit && (
+            <button
+              className="msg-meta__btn"
+              type="button"
+              aria-label={t("common.edit")}
+              title={t("common.edit")}
+              disabled={!canEdit}
+              onClick={startEdit}
+            >
+              <Pencil size={14} />
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -238,46 +528,95 @@ export function TurnActions({
 
 export const AssistantMessage = memo(function AssistantMessage({
   item,
+  defaultExpanded = false,
+  expandWhileStreaming = true,
+  truncateStreamingReasoning = false,
 }: {
   item: AssistantItem;
+  defaultExpanded?: boolean;
+  /** false in compact mode: completed steps fold away, so auto-open + fold reads as flicker. */
+  expandWhileStreaming?: boolean;
+  /** Opt-in for compact mode to keep live DeepSeek reasoning from growing an unbounded DOM. */
+  truncateStreamingReasoning?: boolean;
 }) {
   const t = useT();
+  const reasoningBodyRef = useRef<HTMLDivElement>(null);
+  // Thinking streams in before the answer — show it live while the model is still
+  // working, then it stays available behind the toggle once the answer arrives.
+  const [reasoningOpen, setReasoningOpen] = useState((expandWhileStreaming && item.streaming) || defaultExpanded);
+  const userOverridden = useRef(false);
+  const prevStreamingRef = useRef(item.streaming);
+  const prevReasoningCompleteRef = useRef(item.reasoningComplete ?? false);
+  useGSAPCollapse(reasoningBodyRef, reasoningOpen);
+
+  // Follow the current display mode while streaming unless the user manually
+  // toggled this message; auto-close at stream end for untouched messages.
+  useEffect(() => {
+    const wasStreaming = prevStreamingRef.current;
+    const nowStreaming = item.streaming;
+    prevStreamingRef.current = nowStreaming;
+
+    const wasRC = prevReasoningCompleteRef.current;
+    const nowRC = item.reasoningComplete ?? false;
+    prevReasoningCompleteRef.current = nowRC;
+
+    if (nowStreaming) {
+      if (!wasStreaming) userOverridden.current = false;
+      if (defaultExpanded) {
+        setReasoningOpen(true);
+      } else if (!userOverridden.current) {
+        setReasoningOpen(expandWhileStreaming);
+      }
+    } else if (nowRC && !wasRC) {
+      // Reasoning just finished — auto-close while we wait for text.
+      if (!defaultExpanded && !userOverridden.current) {
+        setReasoningOpen(false);
+      }
+    } else if (wasStreaming) {
+      // Stream fully ended — auto-close if user didn't interact.
+      if (!defaultExpanded && !userOverridden.current) {
+        setReasoningOpen(false);
+      }
+    }
+  }, [item.streaming, item.reasoningComplete, defaultExpanded, expandWhileStreaming]);
+
+  const toggleReasoning = () => {
+    userOverridden.current = true;
+    setReasoningOpen((v) => !v);
+  };
   const hasText = item.streaming || item.text.trim() !== "";
   const processOnly = Boolean(item.reasoning) && !hasText;
   const processWithText = Boolean(item.reasoning) && hasText;
+  const visibleReasoning = reasoningOpen
+    ? displayReasoningText(item.reasoning, {
+        streaming: item.streaming,
+        truncateStreaming: truncateStreamingReasoning,
+      })
+    : "";
   return (
-    <div className={`msg msg--assistant${processOnly ? " msg--process-only" : ""}${processWithText ? " msg--process-with-text" : ""}`}>
+    <div className={`msg msg--assistant${processOnly ? " msg--process-only" : ""}${processWithText ? " msg--process-with-text" : ""}`} data-history-restore={item.id.startsWith("h") ? "" : undefined} data-entrance={item.id}>
       {item.reasoning && (
-        <ProcessCard
-          tone="violet"
-          icon={<ProcessBrainIcon size={12} />}
-          kind="reasoning"
-          name={t("msg.thinking")}
-          meta={
-            <>
-              <ProcessStatusIcon state={item.streaming ? "running" : "done"} label={item.streaming ? t("msg.thinkingRunning") : t("msg.thinkingDone")} />
-              <span>{item.streaming ? t("msg.thinkingRunning") : t("msg.thinkingDone")}</span>
-            </>
-          }
-          defaultOpen={item.streaming}
-        >
-          <div className="reasoning__body">{item.reasoning}</div>
-        </ProcessCard>
+        <div className="reasoning">
+          <button
+            type="button"
+            className="reasoning__head"
+            data-running={item.streaming && !item.reasoningComplete ? "" : undefined}
+            onClick={toggleReasoning}
+            aria-expanded={reasoningOpen}
+          >
+            <ProcessBrainIcon size={12} />
+            <span>{t("msg.thinking")}</span>
+            <span className="reasoning__meta">{item.streaming && !item.reasoningComplete ? t("msg.thinkingRunning") : t("msg.thinkingDone")}</span>
+            <ChevronRight className={`reasoning__chevron${reasoningOpen ? " reasoning__chevron--open" : ""}`} size={12} />
+          </button>
+          {reasoningOpen && (
+            <div ref={reasoningBodyRef} className="reasoning__body">{visibleReasoning}</div>
+          )}
+        </div>
       )}
       {hasText && (
         <div className="msg__body">
-          {item.streaming ? (
-            // Render markdown in real time while streaming.  useDeferredValue
-            // inside <Markdown> lets React prioritise the cursor + layout frame
-            // over the expensive markdown parse — new tokens paint immediately,
-            // the formatted catch-up runs in idle frames.
-            <div className="msg__stream">
-              <Markdown text={item.text} />
-              <span className="msg__cursor" />
-            </div>
-          ) : (
-            <Markdown text={item.text} />
-          )}
+          <Markdown text={item.text} />
         </div>
       )}
     </div>

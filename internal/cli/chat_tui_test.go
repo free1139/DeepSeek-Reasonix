@@ -145,6 +145,64 @@ func TestTermuxNativeScrollbackDefaultsToExpandedReasoning(t *testing.T) {
 	}
 }
 
+// TestCompletionMenuFixedWidth verifies that the completion menu pads every
+// line (items + footer) to m.width so delta rendering always writes exactly the
+// same column count — no trailing characters for \033[K to leave behind.
+func TestCompletionMenuFixedWidth(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
+	m.width = 80
+	m.completion.active = true
+	m.completion.items = []compItem{
+		{label: "review"},
+		{label: "clear", hint: "start fresh"},
+	}
+	m.completion.sel = 1
+	m.completion.kind = compSlash
+
+	out := m.renderCompletion()
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	// items + footer = 3 lines
+	if len(lines) != 3 {
+		t.Fatalf("completion menu should have 3 lines (2 items + footer), got %d:\n%s", len(lines), out)
+	}
+	for i, line := range lines {
+		if got := ansi.StringWidth(line); got != 80 {
+			t.Errorf("line %d visual width = %d, want 80: %q", i, got, line)
+		}
+	}
+}
+
+// TestCompletionMenuPadsWithNonBreakingSpaces verifies the fixed-width padding
+// is not ordinary ASCII space. Ultraviolet treats trailing ASCII spaces as
+// clearable cells and may emit EL/ECH erase sequences; mintty can leave stale
+// halves of CJK glyphs when those sequences clear Chinese skill descriptions.
+func TestCompletionMenuPadsWithNonBreakingSpaces(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
+	m.width = 80
+	m.completion.active = true
+	m.completion.items = []compItem{
+		{label: "/土壤", hint: "分析土壤墒情"},
+		{label: "/巡田", hint: "识别病虫害"},
+	}
+	m.completion.sel = 0
+	m.completion.kind = compSlash
+
+	out := m.renderCompletion()
+	for i, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if got := ansi.StringWidth(line); got != 80 {
+			t.Fatalf("line %d visual width = %d, want 80: %q", i, got, line)
+		}
+		if !strings.HasSuffix(line, "\u00a0") {
+			t.Fatalf("line %d should end with non-breaking padding, got %q", i, line)
+		}
+		if strings.HasSuffix(line, " ") {
+			t.Fatalf("line %d should not end with clearable ASCII space, got %q", i, line)
+		}
+	}
+}
+
 // TestTranscriptViewportSizing proves the viewport tracks the terminal size and
 // gets the rows left over after the pinned bottom region (input box + 2 status
 // rows = 5 with an empty 1-line composer), and is fed the committed transcript.
@@ -166,6 +224,111 @@ func TestTranscriptViewportSizing(t *testing.T) {
 	}
 	if m.viewport.TotalLineCount() == 0 {
 		t.Errorf("viewport should hold the committed banner after the first resize")
+	}
+}
+
+// TestStatusLineWrapAccounting proves that computeStatusLineCount correctly
+// predicts the rendered row count of the status block (working + mode/state line
+// + data line) when wrapping is triggered on a narrow terminal, and that
+// bottomRows reserves the right height so the viewport fills the screen without
+// overlap.
+func TestStatusLineWrapAccounting(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 30)
+
+	// Narrow terminal: mode+state line and data line will both wrap.
+	m0, _ := m.Update(tea.WindowSizeMsg{Width: 30, Height: 12})
+	m = m0.(chatTUI)
+
+	// At width 30 the status block should be detectably wrapped.
+	if m.statusLineCount <= 2 {
+		t.Fatalf("statusLineCount on a narrow terminal (30 cols) = %d, want > 2 (wrapping should be detected)", m.statusLineCount)
+	}
+
+	// Verify the height budget covers the full screen.
+	if got := m.transcriptHeight() + m.bottomRows(); got != m.height {
+		t.Fatalf("transcriptHeight(%d) + bottomRows(%d) = %d, want %d (full screen height)",
+			m.transcriptHeight(), m.bottomRows(), got, m.height)
+	}
+
+	// When running, the working line should increase statusLineCount.
+	idleCount := m.statusLineCount
+	m.state = tuiRunning
+	m.elapsed = 5
+	m.turnTokens = 100
+	// Push an interject so the working line is longer.
+	m.pendingInterject = []string{"feedback"}
+	m.statusLineCount = m.computeStatusLineCount(m.width)
+	runCount := m.statusLineCount
+	if runCount <= idleCount {
+		t.Fatalf("statusLineCount when running (%d) should be > idle (%d)", runCount, idleCount)
+	}
+
+	// Reset and test that a custom statusline command is also counted.
+	m.state = tuiIdle
+	m.pendingInterject = nil
+	m.statuslineCmd = "custom"
+	m.statuslineOut = "model: claude-3 · ctx: 45% · tokens: 128K · cache: 87% · rate: 1.2s · jobs: 3 running · balance: ¥152.30"
+	m0, _ = m.Update(tea.WindowSizeMsg{Width: 35, Height: 12})
+	m = m0.(chatTUI)
+	if m.statusLineCount <= 2 {
+		t.Fatalf("statusLineCount with custom statusline on 35 cols = %d, want > 2 (custom output should wrap)", m.statusLineCount)
+	}
+	if got := m.transcriptHeight() + m.bottomRows(); got != m.height {
+		t.Fatalf("with custom statusline: transcriptHeight(%d) + bottomRows(%d) = %d, want %d",
+			m.transcriptHeight(), m.bottomRows(), got, m.height)
+	}
+}
+
+// TestStatusLineRenderedHeightMatchesBudget proves that the actual rendered
+// line count of View()'s bottom area matches what bottomRows() predicts,
+// specifically at the CJK 2-char-overflow boundary where an off-by-one would
+// hide the bottom row of the viewport.
+func TestStatusLineRenderedHeightMatchesBudget(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 46)
+
+	// Manually set a long git repo/branch so the status line contains CJK.
+	m.missing = ""
+	m.gitStatus = gitStatus{Repo: "我的项目名字", Branch: "我的分支"}
+
+	m0, _ := m.Update(tea.WindowSizeMsg{Width: 46, Height: 12})
+	m = m0.(chatTUI)
+
+	if m.statusLineCount <= 2 {
+		t.Fatalf("statusLineCount at width 46 with CJK = %d, want > 2", m.statusLineCount)
+	}
+
+	// Verify that computeStatusLineCount matches the actual rendered line count.
+	// Strip ANSI from the full view, then reconstruct what bottomRows expects.
+	viewStr := ansi.Strip(m.View().Content)
+	allLines := strings.Split(viewStr, "\n")
+	totalLines := len(allLines)
+
+	// The total should be m.height (full terminal height).
+	if totalLines != m.height {
+		t.Fatalf("View() total lines = %d, want %d (terminal height)", totalLines, m.height)
+	}
+
+	// transcriptHeight() lines should be the viewport, the rest is bottom rows.
+	if got, want := m.transcriptHeight()+m.bottomRows(), m.height; got != want {
+		t.Fatalf("transcriptHeight(%d) + bottomRows(%d) = %d, want %d",
+			m.transcriptHeight(), m.bottomRows(), got, want)
+	}
+
+	// Also verify the invariant holds at narrower widths.
+	for _, w := range []int{44, 42, 40, 35, 30, 25, 20} {
+		m0, _ = m.Update(tea.WindowSizeMsg{Width: w, Height: 12})
+		m = m0.(chatTUI)
+		viewStr2 := ansi.Strip(m.View().Content)
+		allLines2 := strings.Split(viewStr2, "\n")
+		if len(allLines2) != m.height {
+			t.Errorf("width=%d: View() total lines = %d, want %d", w, len(allLines2), m.height)
+		}
+		if got, want := m.transcriptHeight()+m.bottomRows(), m.height; got != want {
+			t.Errorf("width=%d: transcriptHeight(%d) + bottomRows(%d) = %d, want %d",
+				w, m.transcriptHeight(), m.bottomRows(), got, want)
+		}
 	}
 }
 
@@ -239,7 +402,7 @@ func TestMCPManagerHidesComposerBox(t *testing.T) {
 	m = m0.(chatTUI)
 
 	footerRows := strings.Count(m.renderMainManagerFooter(), "\n") + 1
-	if got, want := m.bottomRows(), footerRows+2; got != want {
+	if got, want := m.bottomRows(), footerRows+m.statusLineCount; got != want {
 		t.Fatalf("bottomRows with MCP manager = %d, want %d (footer + status rows; manager content renders in main area)", got, want)
 	}
 	if !m.hideComposer() {
@@ -281,7 +444,7 @@ func TestClearCommandRequiresConfirmationAndDiscardsSession(t *testing.T) {
 	m0, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = m0.(chatTUI)
 	footerRows := strings.Count(m.renderMainManagerFooter(), "\n") + 1
-	if got, want := m.bottomRows(), footerRows+2; got != want {
+	if got, want := m.bottomRows(), footerRows+m.statusLineCount; got != want {
 		t.Fatalf("bottomRows with /clear confirmation = %d, want %d (footer + status rows; confirmation renders in main area)", got, want)
 	}
 	if !m.hideComposer() {
@@ -333,14 +496,14 @@ func TestMainManagerFollowsTranscriptWithoutTopPadding(t *testing.T) {
 	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
 	m0, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
 	m = m0.(chatTUI)
-	m.wrappedLines = []string{"reasonix chat", "› /mcp"}
+	m.wrappedLines = []string{"reasonix", "› /mcp"}
 
 	out := ansi.Strip(m.renderTranscriptWithMainManager("Manage MCP servers\n1 servers"))
 	lines := strings.Split(out, "\n")
 	if len(lines) < 4 {
 		t.Fatalf("rendered manager area too short:\n%s", out)
 	}
-	if !strings.Contains(lines[0], "reasonix chat") || !strings.Contains(lines[1], "/mcp") {
+	if !strings.Contains(lines[0], "reasonix") || !strings.Contains(lines[1], "/mcp") {
 		t.Fatalf("transcript lines should stay above manager:\n%s", out)
 	}
 	if strings.TrimSpace(lines[2]) != "" {
@@ -418,7 +581,7 @@ func TestModalPanelsHideComposerBox(t *testing.T) {
 				t.Fatalf("%s panel did not render", tt.name)
 			}
 			cardRows := strings.Count(card, "\n") + 1
-			if got, want := m.bottomRows(), cardRows+2; got != want {
+			if got, want := m.bottomRows(), cardRows+m.statusLineCount; got != want {
 				t.Fatalf("bottomRows with %s = %d, want %d (panel + status rows, no composer box)", tt.name, got, want)
 			}
 		})
@@ -476,7 +639,7 @@ func TestInputOwnedOverlaysKeepComposerBox(t *testing.T) {
 				t.Fatalf("%s panel did not render", tt.name)
 			}
 			panelRows := strings.Count(panel, "\n") + 1
-			if got, want := m.bottomRows(), panelRows+m.input.Height()+2+2; got != want {
+			if got, want := m.bottomRows(), panelRows+m.input.Height()+2+m.statusLineCount; got != want {
 				t.Fatalf("bottomRows with %s = %d, want %d (panel + composer box + status rows)", tt.name, got, want)
 			}
 		})
@@ -699,6 +862,7 @@ func isolateUserConfig(t *testing.T) {
 	t.Helper()
 	root := t.TempDir()
 	t.Setenv("HOME", root)
+	t.Setenv("REASONIX_CREDENTIALS_STORE", "file")
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("AppData", filepath.Join(root, "AppData")) // os.UserConfigDir reads AppData on Windows
 	t.Chdir(root)
@@ -829,6 +993,55 @@ func TestAutoPlanCommandWritesUserConfigNotProjectConfig(t *testing.T) {
 	}
 	if string(projectBody) != "[agent]\nauto_plan = \"off\"\n" {
 		t.Fatalf("/auto-plan should not rewrite project config:\n%s", projectBody)
+	}
+}
+
+func TestReasoningLanguageCommandPersistsAndUpdatesController(t *testing.T) {
+	isolateUserConfig(t)
+
+	ctrl := control.New(control.Options{ReasoningLanguage: "auto"})
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+
+	m.runReasoningLanguageCommand("/reasoning-language zh")
+
+	body, err := os.ReadFile(config.UserConfigPath())
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	if !strings.Contains(string(body), `reasoning_language = "zh"`) {
+		t.Fatalf("saved config missing reasoning_language=zh:\n%s", body)
+	}
+	composed := ctrl.Compose("hello")
+	if !strings.HasPrefix(composed, "<reasoning-language>") || !strings.Contains(composed, "Simplified Chinese") {
+		t.Fatalf("/reasoning-language zh should affect current controller, got %q", composed)
+	}
+}
+
+func TestReasoningLanguageCommandWritesUserConfigNotProjectConfig(t *testing.T) {
+	isolateUserConfig(t)
+	projectPath := filepath.Join(mustGetwd(t), "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte("[agent]\nreasoning_language = \"en\"\n"), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{ReasoningLanguage: "en"})
+	m.runReasoningLanguageCommand("/reasoning-language zh")
+
+	userBody, err := os.ReadFile(config.UserConfigPath())
+	if err != nil {
+		t.Fatalf("read user config: %v", err)
+	}
+	if !strings.Contains(string(userBody), `reasoning_language = "zh"`) {
+		t.Fatalf("user config missing reasoning_language=zh:\n%s", userBody)
+	}
+	projectBody, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if string(projectBody) != "[agent]\nreasoning_language = \"en\"\n" {
+		t.Fatalf("/reasoning-language should not rewrite project config:\n%s", projectBody)
 	}
 }
 
@@ -1342,6 +1555,27 @@ func TestSlashQuitExit(t *testing.T) {
 	}
 }
 
+func TestSlashMigrateShowsProgress(t *testing.T) {
+	isolateCLIConfigHome(t)
+	m := newTestChatTUI()
+
+	if cmd := m.runSlashCommand("/migrate"); cmd != nil {
+		t.Fatal("/migrate should run locally without returning a command")
+	}
+	out := strings.Join(m.transcript, "\n")
+	for _, want := range []string{
+		"/migrate",
+		"migration rescue: checking legacy config and credentials",
+		"migration rescue: scanning legacy memory",
+		"migration rescue: scanning legacy sessions",
+		"migration rescue complete:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in transcript:\n%s", want, out)
+		}
+	}
+}
+
 // TestDoubleCtrlCQuit verifies that Ctrl+C while idle requires a double-press
 // within the 1.5s window to actually quit. A single press shows a hint; a
 // second press within the window returns tea.Quit.
@@ -1626,5 +1860,189 @@ func TestEscInPlanModeDoesNotExitPlan(t *testing.T) {
 
 	if !m2.planMode {
 		t.Error("Esc must not exit plan mode; only Shift+Tab should")
+	}
+}
+
+func TestDesktopShortcutLayoutShiftTabTogglesPlanOnly(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.ctrl.SetToolApprovalMode(control.ToolApprovalAuto)
+	m.cfg = config.Default()
+	if err := m.cfg.SetUIShortcutLayout("desktop"); err != nil {
+		t.Fatal(err)
+	}
+
+	shiftTab := tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
+	out, _ := m.Update(shiftTab)
+	m = out.(chatTUI)
+	if !m.planMode || !m.ctrl.PlanMode() {
+		t.Fatalf("first Shift+Tab should enter plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	}
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAuto {
+		t.Fatalf("Shift+Tab changed approval mode to %q, want auto", got)
+	}
+
+	out, _ = m.Update(shiftTab)
+	m = out.(chatTUI)
+	if m.planMode || m.ctrl.PlanMode() {
+		t.Fatalf("second Shift+Tab should leave plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	}
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAuto {
+		t.Fatalf("second Shift+Tab changed approval mode to %q, want auto", got)
+	}
+}
+
+func TestDesktopShortcutLayoutShiftTabClearsGoalWhenEnteringPlan(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.ctrl.SetGoal("ship the shortcut redesign")
+	m.cfg = config.Default()
+	if err := m.cfg.SetUIShortcutLayout("desktop"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
+	m = out.(chatTUI)
+	if !m.planMode || !m.ctrl.PlanMode() {
+		t.Fatalf("Shift+Tab should enter plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	}
+	if got := m.ctrl.Goal(); got != "" {
+		t.Fatalf("Shift+Tab entering plan should clear goal, got %q", got)
+	}
+}
+
+func TestDesktopShortcutLayoutCtrlYTogglesYolo(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.cfg = config.Default()
+	if err := m.cfg.SetUIShortcutLayout("desktop"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrlY := tea.KeyPressMsg{Code: 'y', Mod: tea.ModCtrl}
+	out, _ := m.Update(ctrlY)
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalYolo {
+		t.Fatalf("Ctrl+Y approval mode = %q, want yolo", got)
+	}
+
+	out, _ = m.Update(ctrlY)
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAsk {
+		t.Fatalf("second Ctrl+Y approval mode = %q, want ask", got)
+	}
+}
+
+func TestDesktopShortcutLayoutCtrlYRestoresAutoAfterYolo(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.ctrl.SetToolApprovalMode(control.ToolApprovalAuto)
+	m.cfg = config.Default()
+	if err := m.cfg.SetUIShortcutLayout("desktop"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrlY := tea.KeyPressMsg{Code: 'y', Mod: tea.ModCtrl}
+	out, _ := m.Update(ctrlY)
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalYolo {
+		t.Fatalf("Ctrl+Y approval mode = %q, want yolo", got)
+	}
+
+	out, _ = m.Update(ctrlY)
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAuto {
+		t.Fatalf("second Ctrl+Y approval mode = %q, want restored auto", got)
+	}
+}
+
+func TestClassicShortcutLayoutCtrlYTogglesYolo(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.cfg = config.Default()
+	if err := m.cfg.SetUIShortcutLayout("classic"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrlY := tea.KeyPressMsg{Code: 'y', Mod: tea.ModCtrl}
+	out, cmd := m.Update(ctrlY)
+	if cmd != nil {
+		t.Fatal("Ctrl+Y should toggle YOLO directly, not return a paste command")
+	}
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalYolo {
+		t.Fatalf("Ctrl+Y approval mode = %q, want yolo", got)
+	}
+
+	out, _ = m.Update(ctrlY)
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAsk {
+		t.Fatalf("second Ctrl+Y approval mode = %q, want ask", got)
+	}
+}
+
+func TestPrimaryYShortcutRestoresAutoUnderClassicShortcutLayout(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.ctrl.SetToolApprovalMode(control.ToolApprovalAuto)
+	m.cfg = config.Default()
+	if err := m.cfg.SetUIShortcutLayout("classic"); err != nil {
+		t.Fatal(err)
+	}
+
+	cmdY := tea.KeyPressMsg{Code: 'y', Mod: tea.ModSuper}
+	out, _ := m.Update(cmdY)
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalYolo {
+		t.Fatalf("Cmd/Super+Y approval mode = %q, want yolo", got)
+	}
+
+	out, _ = m.Update(cmdY)
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAuto {
+		t.Fatalf("second Cmd/Super+Y approval mode = %q, want restored auto", got)
+	}
+}
+
+func TestDesktopShortcutLayoutDoesNotStealCompletionTab(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.cfg = config.Default()
+	if err := m.cfg.SetUIShortcutLayout("desktop"); err != nil {
+		t.Fatal(err)
+	}
+	m.input.SetValue("/")
+	m.completion = completion{
+		active:      true,
+		kind:        compSlash,
+		items:       []compItem{{label: "/mcp", insert: "/mcp ", descend: true}},
+		replaceFrom: 0,
+	}
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	m = out.(chatTUI)
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAsk {
+		t.Fatalf("completion Tab changed approval mode to %q", got)
+	}
+	if got := m.input.Value(); got != "/mcp " {
+		t.Fatalf("completion Tab input = %q, want /mcp ", got)
+	}
+}
+
+func TestShiftTabStillTogglesPlanUnderClassicShortcutLayout(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.cfg = config.Default()
+	if err := m.cfg.SetUIShortcutLayout("classic"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
+	m = out.(chatTUI)
+	if !m.planMode || !m.ctrl.PlanMode() {
+		t.Fatalf("Shift+Tab should toggle plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	}
+	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAsk {
+		t.Fatalf("Shift+Tab changed approval mode to %q", got)
 	}
 }
