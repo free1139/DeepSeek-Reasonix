@@ -7,6 +7,11 @@ import { fileURLToPath } from "node:url";
 const testDir = dirname(fileURLToPath(import.meta.url));
 const appSource = readFileSync(resolve(testDir, "../App.tsx"), "utf8");
 const appChromeSource = readFileSync(resolve(testDir, "../components/AppChrome.tsx"), "utf8");
+const commandPaletteSource = readFileSync(resolve(testDir, "../components/CommandPalette.tsx"), "utf8");
+const projectTreeSource = readFileSync(resolve(testDir, "../components/ProjectTree.tsx"), "utf8");
+const topicShortcutsSource = readFileSync(resolve(testDir, "../lib/topicShortcuts.ts"), "utf8");
+const transcriptSource = readFileSync(resolve(testDir, "../components/Transcript.tsx"), "utf8");
+const layoutStoreSource = readFileSync(resolve(testDir, "../store/layout.ts"), "utf8");
 const stylesSource = readFileSync(resolve(testDir, "../styles.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
 
 let passed = 0;
@@ -65,6 +70,12 @@ ok(
 );
 
 ok(
+  /const WORKSPACE_PANEL_DEFAULT_OPEN = false;/.test(layoutStoreSource) &&
+    /workspacePanelOpen:\s*WORKSPACE_PANEL_DEFAULT_OPEN/.test(layoutStoreSource),
+  "right dock starts collapsed on launch",
+);
+
+ok(
   finalDeclaration(".app-chrome__tab-strip", "overflow") === "hidden",
   "AppChrome tab strip clips tabs to the available chrome width",
 );
@@ -110,13 +121,87 @@ ok(
 );
 
 ok(
-  /\{!workbenchChromeHidden && \(/.test(appSource),
+  /\{!appChromeHidden && \(/.test(appSource),
   "workbench skips rendering the top AppChrome row",
 );
 
 ok(
   /topicbar__chrome-btn/.test(appSource),
   "workbench keeps chrome controls in the topic bar",
+);
+
+ok(
+  /const \[transcriptRevealSignal, setTranscriptRevealSignal\] = useState\(0\);/.test(appSource) &&
+    /revealActiveSignal=\{tabRevealSignal\}/.test(appSource) &&
+    /revealSignal=\{transcriptRevealSignal\}/.test(appSource),
+  "transcript bottom reveal is decoupled from tab-strip reveal",
+);
+
+const tabsReorderBlock = appSource.match(/const handleTabsReorder = useCallback\([\s\S]*?\n  \}, \[refreshTabMetas, reorderTabs\]\);/)?.[0] ?? "";
+ok(
+  /setTabRevealSignal/.test(tabsReorderBlock) && !/setTranscriptRevealSignal/.test(tabsReorderBlock),
+  "tab reordering refreshes the tab strip without snapping the transcript",
+);
+
+ok(
+  /aria-label=\{t\("transcript\.jumpToBottom"\)\}/.test(transcriptSource) &&
+    /title=\{t\("transcript\.jumpToBottom"\)\}/.test(transcriptSource),
+  "jump-to-bottom affordance uses localized transcript text",
+);
+
+ok(
+  /setActive\(items\.length > 0 \? 0 : -1\)/.test(commandPaletteSource),
+  "command palette highlights the first item when opened with an empty query",
+);
+
+ok(
+  /topicShortcutIndexFromEvent\(event, desktopPlatform\)/.test(appSource) &&
+    /useTopicShortcuts\(!sidebarCollapsed, desktopPlatform\)/.test(appSource),
+  "topic shortcuts use the resolved desktop platform",
+);
+
+ok(
+  /topicShortcutLabel\(shortcutIndex, shortcutPlatform\)/.test(projectTreeSource),
+  "topic shortcut badges render the platform-specific modifier",
+);
+
+ok(
+  /if \(!enabled\) hideBadges\(\);/.test(topicShortcutsSource) &&
+    /if \(heldRef\.current\) hideBadges\(\);/.test(topicShortcutsSource) &&
+    /window\.removeEventListener\("blur", onBlur\);\s*hideBadges\(\);/.test(topicShortcutsSource),
+  "topic shortcut badge state is cleared when disabled, interrupted, or cleaned up",
+);
+
+ok(
+  /const \[rewindCommitting, setRewindCommitting\] = useState\(false\);/.test(appSource) &&
+    /rewindStateRef\.current = null;/.test(appSource) &&
+    /setRewindCommitting\(true\);/.test(appSource),
+  "committing optimistic rewind clears undo state before awaiting the backend",
+);
+
+ok(
+  /const controllerReady = state\.meta\?\.ready === true && !state\.backendActivationPending;/.test(appSource) &&
+    /if \(!controllerReady\) return;\s*void commitThenSend\(text\);/s.test(appSource) &&
+    /onPrompt=\{handleTranscriptPrompt\}/.test(appSource) &&
+    /submitDisabled=\{!controllerReady\}/.test(appSource),
+  "welcome prompts and composer submit share the controller readiness gate",
+);
+
+ok(
+  /const transcriptHydrating = state\.hydrating && !state\.hydrateHistoryLoaded;/.test(appSource) &&
+    /hydrating=\{transcriptHydrating\}/.test(appSource),
+  "Welcome is suppressed only until transcript history has loaded",
+);
+
+const openTopicBlock = appSource.match(/const handleOpenTopic = useCallback\([\s\S]*?\n  \}, \[[^\]]*seedActiveTabMeta[^\]]*\]\);/)?.[0] ?? "";
+ok(
+  /let openedTab: TabMeta;/.test(openTopicBlock) &&
+    /openedTab = await activateTopic/.test(openTopicBlock) &&
+    /openedTab = await openTopicSession/.test(openTopicBlock) &&
+    /openedTab = await openGlobalTab/.test(openTopicBlock) &&
+    /openedTab = await openProjectTab/.test(openTopicBlock) &&
+    /seedActiveTabMeta\(openedTab\);[\s\S]*void refreshTabMetas\(\);/.test(openTopicBlock),
+  "opening topics seeds active tab metadata before background refresh",
 );
 
 for (const selector of [
@@ -193,8 +278,8 @@ for (const selector of [
 }
 
 ok(
-  finalDeclaration(":root[data-theme-style] .layout--workbench-chrome-hidden .topicbar", "background") === "var(--chat-bg)",
-  "workbench topic bar uses a flat chat background",
+  finalDeclaration(":root[data-theme-style] .layout--workbench-chrome-hidden .topicbar", "background") === "var(--bg-elev)",
+  "workbench topic bar uses elevated background for light-mode white",
 );
 
 for (const selector of [

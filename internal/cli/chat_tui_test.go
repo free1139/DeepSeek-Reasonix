@@ -24,9 +24,31 @@ import (
 
 type blockingTurnRunner struct{ started chan struct{} }
 
+type stubbornTurnRunner struct {
+	started chan struct{}
+	release chan struct{}
+}
+
 func TestMain(m *testing.M) {
 	old := detectTermuxTerminal
 	detectTermuxTerminal = func() bool { return false }
+
+	// Pin the UI language for the whole cli test binary. Production code
+	// (cli.Run) calls i18n.DetectLanguage("") which resolves the host locale from
+	// the environment (REASONIX_LANG/LC_ALL/LC_MESSAGES/LANG) and installs it as
+	// the global i18n.M. On a non-English dev machine that flips M to e.g.
+	// Chinese, and tests that exercise the CLI entry point (acp_test.go,
+	// cli_test.go) don't restore it — so later tests asserting English UI strings
+	// fail, but only when the whole package runs, not in isolation. Forcing a
+	// deterministic English environment keeps the suite independent of the host
+	// locale (matching CI). Tests that need another language still set it
+	// explicitly via i18n.DetectLanguage(lang) with their own cleanup.
+	os.Unsetenv("REASONIX_LANG")
+	os.Unsetenv("LC_ALL")
+	os.Unsetenv("LC_MESSAGES")
+	os.Setenv("LANG", "en_US.UTF-8")
+	i18n.DetectLanguage("en")
+
 	code := m.Run()
 	detectTermuxTerminal = old
 	os.Exit(code)
@@ -35,6 +57,12 @@ func TestMain(m *testing.M) {
 func (r *blockingTurnRunner) Run(ctx context.Context, _ string) error {
 	close(r.started)
 	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (r *stubbornTurnRunner) Run(ctx context.Context, _ string) error {
+	close(r.started)
+	<-r.release
 	return ctx.Err()
 }
 
@@ -395,7 +423,7 @@ func TestMCPManagerHidesComposerBox(t *testing.T) {
 	ctrl := control.New(control.Options{})
 	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
 	m.mcp = &mcpManager{stage: mcpStageList, snapshot: mcpSnapshot{servers: []mcpServerView{
-		{Name: "github", Transport: "stdio", Status: "deferred", Configured: true, Tier: "lazy"},
+		{Name: "github", Transport: "stdio", Status: "deferred", Configured: true, Tier: "background"},
 	}}}
 
 	m0, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
@@ -511,6 +539,38 @@ func TestMainManagerFollowsTranscriptWithoutTopPadding(t *testing.T) {
 	}
 	if !strings.Contains(lines[3], "Manage MCP servers") {
 		t.Fatalf("manager should follow transcript immediately, got line 3 %q in:\n%s", lines[3], out)
+	}
+}
+
+func TestMarkdownDividerFitsTranscriptContentWidth(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
+	m0, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	m = m0.(chatTUI)
+
+	wantW := transcriptContentWidth(80, false)
+	if m.viewport.Width() != wantW {
+		t.Fatalf("viewport width = %d, want transcript content width %d", m.viewport.Width(), wantW)
+	}
+	rule := strings.TrimRight(m.renderer.Render("---"), "\n")
+	lines := strings.Split(wrapTranscript(rule, m.viewport.Width()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("markdown divider wrapped into %d lines at width %d: %q", len(lines), m.viewport.Width(), lines)
+	}
+	if w := visibleWidth(lines[0]); w != m.viewport.Width() {
+		t.Fatalf("markdown divider width = %d, want %d: %q", w, m.viewport.Width(), lines[0])
+	}
+}
+
+func TestTranscriptContentWidthReservesScrollbarColumn(t *testing.T) {
+	if got := transcriptContentWidth(80, false); got != 79 {
+		t.Fatalf("transcriptContentWidth(80, false) = %d, want 79", got)
+	}
+	if got := transcriptContentWidth(80, true); got != 80 {
+		t.Fatalf("transcriptContentWidth(80, true) = %d, want 80", got)
+	}
+	if got := transcriptContentWidth(0, false); got != 1 {
+		t.Fatalf("transcriptContentWidth(0, false) = %d, want 1", got)
 	}
 }
 
@@ -1045,6 +1105,33 @@ func TestReasoningLanguageCommandWritesUserConfigNotProjectConfig(t *testing.T) 
 	}
 }
 
+func TestMemoryV5CommandWritesUserConfigNotProjectConfig(t *testing.T) {
+	isolateUserConfig(t)
+	projectPath := filepath.Join(mustGetwd(t), "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte("[agent]\nmemory_compiler = { enabled = true }\n"), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.runMemoryV5Command("/memory-v5 off")
+
+	userBody, err := os.ReadFile(config.UserConfigPath())
+	if err != nil {
+		t.Fatalf("read user config: %v", err)
+	}
+	if !strings.Contains(string(userBody), `memory_compiler = { enabled = false }`) {
+		t.Fatalf("user config missing memory_compiler off:\n%s", userBody)
+	}
+	projectBody, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if string(projectBody) != "[agent]\nmemory_compiler = { enabled = true }\n" {
+		t.Fatalf("/memory-v5 should not rewrite project config:\n%s", projectBody)
+	}
+}
+
 func TestLanguageCommandSwitchesImmediatelyAndPersists(t *testing.T) {
 	isolateUserConfig(t)
 	i18n.DetectLanguage("en")
@@ -1349,8 +1436,8 @@ func TestQueueIndicatorHiddenWhenIdle(t *testing.T) {
 }
 
 // TestViewAltScreenFillsHeight proves the switch to alt-screen: View requests
-// the alt buffer, and the frame is exactly the terminal height (the
-// transcript viewport pads to fill above the pinned bottom region).
+// the alt buffer without mouse reporting, and the frame is exactly the terminal
+// height (the transcript viewport pads to fill above the pinned bottom region).
 func TestViewAltScreenFillsHeight(t *testing.T) {
 	ctrl := control.New(control.Options{})
 	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
@@ -1360,6 +1447,9 @@ func TestViewAltScreenFillsHeight(t *testing.T) {
 
 	if !v.AltScreen {
 		t.Error("View must request alt-screen so resize repaints the whole grid")
+	}
+	if v.MouseMode != tea.MouseModeNone {
+		t.Error("View must leave terminal mouse selection available by default")
 	}
 	if lines := strings.Count(v.Content, "\n") + 1; lines != 24 {
 		t.Errorf("alt-screen frame = %d lines, want 24 (full terminal height)", lines)
@@ -1459,6 +1549,42 @@ func TestEmptyEnterScrollsToBottom(t *testing.T) {
 			t.Error("empty enter while running should scroll viewport to bottom")
 		}
 	})
+}
+
+// TestForceGotoBottomScrollsWithoutTranscriptChange keeps the force-bottom
+// contract independent from transcript length, width, or dirty-state changes.
+func TestForceGotoBottomScrollsWithoutTranscriptChange(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	ch := make(chan event.Event, 1)
+	notice := agentEventMsg(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "line"})
+	adv := func(m chatTUI, msg tea.Msg) chatTUI {
+		n, _ := m.Update(msg)
+		return n.(chatTUI)
+	}
+
+	cur := adv(newChatTUI(ctrl, "", ch, 80), tea.WindowSizeMsg{Width: 80, Height: 8})
+	for i := 0; i < 12; i++ {
+		cur = adv(cur, notice)
+	}
+	if !cur.viewport.AtBottom() {
+		t.Fatal("new output while pinned should keep the viewport at the bottom")
+	}
+
+	cur = adv(cur, tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	if cur.viewport.AtBottom() {
+		t.Fatal("wheel-up should break the bottom pin")
+	}
+
+	cur.forceGotoBottom = true
+	cur.transcriptDirty = false
+	cur = adv(cur, tea.WindowSizeMsg{Width: 80, Height: 8})
+
+	if !cur.viewport.AtBottom() {
+		t.Fatalf("forceGotoBottom should scroll without transcript changes, YOffset=%d", cur.viewport.YOffset())
+	}
+	if cur.forceGotoBottom {
+		t.Fatal("forceGotoBottom should be cleared after scrolling")
+	}
 }
 
 func TestFoldedPasteUsesPlaceholderAndExpandsOnSend(t *testing.T) {
@@ -1618,6 +1744,55 @@ func TestDoubleCtrlCQuit(t *testing.T) {
 	// lastCtrlCAt should be refreshed to now.
 	if time.Since(m4.lastCtrlCAt) > time.Second {
 		t.Error("expired Ctrl+C should refresh lastCtrlCAt")
+	}
+}
+
+func TestSecondCtrlCQuitsAfterCancelIsAlreadyRequested(t *testing.T) {
+	r := &stubbornTurnRunner{started: make(chan struct{}), release: make(chan struct{})}
+	ctrl := control.New(control.Options{Runner: r, Sink: event.Discard, SessionDir: t.TempDir(), Label: "test"})
+	ctrl.Send("hi")
+	<-r.started
+	defer close(r.release)
+
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+	m.state = tuiRunning
+	ctrlC := tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}
+
+	_, firstCmd := m.Update(ctrlC)
+	if firstCmd != nil {
+		t.Fatal("first Ctrl+C while running should request cancel, not quit")
+	}
+	if st := ctrl.RuntimeStatus(); !st.Running || !st.CancelRequested {
+		t.Fatalf("first Ctrl+C status = %+v, want running cancel requested", st)
+	}
+
+	_, secondCmd := m.Update(ctrlC)
+	if secondCmd == nil {
+		t.Fatal("second Ctrl+C after cancel request should quit")
+	}
+	if msg := secondCmd(); msg != (tea.QuitMsg{}) {
+		t.Fatalf("second Ctrl+C command = %T, want tea.QuitMsg", msg)
+	}
+}
+
+func TestRunningStatusShowsCancelRequested(t *testing.T) {
+	r := &stubbornTurnRunner{started: make(chan struct{}), release: make(chan struct{})}
+	ctrl := control.New(control.Options{Runner: r, Sink: event.Discard, SessionDir: t.TempDir(), Label: "test"})
+	ctrl.Send("hi")
+	<-r.started
+	defer close(r.release)
+
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+	m.state = tuiRunning
+	m.width = 80
+	m.height = 24
+	ctrl.Cancel()
+
+	view := ansi.Strip(m.View().Content)
+	if !strings.Contains(view, "stopping") {
+		t.Fatalf("running status after cancel should show stopping feedback:\n%s", view)
 	}
 }
 

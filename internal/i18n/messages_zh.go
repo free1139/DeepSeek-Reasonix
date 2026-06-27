@@ -48,6 +48,7 @@ var Chinese = Messages{
 	ChatStatusThinkingFmt:       "%s 思考中… (%d 秒 · Esc 取消)",
 	ChatToolWorkingFmt:          "%s 运行中 · %d 秒",
 	ChatStatusRetryingFmt:       "%s 正在重试 (%d/%d)… (Esc 取消)",
+	ChatStatusCancellingFmt:     "%s 正在停止… (%d 秒 · Ctrl+C 退出)",
 	ChatStatusIdle:              "就绪",
 	ChatStatusYoloIdle:          "已跳过工具批准",
 	ChatStatusCycleHint:         "shift+tab 切换计划 · ctrl+y yolo",
@@ -104,7 +105,7 @@ var Chinese = Messages{
 	SlashUnavailable:   "当前构建不支持该命令",
 	SlashUnknown:       "未知命令",
 	SlashTodoCleared:   "已清除任务清单",
-	SlashHelp:          "命令：/compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model（切换模型）· /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /migrate · /goal · /remember · /quit · /help · 以及 skills（/init、/explore …）",
+	SlashHelp:          "命令：/compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model（切换模型）· /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /memory-v5 · /migrate · /goal · /remember · /quit · /help · 以及 skills（/init、/explore …）",
 
 	SkillPickerTitle:             "Skills",
 	SkillPickerAvailableFmt:      "%d 个可用",
@@ -184,11 +185,13 @@ var Chinese = Messages{
 	CmdLanguage:     "切换 CLI 语言",
 	CmdSkill:        "管理 skills",
 	CmdVerbose:      "切换 thinking 原文显示",
+	CmdReloadCmd:    "重载自定义命令",
 	CmdDiffFold:     "切换 diff 折叠/展开",
 	CmdSandbox:      "查看沙箱状态",
 	CmdEffort:       "设置推理强度",
 	CmdAutoPlan:     "配置自动计划模式",
 	CmdReasonLang:   "设置可见思考语言",
+	CmdMemoryV5:     "切换 Memory v5",
 	CmdHelp:         "查看命令列表",
 	CmdTodo:         "清除任务清单",
 	CmdQuit:         "退出会话",
@@ -369,10 +372,11 @@ var Chinese = Messages{
   reasonix [--model NAME] [-c|--continue] [--resume] [--yolo] [--dir PATH]   交互式会话（多轮；-c 恢复最近一次，--resume 选择一个）
   reasonix run  [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] <task>   执行单次任务后退出
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI 代码审查（基于本地 diff）
-  reasonix serve [--model NAME] [--addr HOST:PORT]      通过 HTTP+SSE 提供会话（浏览器客户端在 /）
+  reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  通过 HTTP+SSE 提供服务（支持可选认证）
   reasonix acp [--model NAME]                           通过 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
   reasonix setup [path]                                 交互式配置向导；生成 reasonix.toml（及 .env）
   reasonix config auto-plan [off|on]                    配置自动计划模式
+  reasonix config memory-v5 [off|on|status]             配置 Memory v5
   reasonix config reasoning-language [auto|zh|en]        配置可见思考语言
   reasonix mcp <add|remove|list|import>                 管理 reasonix.toml 里的 MCP 服务器
   reasonix init                                         查看如何生成项目记忆（AGENTS.md）

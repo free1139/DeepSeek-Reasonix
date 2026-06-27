@@ -92,6 +92,7 @@ func TestWriteRootsForRootExcludesUserConfigDirByDefault(t *testing.T) {
 // an equivalent config — i.e. the wizard never writes a file it can't read.
 func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig := Default()
+	orig.Providers = append(orig.Providers, legacyMimoCustomProvider("mimo-pro"))
 	orig.DefaultModel = "mimo-pro"
 	orig.Language = "zh"
 	orig.UI.Theme = "light"
@@ -102,8 +103,10 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig.Desktop.Theme = "dark"
 	orig.Desktop.ThemeStyle = "graphite"
 	orig.Desktop.CloseBehavior = "background"
+	orig.Desktop.DisplayMode = "compact"
 	orig.Desktop.StatusBarStyle = "text"
 	orig.Desktop.StatusBarItems = []string{"model", "balance", "cache"}
+	orig.Desktop.DefaultToolApprovalMode = "auto"
 	orig.Desktop.CheckUpdates = boolPtr(false)
 	orig.Desktop.Telemetry = boolPtr(false)
 	orig.Notifications.Enabled = true
@@ -120,6 +123,8 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig.Agent.RecentKeep = 4
 	orig.Tools.BashTimeoutSeconds = intPtr(900)
 	orig.Tools.BackgroundJobs.StalledWarningSeconds = intPtr(30)
+	orig.Tools.Shell.Prefer = "bash"
+	orig.Tools.Shell.Path = "/usr/local/bin/bash"
 	orig.Permissions = PermissionsConfig{
 		Mode:  "deny",
 		Deny:  []string{"Bash(rm -rf*)"},
@@ -223,11 +228,17 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if got.Desktop.CloseBehavior != "background" {
 		t.Errorf("desktop.close_behavior = %q, want background", got.Desktop.CloseBehavior)
 	}
+	if got.DesktopDisplayMode() != "compact" {
+		t.Errorf("desktop.display_mode = %q, want compact", got.DesktopDisplayMode())
+	}
 	if got.Desktop.StatusBarStyle != "text" {
 		t.Errorf("desktop.status_bar_style = %q, want text", got.Desktop.StatusBarStyle)
 	}
 	if want := []string{"model", "balance", "cache"}; !reflect.DeepEqual(got.Desktop.StatusBarItems, want) {
 		t.Errorf("desktop.status_bar_items = %v, want %v", got.Desktop.StatusBarItems, want)
+	}
+	if got.DesktopDefaultToolApprovalMode() != "auto" {
+		t.Errorf("desktop.default_tool_approval_mode = %q, want auto", got.DesktopDefaultToolApprovalMode())
 	}
 	if got.Desktop.CheckUpdates == nil || *got.Desktop.CheckUpdates {
 		t.Errorf("desktop.check_updates = %+v, want false", got.Desktop.CheckUpdates)
@@ -308,6 +319,12 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if got.Tools.BackgroundJobs.StalledWarningSeconds == nil || *got.Tools.BackgroundJobs.StalledWarningSeconds != 30 {
 		t.Errorf("tools.background_jobs.stalled_warning_seconds = %v, want 30", got.Tools.BackgroundJobs.StalledWarningSeconds)
 	}
+	if got.Tools.Shell.Prefer != "bash" {
+		t.Errorf("tools.shell.prefer = %q, want bash", got.Tools.Shell.Prefer)
+	}
+	if got.Tools.Shell.Path != "/usr/local/bin/bash" {
+		t.Errorf("tools.shell.path = %q, want /usr/local/bin/bash", got.Tools.Shell.Path)
+	}
 	if g, _ := got.Provider("mimo-pro"); g == nil || g.BaseURL != "http://localhost:8000/v1" || g.ReasoningProtocol != "openai" {
 		t.Errorf("mimo-pro base_url not preserved: %+v", g)
 	}
@@ -359,6 +376,45 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 	if strings.Contains(rendered, "\ntier") {
 		t.Errorf("rendered config should not contain MCP tier fields:\n%s", rendered)
+	}
+}
+
+func TestRenderTOMLDocumentsPlanModeAllowedTools(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.PlanModeAllowedTools = []string{"custom_reader"}
+
+	rendered := RenderTOML(cfg)
+	if !strings.Contains(rendered, `plan_mode_allowed_tools = ["custom_reader"]`) {
+		t.Fatalf("rendered config should preserve plan_mode_allowed_tools:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "extra read-only declarations") || !strings.Contains(rendered, "cannot unlock known blocked tools or unsafe bash") {
+		t.Fatalf("rendered config should document tightened plan_mode_allowed_tools semantics:\n%s", rendered)
+	}
+
+	var got Config
+	if _, err := toml.Decode(rendered, &got); err != nil {
+		t.Fatalf("rendered TOML does not parse: %v\n%s", err, rendered)
+	}
+	if !reflect.DeepEqual(got.Agent.PlanModeAllowedTools, cfg.Agent.PlanModeAllowedTools) {
+		t.Fatalf("PlanModeAllowedTools round trip = %v, want %v", got.Agent.PlanModeAllowedTools, cfg.Agent.PlanModeAllowedTools)
+	}
+}
+
+func TestRenderTOMLCreationLayoutStyle(t *testing.T) {
+	c := Default()
+	if err := c.SetDesktopLayoutStyle("creation"); err != nil {
+		t.Fatalf("SetDesktopLayoutStyle: %v", err)
+	}
+	rendered := RenderTOML(c)
+	var got Config
+	if _, err := toml.Decode(rendered, &got); err != nil {
+		t.Fatalf("rendered TOML does not parse: %v\n---\n%s", err, rendered)
+	}
+	if got.Desktop.LayoutStyle != "creation" {
+		t.Errorf("desktop.layout_style = %q, want creation", got.Desktop.LayoutStyle)
+	}
+	if got.DesktopLayoutStyle() != "creation" {
+		t.Errorf("DesktopLayoutStyle() = %q, want creation", got.DesktopLayoutStyle())
 	}
 }
 
@@ -484,17 +540,18 @@ func TestScopedRenderSeparatesUserAndProjectConfig(t *testing.T) {
 	c.Desktop.ThemeStyle = "graphite"
 	c.Desktop.CloseBehavior = "background"
 	c.Desktop.StatusBarStyle = "text"
+	c.Desktop.DefaultToolApprovalMode = "auto"
 	c.Desktop.CheckUpdates = boolPtr(false)
 
 	user := RenderTOMLForScope(c, RenderScopeUser)
-	for _, want := range []string{"config_version = 3", "[desktop]", `theme = "dark"`, `close_behavior = "background"`, `status_bar_style = "text"`, `check_updates = false`, "[notifications]"} {
+	for _, want := range []string{"config_version = 3", "[desktop]", `theme = "dark"`, `close_behavior = "background"`, `status_bar_style = "text"`, `default_tool_approval_mode = "auto"`, `check_updates = false`, "[notifications]", "[tools.shell]"} {
 		if !strings.Contains(user, want) {
 			t.Fatalf("user render missing %q:\n%s", want, user)
 		}
 	}
 
 	project := RenderTOMLForScope(c, RenderScopeProject)
-	for _, forbidden := range []string{"[desktop]", "[notifications]", "close_behavior =", "check_updates ="} {
+	for _, forbidden := range []string{"[desktop]", "[notifications]", "close_behavior =", "default_tool_approval_mode =", "check_updates =", "max_steps", "planner_max_steps"} {
 		if strings.Contains(project, forbidden) {
 			t.Fatalf("project render should not contain %q:\n%s", forbidden, project)
 		}
@@ -504,6 +561,30 @@ func TestScopedRenderSeparatesUserAndProjectConfig(t *testing.T) {
 	}
 	if !strings.Contains(project, "# system_prompt =") {
 		t.Fatalf("project render should leave a system prompt hint:\n%s", project)
+	}
+}
+
+func TestProjectDeltaRendersToolsShellOverrides(t *testing.T) {
+	c := Default()
+	c.Tools.Shell.Prefer = "bash"
+	c.Tools.Shell.Path = "/usr/local/bin/bash"
+
+	delta := RenderTOMLProjectDelta(c)
+	for _, want := range []string{"[tools.shell]", `prefer = "bash"`, `path = "/usr/local/bin/bash"`} {
+		if !strings.Contains(delta, want) {
+			t.Fatalf("project delta missing %q:\n%s", want, delta)
+		}
+	}
+	if strings.Contains(delta, "[tools]\n\n") {
+		t.Fatalf("project delta should not emit an empty [tools] block:\n%s", delta)
+	}
+
+	got := Default()
+	if _, err := toml.Decode(delta, got); err != nil {
+		t.Fatalf("decode project delta: %v\n%s", err, delta)
+	}
+	if got.Tools.Shell.Prefer != "bash" || got.Tools.Shell.Path != "/usr/local/bin/bash" {
+		t.Fatalf("tools.shell = %+v, want bash with path", got.Tools.Shell)
 	}
 }
 
@@ -610,6 +691,24 @@ func boolPtr(v bool) *bool { return &v }
 
 func intPtr(v int) *int { return &v }
 
+func TestRenderTOMLPreservesDesktopDisplayMode(t *testing.T) {
+	c := Default()
+	if err := c.SetDesktopDisplayMode("compact"); err != nil {
+		t.Fatalf("SetDesktopDisplayMode: %v", err)
+	}
+	rendered := RenderTOMLForScope(c, RenderScopeUser)
+	if !strings.Contains(rendered, `display_mode = "compact"`) {
+		t.Fatalf("rendered user config missing display_mode:\n%s", rendered)
+	}
+	var got Config
+	if _, err := toml.Decode(rendered, &got); err != nil {
+		t.Fatalf("rendered TOML does not parse: %v\n---\n%s", err, rendered)
+	}
+	if got.DesktopDisplayMode() != "compact" {
+		t.Fatalf("display_mode after round trip = %q, want compact", got.DesktopDisplayMode())
+	}
+}
+
 func TestRenderTOMLDefaultStepsCommentedOut(t *testing.T) {
 	isolateUserConfigHome(t)
 	out := RenderTOML(Default())
@@ -651,7 +750,7 @@ func TestRenderTOMLNonDefaultStepsWrittenExplicitly(t *testing.T) {
 	isolateUserConfigHome(t)
 	c := Default()
 	c.Agent.MaxSteps = 5
-	c.Agent.PlannerMaxSteps = 0
+	c.Agent.PlannerMaxSteps = 7
 	out := RenderTOML(c)
 	agentLines := extractSectionLines(out, "[agent]")
 	foundMax, foundPlanner := false, false
@@ -678,7 +777,7 @@ func TestRenderTOMLDefaultStepsDoNotOverrideGlobalConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	globalPath := filepath.Join(globalDir, "config.toml")
-	if err := os.WriteFile(globalPath, []byte("[agent]\nplanner_max_steps = 0\nmax_steps = 100\n"), 0o644); err != nil {
+	if err := os.WriteFile(globalPath, []byte("[agent]\nplanner_max_steps = 9\nmax_steps = 100\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -693,8 +792,8 @@ func TestRenderTOMLDefaultStepsDoNotOverrideGlobalConfig(t *testing.T) {
 	if err := mergeFile(cfg, globalPath); err != nil {
 		t.Fatalf("global merge failed: %v", err)
 	}
-	if cfg.Agent.PlannerMaxSteps != 0 {
-		t.Fatalf("after global: planner_max_steps = %d, want 0", cfg.Agent.PlannerMaxSteps)
+	if cfg.Agent.PlannerMaxSteps != 9 {
+		t.Fatalf("after global: planner_max_steps = %d, want 9", cfg.Agent.PlannerMaxSteps)
 	}
 	if cfg.Agent.MaxSteps != 100 {
 		t.Fatalf("after global: max_steps = %d, want 100", cfg.Agent.MaxSteps)
@@ -703,8 +802,8 @@ func TestRenderTOMLDefaultStepsDoNotOverrideGlobalConfig(t *testing.T) {
 	if err := mergeFile(cfg, projectPath); err != nil {
 		t.Fatalf("project merge failed: %v", err)
 	}
-	if cfg.Agent.PlannerMaxSteps != 0 {
-		t.Errorf("after project: planner_max_steps = %d, want 0 (global should not be overridden by commented-out default)", cfg.Agent.PlannerMaxSteps)
+	if cfg.Agent.PlannerMaxSteps != 9 {
+		t.Errorf("after project: planner_max_steps = %d, want 9 (global should not be overridden by commented-out default)", cfg.Agent.PlannerMaxSteps)
 	}
 	if cfg.Agent.MaxSteps != 100 {
 		t.Errorf("after project: max_steps = %d, want 100 (global should not be overridden by commented-out default)", cfg.Agent.MaxSteps)

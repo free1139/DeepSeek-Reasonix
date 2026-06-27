@@ -3,7 +3,9 @@
 import {
   projectTreeFolderDisclosure,
   defaultExpandedProjectTreeKeys,
+  activeSessionAncestorKeys,
   projectTreeTopicOpenRequest,
+  projectTreeShouldSuppressOpenForRename,
 } from "../components/ProjectTree";
 import type { ProjectNode } from "../lib/types";
 
@@ -62,8 +64,26 @@ const tree: ProjectNode[] = [
 
 eq(
   defaultExpandedProjectTreeKeys(tree),
+  [],
+  "without an active tab, no folders default to expanded",
+);
+
+eq(
+  defaultExpandedProjectTreeKeys(tree, "global", "", "topic-a", "/tmp/b.jsonl"),
   ["global_folder", "global_topic_topic-a"],
-  "runtime-session topic rows default to expanded so child sessions are visible",
+  "active session path expands only ancestor folders",
+);
+
+eq(
+  activeSessionAncestorKeys(tree, "global", "", "topic-a", "/tmp/b.jsonl"),
+  ["global_folder", "global_topic_topic-a"],
+  "activeSessionAncestorKeys matches defaultExpandedProjectTreeKeys for active session",
+);
+
+eq(
+  activeSessionAncestorKeys(tree, "global", "", "topic-b"),
+  ["global_folder"],
+  "active topic without runtime session rows expands only parent folders",
 );
 
 eq(
@@ -82,6 +102,33 @@ eq(
   }),
   { scope: "project", workspaceRoot: "/repo", topicId: "topic-project", sessionPath: undefined },
   "regular project topic still opens by topic",
+);
+
+eq(
+  projectTreeShouldSuppressOpenForRename(
+    { rowKey: "topic-a", canRename: true },
+    { rowKey: "topic-a", canRename: true },
+  ),
+  true,
+  "second click on the same renameable topic suppresses open for inline rename",
+);
+
+eq(
+  projectTreeShouldSuppressOpenForRename(
+    { rowKey: "session-a", canRename: false },
+    { rowKey: "session-a", canRename: false },
+  ),
+  false,
+  "runtime session double-click still allows the session row to open",
+);
+
+eq(
+  projectTreeShouldSuppressOpenForRename(
+    { rowKey: "topic-a", canRename: true },
+    { rowKey: "topic-b", canRename: true },
+  ),
+  false,
+  "quickly clicking a different topic still opens the new target",
 );
 
 eq(

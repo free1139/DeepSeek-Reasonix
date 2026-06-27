@@ -47,6 +47,7 @@ var English = Messages{
 	ChatStatusThinkingFmt:       "%s thinking… (%ds · Esc cancels)",
 	ChatToolWorkingFmt:          "%s working · %ds",
 	ChatStatusRetryingFmt:       "%s retrying (%d/%d)… (Esc cancels)",
+	ChatStatusCancellingFmt:     "%s stopping… (%ds · Ctrl+C exits)",
 	ChatStatusIdle:              "ready",
 	ChatStatusYoloIdle:          "tool approvals skipped",
 	ChatStatusCycleHint:         "shift+tab toggles plan · ctrl+y yolo",
@@ -103,7 +104,7 @@ var English = Messages{
 	SlashUnavailable:   "command unavailable in this build",
 	SlashUnknown:       "unknown command",
 	SlashTodoCleared:   "task list dismissed",
-	SlashHelp:          "commands: /compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model (switch model) · /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /migrate · /goal · /remember · /quit · /help · plus skills (/init, /explore, …)",
+	SlashHelp:          "commands: /compact · /new · /clear · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model (switch model) · /effort · /theme · /language · /mcp · /skills · /hooks · /paste-image · /memory · /memory-v5 · /migrate · /goal · /remember · /quit · /help · plus skills (/init, /explore, …)",
 
 	SkillPickerTitle:             "Skills",
 	SkillPickerAvailableFmt:      "%d available",
@@ -183,11 +184,13 @@ var English = Messages{
 	CmdLanguage:     "switch CLI language",
 	CmdSkill:        "manage skills",
 	CmdVerbose:      "toggle thinking text",
+	CmdReloadCmd:    "reload custom commands",
 	CmdDiffFold:     "toggle diff fold/expand",
 	CmdSandbox:      "show sandbox status",
 	CmdEffort:       "set reasoning effort",
 	CmdAutoPlan:     "configure automatic plan mode",
 	CmdReasonLang:   "set visible reasoning language",
+	CmdMemoryV5:     "toggle Memory v5",
 	CmdHelp:         "list commands",
 	CmdTodo:         "dismiss the task list",
 	CmdQuit:         "exit the session",
@@ -368,10 +371,11 @@ Usage:
   reasonix [--model NAME] [-c|--continue] [--resume] [--yolo] [--dir PATH]   interactive session (multi-turn; -c resumes the latest, --resume picks one)
   reasonix run  [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] <task>   run one task and exit
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI-powered code review on local diffs
-  reasonix serve [--model NAME] [--addr HOST:PORT]      serve the session over HTTP+SSE (browser client at /)
+  reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  serve over HTTP+SSE (with optional auth)
   reasonix acp [--model NAME]                           serve Agent Client Protocol over stdio (also: reasonix --acp)
   reasonix setup [path]                                 interactive config wizard; writes reasonix.toml (+ .env)
   reasonix config auto-plan [off|on]                    configure automatic plan mode
+  reasonix config memory-v5 [off|on|status]             configure Memory v5
   reasonix config reasoning-language [auto|zh|en]        configure visible reasoning language
   reasonix mcp <add|remove|list|import>                 manage MCP servers in reasonix.toml
   reasonix init                                         show how to generate project memory (AGENTS.md)
