@@ -1634,11 +1634,15 @@ func (e *ProviderEntry) APIKey() string {
 	if e.APIKeyEnv == "" {
 		return ""
 	}
-	value, _, ok := storedCredentialValue(e.APIKeyEnv)
-	if !ok {
-		return ""
+	if value, _, ok := storedCredentialValue(e.APIKeyEnv); ok {
+		return value
 	}
-	return value
+	// Fallback to the process environment variable — the user may have exported
+	// it without writing it to the Reasonix credentials .env file.
+	if v := os.Getenv(e.APIKeyEnv); v != "" {
+		return v
+	}
+	return ""
 }
 
 // ResolveAPIKeyFromProcessEnvForProbe pins a setup-time, user-entered key onto

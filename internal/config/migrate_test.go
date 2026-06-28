@@ -950,3 +950,143 @@ func TestMigrateSupportData(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrateBackfillsLegacyProvidersWhenDestHasOnlyDefaults(t *testing.T) {
+	_, dest, home := legacyHome(t)
+
+	// Write dest with only the two default providers.
+	writeLegacy(t, dest, `
+config_version = 3
+default_model = "deepseek-flash"
+
+[[providers]]
+name = "deepseek-flash"
+kind = "openai"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[[providers]]
+name = "deepseek-pro"
+kind = "openai"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"
+`)
+
+	// Write a legacy TOML with an extra custom provider.
+	legacyPath := filepath.Join(home, ".config", "reasonix", "config.toml")
+	writeLegacy(t, legacyPath, `
+config_version = 2
+default_model = "deepseek-flash/deepseek-v4-flash"
+
+[[providers]]
+name = "deepseek-flash"
+kind = "openai"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[[providers]]
+name = "deepseek-pro"
+kind = "openai"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[[providers]]
+name = "my-custom"
+kind = "openai"
+base_url = "https://my-api.example.com/v1"
+model = "my-model"
+api_key_env = "MY_API_KEY"
+`)
+
+	res, err := MigrateLegacyIfNeeded()
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected migration to backfill legacy providers")
+	}
+	if res.From != legacyPath || res.To != dest {
+		t.Fatalf("migration from/to = %s/%s, want %s/%s", res.From, res.To, legacyPath, dest)
+	}
+
+	// Verify the dest now has the custom provider.
+	cfg := LoadForEdit(dest)
+	found := false
+	for _, p := range cfg.Providers {
+		if p.Name == "my-custom" {
+			found = true
+			if p.BaseURL != "https://my-api.example.com/v1" {
+				t.Errorf("custom provider base_url = %q", p.BaseURL)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("dest config missing backfilled custom provider 'my-custom'")
+	}
+	t.Logf("dest has %d providers after backfill", len(cfg.Providers))
+}
+
+func TestMigrateSkipsBackfillWhenDestHasCustomProviders(t *testing.T) {
+	_, dest, home := legacyHome(t)
+
+	// Write dest with a custom provider already present.
+	writeLegacy(t, dest, `
+config_version = 3
+default_model = "my-custom"
+
+[[providers]]
+name = "deepseek-flash"
+kind = "openai"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[[providers]]
+name = "my-custom"
+kind = "openai"
+base_url = "https://my-api.example.com/v1"
+model = "my-model"
+api_key_env = "MY_API_KEY"
+`)
+
+	// Write a legacy TOML with a different custom provider.
+	legacyPath := filepath.Join(home, ".config", "reasonix", "config.toml")
+	writeLegacy(t, legacyPath, `
+config_version = 2
+
+[[providers]]
+name = "deepseek-flash"
+kind = "openai"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[[providers]]
+name = "legacy-extra"
+kind = "openai"
+base_url = "https://legacy-api.example.com/v1"
+model = "legacy-model"
+api_key_env = "LEGACY_KEY"
+`)
+
+	res, err := MigrateLegacyIfNeeded()
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if res != nil {
+		t.Fatalf("expected no migration when dest has custom providers, got %+v", res)
+	}
+
+	// Verify the dest was NOT modified — still has only 'my-custom', not 'legacy-extra'.
+	cfg := LoadForEdit(dest)
+	for _, p := range cfg.Providers {
+		if p.Name == "legacy-extra" {
+			t.Error("dest should NOT contain legacy-extra when dest already has custom providers")
+		}
+	}
+}
