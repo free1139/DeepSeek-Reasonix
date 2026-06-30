@@ -184,6 +184,30 @@ func configureCLIThemeFromConfigNoProbe() {
 	withoutTerminalProbe(configureCLIThemeFromConfig)
 }
 
+// workspaceRoot returns the nearest ancestor that has a .reasonix convention
+// directory — the marker written by IsProjectInitialized / InitProject — or
+// the current working directory when none is found.
+func workspaceRoot() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	dir, err := filepath.Abs(wd)
+	if err != nil {
+		dir = filepath.Clean(wd)
+	}
+	for {
+		if fi, err := os.Stat(filepath.Join(dir, ".reasonix")); err == nil && fi.IsDir() {
+			return dir
+		}
+		next := filepath.Dir(dir)
+		if next == dir {
+			return wd
+		}
+		dir = next
+	}
+}
+
 // setup builds a ready-to-drive Controller from config via boot.Build. It is a
 // thin adapter kept so the subcommands below read the same as before; the actual
 // assembly (model resolution, tool registry, permission gate, two-model
@@ -546,15 +570,28 @@ func chatREPL(args []string) int {
 		configureCLIThemeWithStyle(cfg.UITheme(), cfg.UIThemeStyle())
 	}
 
+	// Resolve the workspace (git) root so project-level configuration and the
+	// .reasonix/ convention directory are found even when the shell's cwd is a
+	// subdirectory of the repo.
+	root := workspaceRoot()
+
+	// If config wasn't loaded above (no reasonix.toml in cwd), retry from the
+	// workspace root so a reasonix.toml at the repo root is picked up.
+	if cfg == nil || err != nil {
+		if cfg2, err2 := config.LoadForRoot(root); err2 == nil {
+			cfg = cfg2
+			err = nil
+		}
+	}
+
 	// Resolve the session directory. If the project directory isn't initialized
 	// for local session storage, prompt the user to do so (n exits).
-	cwd, _ := os.Getwd()
-	if !config.IsProjectInitialized(cwd) {
+	if !config.IsProjectInitialized(root) {
 		if !isInteractive() {
 			fmt.Fprintln(os.Stderr, "not a terminal — run from an interactive shell or use --dir")
 			return 1
 		}
-		fmt.Printf("\nThis directory (%s) has not been initialized.\n", cwd)
+		fmt.Printf("\nThis directory (%s) has not been initialized.\n", root)
 		fmt.Printf("Initialize it now? Sessions and checkpoints will be stored in .reasonix/\n")
 		fmt.Printf("[Y/n] ")
 		var answer string
@@ -563,7 +600,7 @@ func chatREPL(args []string) int {
 		if answer != "" && answer != "y" && answer != "yes" {
 			return 0
 		}
-		if _, err := config.InitProject(cwd); err != nil {
+		if _, err := config.InitProject(root); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			return 1
 		}
@@ -580,7 +617,7 @@ func chatREPL(args []string) int {
 		}
 		resumePath = path
 	case *cont:
-		sessions, err := agent.ListSessions(config.ResolveSessionDir(cwd))
+		sessions, err := agent.ListSessions(config.ResolveSessionDir(root))
 		if err != nil || len(sessions) == 0 {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 			return 1
