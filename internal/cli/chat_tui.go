@@ -2561,7 +2561,7 @@ func (m chatTUI) View() tea.View {
 	}
 	v := tea.NewView(mainArea + "\n" + strings.Join(parts, "\n"))
 	v.AltScreen = true
-	v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript; text selection is handled in-app
+	// v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript; text selection is handled in-app
 	// Anchor the real terminal cursor at the textarea's insertion point only when
 	// the composer is visible. Input box position stays fixed from screen top:
 	// row 0 (header if present) + row 1 (separator if present) + viewport height
