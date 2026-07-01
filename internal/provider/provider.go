@@ -42,6 +42,8 @@ type Message struct {
 	ToolCallID         string           `json:"tool_call_id,omitempty"`    // links a tool result to its call
 	Name               string           `json:"name,omitempty"`            // tool message: tool name
 	MemoryCitations    []MemoryCitation `json:"memoryCitations,omitempty"` // local UI metadata; provider requests ignore it
+	Edited             bool             `json:"edited,omitempty"`          // local UI metadata; provider requests ignore it
+	Original           string           `json:"original,omitempty"`        // user prompt before inline edit
 }
 
 // MemoryCitation is local display metadata for memories that influenced an
@@ -225,6 +227,9 @@ func toolTurnWellFormed(calls []ToolCall, results []Message) bool {
 		if results[k].ToolCallID != tc.ID {
 			return false
 		}
+		if results[k].Name != tc.Name {
+			return false
+		}
 	}
 	return true
 }
@@ -334,6 +339,7 @@ func pairToolResults(calls []ToolCall, avail []Message) []Message {
 		}
 		for _, tc := range calls {
 			if r, ok := byID[tc.ID]; ok {
+				r.Name = tc.Name
 				out = append(out, r)
 			} else {
 				out = append(out, Message{Role: RoleTool, ToolCallID: tc.ID, Name: tc.Name, Content: interruptedToolResult})
@@ -345,6 +351,7 @@ func pairToolResults(calls []ToolCall, avail []Message) []Message {
 		if k < len(avail) {
 			r := avail[k]
 			r.ToolCallID = tc.ID
+			r.Name = tc.Name
 			out = append(out, r)
 		} else {
 			out = append(out, Message{Role: RoleTool, ToolCallID: tc.ID, Name: tc.Name, Content: interruptedToolResult})

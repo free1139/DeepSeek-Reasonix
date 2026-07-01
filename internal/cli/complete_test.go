@@ -36,9 +36,12 @@ func TestSlashCompletionFilterAndAccept(t *testing.T) {
 	if !m.completion.active || m.completion.kind != compSlash {
 		t.Fatalf("typing /co should open the slash menu: %+v", m.completion)
 	}
-	// /compact matches "/co" prefix.
-	if len(m.completion.items) != 1 || !hasLabel(m.completion.items, "/compact") {
-		t.Fatalf("filter = %v, want /compact", labels(m.completion.items))
+	// /compact and /copy both start with "/co".
+	if len(m.completion.items) != 2 {
+		t.Fatalf("filter = %v, want /compact and /copy", labels(m.completion.items))
+	}
+	if m.completion.items[0].label != "/compact" || m.completion.items[1].label != "/copy" {
+		t.Fatalf("filter = %v, want [/compact /copy]", labels(m.completion.items))
 	}
 
 	// Accept the item.
@@ -489,7 +492,7 @@ func TestSlashArgCompletionMemoryV5(t *testing.T) {
 	if !m.completion.active || m.completion.kind != compSlashArg {
 		t.Fatalf("/memory-v5 should open arg completion: %+v", m.completion)
 	}
-	for _, want := range []string{"status", "off", "on"} {
+	for _, want := range []string{"status", "off", "observe", "compact", "on"} {
 		if !hasLabel(m.completion.items, want) {
 			t.Fatalf("/memory-v5 completion missing %q: %v", want, labels(m.completion.items))
 		}

@@ -63,6 +63,8 @@ func New(cfg provider.Config) (provider.Provider, error) {
 	}
 	protocol, _ := cfg.Extra["reasoning_protocol"].(string)
 	protocol = normalizeReasoningProtocol(protocol)
+	chatURL, _ := cfg.Extra["chat_url"].(string)
+	chatURL = normalizeChatURL(cfg.BaseURL, chatURL)
 	vision, _ := cfg.Extra["vision"].(bool)
 	visionDetail, _ := cfg.Extra["vision_detail"].(string)
 	visionDetail = strings.ToLower(strings.TrimSpace(visionDetail))
@@ -117,6 +119,7 @@ func New(cfg provider.Config) (provider.Provider, error) {
 		keyEnv:       keyEnv,
 		keySource:    keySource,
 		baseURL:      strings.TrimRight(cfg.BaseURL, "/"),
+		chatURL:      chatURL,
 		model:        cfg.Model,
 		deepseek:     deepseek,
 		minimax:      minimax,
@@ -144,6 +147,7 @@ type client struct {
 	keyEnv       string // api_key_env name, surfaced in auth errors
 	keySource    string // source of keyEnv, surfaced in auth errors
 	baseURL      string
+	chatURL      string
 	model        string
 	http         *http.Client
 	deepseek     bool
@@ -179,6 +183,13 @@ func normalizeReasoningProtocol(raw string) string {
 	}
 }
 
+func normalizeChatURL(baseURL, chatURL string) string {
+	if trimmed := strings.TrimRight(strings.TrimSpace(chatURL), "/"); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/chat/completions"
+}
+
 // bufPool reuses byte buffers for JSON-marshalled request bodies. Each turn
 // allocates a buffer, marshals the request, and sends it — pooling avoids the
 // GC churn from repeated alloc/free of ~10-100KB buffers. The pool is
@@ -202,7 +213,7 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 
 	for attempt := 0; attempt < 2; attempt++ {
 		newReq := func(ctx context.Context) (*http.Request, error) {
-			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatURL, bytes.NewReader(body))
 			if err != nil {
 				return nil, err
 			}

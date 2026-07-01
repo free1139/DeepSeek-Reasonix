@@ -36,6 +36,8 @@ const maxFinalReadinessBlocks = 3
 const maxEmptyFinalBlocks = 3
 const maxStreamRecoveries = 3
 const maxExecutorHandoffNudges = 1
+const memoryCompilerInjectionMax = 5
+const memoryCompilerInjectionCooldown = 30 * time.Second
 
 // Renderer redraws the assistant's final-answer text as styled output. It is
 // applied only after a turn's text stream completes, so the user sees raw
@@ -132,6 +134,28 @@ type Gate interface {
 	Check(ctx context.Context, toolName string, args json.RawMessage, readOnly bool) (allow bool, reason string, err error)
 }
 
+// PlanModeReadOnlyTrustRequest describes an external read-only hint that plan
+// mode will not trust without a user decision. ToolName is the provider-visible
+// name; ServerName and RawToolName are the MCP identifiers persisted in config.
+type PlanModeReadOnlyTrustRequest struct {
+	ToolName    string
+	ServerName  string
+	RawToolName string
+	Args        json.RawMessage
+}
+
+// PlanModeReadOnlyTrustGate optionally confirms an MCP server's self-reported
+// read-only hint at execution time. It is separate from Gate because the
+// plan-mode check runs before ordinary permission policy.
+type PlanModeReadOnlyTrustGate interface {
+	CheckPlanModeReadOnlyTrust(ctx context.Context, req PlanModeReadOnlyTrustRequest) (allow bool, reason string, err error)
+}
+
+const (
+	MemoryCompilerVerbosityObserve = "observe"
+	MemoryCompilerVerbosityCompact = "compact"
+)
+
 // ToolHooks fires user-configured shell hooks around each tool call. PreToolUse
 // runs before the call and may block it (block=true; message is the reason fed
 // back to the model); PostToolUse runs after and only surfaces output to the
@@ -208,6 +232,10 @@ type Agent struct {
 	// plan-mode check. nil disables gating entirely.
 	gate Gate
 
+	// planModeReadOnlyTrust, when non-nil, can ask the user to trust an MCP
+	// server's readOnlyHint for plan-mode execution without changing tool schemas.
+	planModeReadOnlyTrust PlanModeReadOnlyTrustGate
+
 	// hooks, when non-nil, fires PreToolUse / PostToolUse shell hooks around each
 	// tool call. nil disables hook firing.
 	hooks ToolHooks
@@ -276,7 +304,21 @@ type Agent struct {
 	// system prompt or tool schema.
 	memoryCompilerMu sync.RWMutex
 	memoryCompiler   *memorycompiler.Runtime
-	compilerTurn     *memorycompiler.Turn
+	// observe is the default: Memory v5 writes traces without adding a
+	// provider-visible execution contract. compact preserves the old injection.
+	memoryCompilerVerbosity string
+	compilerTurn            *memorycompiler.Turn
+
+	// compilerInjectionMu bounds how often Memory v5 may replace a visible user
+	// turn with an execution contract. The runtime can still observe throttled
+	// turns for trace writeback, but prompt injection and UI citations stay
+	// limited so the compiler does not dominate every conversation turn.
+	compilerInjectionMu    sync.Mutex
+	lastCompilerInjectedAt time.Time
+	compilerInjectionCount int
+
+	// classifier 用于判断用户输入是任务还是聊天，决定是否启动 Memory v5
+	classifier TaskClassifier
 
 	// planModeAllowedTools declares extra custom tools that the centralized
 	// plan-mode policy may treat as read-only. Known blocked tools still lose.
@@ -292,6 +334,7 @@ type Agent struct {
 	// notice so it fires once per approach, not every turn.
 	contextWindow       int
 	softCompactRatio    float64
+	toolResultSnipRatio float64
 	compactRatio        float64
 	compactForceRatio   float64
 	softCompactNoticed  bool
@@ -374,6 +417,17 @@ func (a *Agent) SetMemoryCompiler(rt *memorycompiler.Runtime) {
 	a.memoryCompilerMu.Lock()
 	a.memoryCompiler = rt
 	a.memoryCompilerMu.Unlock()
+	a.resetMemoryCompilerInjectionGate()
+}
+
+func (a *Agent) SetMemoryCompilerVerbosity(verbosity string) {
+	if a == nil {
+		return
+	}
+	a.memoryCompilerMu.Lock()
+	a.memoryCompilerVerbosity = normalizeMemoryCompilerVerbosity(verbosity)
+	a.memoryCompilerMu.Unlock()
+	a.resetMemoryCompilerInjectionGate()
 }
 
 func (a *Agent) memoryCompilerRuntime() *memorycompiler.Runtime {
@@ -385,6 +439,98 @@ func (a *Agent) memoryCompilerRuntime() *memorycompiler.Runtime {
 	return a.memoryCompiler
 }
 
+func (a *Agent) memoryCompilerShouldInject() bool {
+	if a == nil {
+		return false
+	}
+	a.memoryCompilerMu.RLock()
+	defer a.memoryCompilerMu.RUnlock()
+	return normalizeMemoryCompilerVerbosity(a.memoryCompilerVerbosity) == MemoryCompilerVerbosityCompact
+}
+
+func normalizeMemoryCompilerVerbosity(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "compact", "inject", "injected", "contract", "on":
+		return MemoryCompilerVerbosityCompact
+	default:
+		return MemoryCompilerVerbosityObserve
+	}
+}
+
+// clearClassifierCache 清除 LLM 分类器的缓存（在会话边界调用）
+func (a *Agent) clearClassifierCache() {
+	if a == nil || a.classifier == nil {
+		return
+	}
+	if llm, ok := a.classifier.(*llmClassifier); ok && llm.cache != nil {
+		llm.cache.Clear()
+	}
+}
+
+func shouldStartMemoryCompiler(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return false
+	}
+	// Contract-like leading XML is host-generated control text, not a genuine
+	// user task. Let it pass through normally instead of compiling it again and
+	// risking nested Memory v5 blocks in previews or future source_event fields.
+	return !strings.HasPrefix(trimmed, "<")
+}
+
+func shouldInjectMemoryCompilerContractForInput(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return false
+	}
+	normalized := strings.ToLower(strings.Trim(trimmed, " \t\r\n.!?。！？,，;；:："))
+	switch normalized {
+	case "", "hello", "hi", "hey", "你好", "您好", "nihao", "thanks", "thank you", "谢谢", "ok", "okay", "好的", "嗯":
+		return false
+	}
+	actionNeedles := []string{
+		"fix", "debug", "repair", "resolve", "reproduce",
+		"create", "add", "write", "edit", "update", "change", "delete", "remove", "rename",
+		"review", "inspect", "analyze", "check", "test", "run", "build", "implement", "refactor",
+		"continue work", "continue the", "continue this",
+		"修复", "调试", "解决", "复现", "创建", "新建", "添加", "编写", "编辑", "修改", "更新",
+		"删除", "移除", "重命名", "评审", "检查", "分析", "测试", "运行", "构建", "实现", "重构", "继续处理",
+	}
+	for _, needle := range actionNeedles {
+		if strings.Contains(normalized, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) tryMarkMemoryCompilerInjected(now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	a.compilerInjectionMu.Lock()
+	defer a.compilerInjectionMu.Unlock()
+	if a.compilerInjectionCount >= memoryCompilerInjectionMax {
+		return false
+	}
+	if !a.lastCompilerInjectedAt.IsZero() && now.Sub(a.lastCompilerInjectedAt) < memoryCompilerInjectionCooldown {
+		return false
+	}
+	a.compilerInjectionCount++
+	a.lastCompilerInjectedAt = now
+	return true
+}
+
+func (a *Agent) resetMemoryCompilerInjectionGate() {
+	if a == nil {
+		return
+	}
+	a.compilerInjectionMu.Lock()
+	defer a.compilerInjectionMu.Unlock()
+	a.compilerInjectionCount = 0
+	a.lastCompilerInjectedAt = time.Time{}
+}
+
 // SetGate installs the per-call permission gate. Used by interactive CLI sessions to swap the
 // headless gate built in setup for an interactive one that prompts the user;
 // nil disables gating. Safe to call before the run loop starts.
@@ -393,6 +539,15 @@ func (a *Agent) SetGate(g Gate) {
 		g = nil
 	}
 	a.gate = g
+}
+
+// SetPlanModeReadOnlyTrustGate installs the optional confirmation path for MCP
+// tools whose read-only flag comes from an external readOnlyHint.
+func (a *Agent) SetPlanModeReadOnlyTrustGate(g PlanModeReadOnlyTrustGate) {
+	if nilutil.IsNil(g) {
+		g = nil
+	}
+	a.planModeReadOnlyTrust = g
 }
 
 func (a *Agent) withTurnPreferences(input string) string {
@@ -456,6 +611,9 @@ func (a *Agent) SetSession(s *Session) {
 	if s != nil {
 		a.rebuildTodoState(s.Snapshot())
 	}
+	a.resetMemoryCompilerInjectionGate()
+	// 清除分类缓存（会话边界）
+	a.clearClassifierCache()
 }
 
 // LastUsage returns the most recent per-turn token telemetry the provider
@@ -565,15 +723,20 @@ type Options struct {
 	// Gate is the per-call permission gate. nil disables gating.
 	Gate Gate
 
+	// PlanModeReadOnlyTrustGate confirms untrusted external read-only hints when
+	// plan mode would otherwise block them. nil keeps fail-closed behavior.
+	PlanModeReadOnlyTrustGate PlanModeReadOnlyTrustGate
+
 	// Context management. ContextWindow <= 0 disables compaction. Ratios and
 	// RecentKeep fall back to defaults when unset.
-	ContextWindow     int
-	SoftCompactRatio  float64
-	CompactRatio      float64
-	CompactForceRatio float64
-	RecentKeep        int
-	ArchiveDir        string
-	KeepPolicy        KeepPolicy
+	ContextWindow       int
+	SoftCompactRatio    float64
+	ToolResultSnipRatio float64
+	CompactRatio        float64
+	CompactForceRatio   float64
+	RecentKeep          int
+	ArchiveDir          string
+	KeepPolicy          KeepPolicy
 
 	// Hooks fires PreToolUse / PostToolUse shell hooks around tool calls. nil
 	// disables hook firing.
@@ -600,6 +763,13 @@ type Options struct {
 	// MemoryCompiler enables Memory v5 execution trace writeback and cache-safe
 	// execution-contract compilation.
 	MemoryCompiler *memorycompiler.Runtime
+	// MemoryCompilerVerbosity controls provider-visible injection. Empty defaults
+	// to observe; compact restores the execution-contract user-turn injection.
+	MemoryCompilerVerbosity string
+
+	// UseMemoryCompilerLLMClassification 启用 LLM 分类来判断任务 vs 聊天
+	// 默认 false 时使用启发式分类器
+	UseMemoryCompilerLLMClassification bool
 }
 
 // New constructs an Agent. MaxSteps <= 0 means no cap — the run loop continues
@@ -610,8 +780,14 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 	if opts.SoftCompactRatio <= 0 {
 		opts.SoftCompactRatio = defaultSoftCompactRatio
 	}
+	if opts.ToolResultSnipRatio <= 0 {
+		opts.ToolResultSnipRatio = defaultToolResultSnipRatio
+	}
 	if opts.CompactRatio <= 0 {
 		opts.CompactRatio = defaultCompactRatio
+	}
+	if opts.ToolResultSnipRatio >= opts.CompactRatio {
+		opts.ToolResultSnipRatio = opts.CompactRatio
 	}
 	if opts.CompactForceRatio <= 0 {
 		opts.CompactForceRatio = defaultCompactForceRatio
@@ -626,6 +802,10 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 	if nilutil.IsNil(gate) {
 		gate = nil
 	}
+	planModeReadOnlyTrust := opts.PlanModeReadOnlyTrustGate
+	if nilutil.IsNil(planModeReadOnlyTrust) {
+		planModeReadOnlyTrust = nil
+	}
 	hooks := opts.Hooks
 	if nilutil.IsNil(hooks) {
 		hooks = nil
@@ -635,29 +815,41 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		maxStepsKey = "agent.max_steps"
 	}
 	a := &Agent{
-		prov:                 prov,
-		tools:                tools,
-		session:              session,
-		maxSteps:             opts.MaxSteps,
-		maxStepsKey:          maxStepsKey,
-		temperature:          opts.Temperature,
-		pricing:              opts.Pricing,
-		usageSource:          usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
-		sink:                 sink,
-		gate:                 gate,
-		hooks:                hooks,
-		jobs:                 opts.Jobs,
-		evidence:             evidence.NewLedger(),
-		projectChecks:        append([]instruction.VerifyCheck(nil), opts.ProjectChecks...),
-		contextWindow:        opts.ContextWindow,
-		softCompactRatio:     opts.SoftCompactRatio,
-		compactRatio:         opts.CompactRatio,
-		compactForceRatio:    opts.CompactForceRatio,
-		recentKeep:           opts.RecentKeep,
-		archiveDir:           opts.ArchiveDir,
-		keepPolicy:           opts.KeepPolicy,
-		planModeAllowedTools: append([]string(nil), opts.PlanModeAllowedTools...),
-		memoryCompiler:       opts.MemoryCompiler,
+		prov:                    prov,
+		tools:                   tools,
+		session:                 session,
+		maxSteps:                opts.MaxSteps,
+		maxStepsKey:             maxStepsKey,
+		temperature:             opts.Temperature,
+		pricing:                 opts.Pricing,
+		usageSource:             usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
+		sink:                    sink,
+		gate:                    gate,
+		planModeReadOnlyTrust:   planModeReadOnlyTrust,
+		hooks:                   hooks,
+		jobs:                    opts.Jobs,
+		evidence:                evidence.NewLedger(),
+		projectChecks:           append([]instruction.VerifyCheck(nil), opts.ProjectChecks...),
+		contextWindow:           opts.ContextWindow,
+		softCompactRatio:        opts.SoftCompactRatio,
+		toolResultSnipRatio:     opts.ToolResultSnipRatio,
+		compactRatio:            opts.CompactRatio,
+		compactForceRatio:       opts.CompactForceRatio,
+		recentKeep:              opts.RecentKeep,
+		archiveDir:              opts.ArchiveDir,
+		keepPolicy:              opts.KeepPolicy,
+		planModeAllowedTools:    append([]string(nil), opts.PlanModeAllowedTools...),
+		memoryCompiler:          opts.MemoryCompiler,
+		memoryCompilerVerbosity: normalizeMemoryCompilerVerbosity(opts.MemoryCompilerVerbosity),
+	}
+	// 初始化分类器
+	if opts.UseMemoryCompilerLLMClassification && prov != nil {
+		// 使用 LLM 分类器（Haiku）
+		fallback := newHeuristicClassifier()
+		a.classifier = newLLMClassifier(prov, fallback)
+	} else {
+		// 默认使用启发式分类器
+		a.classifier = newHeuristicClassifier()
 	}
 	a.SetResponseLanguage(opts.ResponseLanguage)
 	a.SetReasoningLanguage(opts.ReasoningLanguage)
@@ -694,18 +886,38 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		memoryCompilerInput = sourceInput
 	}
 	input = a.withTurnPreferences(rawInput)
-	if memCompiler := a.memoryCompilerRuntime(); memCompiler != nil {
-		if compiledInput, turn := memCompiler.StartTurn(ctx, memoryCompilerInput, a.session.Snapshot()); turn != nil {
-			a.compilerTurn = turn
-			a.emitMemoryCompilerStats(turn)
-			defer func() {
-				turn.Finish(runErr)
-				if a.compilerTurn == turn {
-					a.compilerTurn = nil
+	if memCompiler := a.memoryCompilerRuntime(); memCompiler != nil && !MemoryCompilerSkipFromContext(ctx) && shouldStartMemoryCompiler(memoryCompilerInput) {
+		// 使用分类器判断是否为任务
+		isTask := true // 默认为任务
+		var classifyErr error
+		if a.classifier != nil {
+			isTask, classifyErr = a.classifier.IsTask(ctx, memoryCompilerInput)
+			if classifyErr != nil {
+				// 分类失败时降级到启发式分类器
+				isTask = shouldInjectMemoryCompilerContractForInput(memoryCompilerInput)
+			}
+		}
+
+		// 只有任务才启动 Memory v5
+		if isTask {
+			if compiledInput, turn := memCompiler.StartTurn(ctx, memoryCompilerInput, a.session.Snapshot()); turn != nil {
+				injected := strings.TrimSpace(compiledInput) != "" &&
+					a.memoryCompilerShouldInject() &&
+					a.tryMarkMemoryCompilerInjected(time.Now())
+				if !injected {
+					turn.SuppressInjection()
 				}
-			}()
-			if strings.TrimSpace(compiledInput) != "" {
-				input = a.withTurnPreferences(compiledInput)
+				a.compilerTurn = turn
+				a.emitMemoryCompilerStats(turn)
+				defer func() {
+					turn.Finish(runErr)
+					if a.compilerTurn == turn {
+						a.compilerTurn = nil
+					}
+				}()
+				if injected {
+					input = a.withTurnPreferences(compiledInput)
+				}
 			}
 		}
 	}
@@ -1097,6 +1309,13 @@ func (a *Agent) emitTodoState(todos []evidence.TodoItem, itemIndex int) {
 	a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: t})
 	t.Output = "task list advanced by complete_step"
 	a.sink.Emit(event.Event{Kind: event.ToolResult, Tool: t})
+}
+
+// RebuildTodoState re-derives canonical task state from the current session
+// transcript. Call after externally truncating the session (e.g. after a
+// user-cancel strip) so Agent.todoState stays consistent with the messages.
+func (a *Agent) RebuildTodoState() {
+	a.rebuildTodoState(a.Session().Snapshot())
 }
 
 // rebuildTodoState reconstructs the canonical task list from a transcript: the
@@ -1595,6 +1814,7 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 				Output:     o.output,
 				Error:      o.errMsg,
 				ReadOnly:   ok && t.ReadOnly(),
+				Blocked:    o.blocked,
 				DurationMs: durations[i],
 				Truncated:  o.truncated,
 			})
@@ -1826,10 +2046,21 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			untrusted = u.PlanModeUntrustedReadOnly()
 		}
 		if blocked, msg := a.planModeBlocked(call.Name, t.ReadOnly(), untrusted, safety, json.RawMessage(call.Arguments)); blocked {
-			return toolOutcome{
-				output:  msg,
-				blocked: true,
-				errMsg:  "blocked: plan mode is read-only",
+			trustAllowed := false
+			if t.ReadOnly() && untrusted && safety != planmode.PlanSafetyUnsafe {
+				if allow, outcome, handled := a.checkPlanModeReadOnlyTrust(ctx, call, t); handled {
+					if !allow {
+						return outcome
+					}
+					trustAllowed = true
+				}
+			}
+			if !trustAllowed {
+				return toolOutcome{
+					output:  msg,
+					blocked: true,
+					errMsg:  "blocked: plan mode is read-only",
+				}
 			}
 		}
 	}
@@ -1961,6 +2192,53 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	}
 	body, truncMsg := truncateToolOutput(result)
 	return toolOutcome{output: body, truncated: truncMsg != "", truncMsg: truncMsg}
+}
+
+func (a *Agent) checkPlanModeReadOnlyTrust(ctx context.Context, call provider.ToolCall, t tool.Tool) (bool, toolOutcome, bool) {
+	if a.planModeReadOnlyTrust == nil {
+		return false, toolOutcome{}, false
+	}
+	server, rawTool, ok := planModeMCPTrustTarget(call.Name, t)
+	if !ok {
+		return false, toolOutcome{}, false
+	}
+	req := PlanModeReadOnlyTrustRequest{
+		ToolName:    call.Name,
+		ServerName:  server,
+		RawToolName: rawTool,
+		Args:        json.RawMessage(call.Arguments),
+	}
+	allow, reason, err := a.planModeReadOnlyTrust.CheckPlanModeReadOnlyTrust(ctx, req)
+	if err != nil {
+		return false, toolOutcome{
+			output:  fmt.Sprintf("blocked: plan-mode read-only trust approval aborted (%v)", err),
+			blocked: true,
+			errMsg:  fmt.Sprintf("blocked: %v", err),
+		}, true
+	}
+	if !allow {
+		if strings.TrimSpace(reason) == "" {
+			reason = "the user declined to trust this MCP read-only hint — do not retry it; continue planning with other trusted read-only tools."
+		}
+		return false, toolOutcome{
+			output:  "blocked: " + reason,
+			blocked: true,
+			errMsg:  "blocked by plan-mode MCP read-only trust",
+		}, true
+	}
+	return true, toolOutcome{}, true
+}
+
+func planModeMCPTrustTarget(toolName string, t tool.Tool) (server, rawTool string, ok bool) {
+	if meta, metaOK := t.(tool.MCPMetadata); metaOK {
+		server = strings.TrimSpace(meta.MCPServerName())
+		rawTool = strings.TrimSpace(meta.MCPRawToolName())
+		if server != "" && rawTool != "" {
+			return server, rawTool, true
+		}
+	}
+	server, rawTool, ok = tool.SplitMCPName(toolName)
+	return server, rawTool, ok
 }
 
 func (a *Agent) planModeBlocked(toolName string, readOnly, untrusted bool, safety planmode.PlanSafety, args json.RawMessage) (blocked bool, message string) {

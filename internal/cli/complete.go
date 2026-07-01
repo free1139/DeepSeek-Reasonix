@@ -61,9 +61,13 @@ const (
 // built-in verbs, custom commands, skills (each as "/<name>"), and MCP prompts.
 func (m *chatTUI) slashItems() []compItem {
 	items := []compItem{
+		// add by free1139
+		{label: "/audit", insert: "/audit ", hint: "switch mode (Auto/Plan/YOLO)", descend: true},
+
 		{label: "/compact", insert: "/compact ", hint: i18n.M.CmdCompact},
 		{label: "/new", insert: "/new ", hint: i18n.M.CmdNew},
 		{label: "/clear", insert: "/clear", hint: i18n.M.CmdClear},
+		{label: "/cls", insert: "/cls", hint: i18n.M.CmdCls},
 		{label: "/resume", insert: "/resume ", hint: i18n.M.CmdResume},
 		{label: "/rename", insert: "/rename ", hint: i18n.M.CmdRename},
 		{label: "/rewind", insert: "/rewind", hint: i18n.M.CmdRewind},
@@ -94,9 +98,8 @@ func (m *chatTUI) slashItems() []compItem {
 		{label: "/remember", insert: "/remember ", hint: i18n.M.CmdRemember},
 		{label: "/forget", insert: "/forget ", hint: i18n.M.CmdForget},
 		{label: "/quit", insert: "/quit", hint: i18n.M.CmdQuit},
-
-		// add by free1139
-		{label: "/audit", insert: "/audit ", hint: "switch mode (Auto/Plan/YOLO)", descend: true},
+		{label: "/copy", insert: "/copy", hint: i18n.M.CmdCopy},
+		{label: "/export", insert: "/export", hint: i18n.M.CmdExport},
 	}
 	for _, c := range m.commands {
 		items = append(items, compItem{label: "/" + c.Name, insert: "/" + c.Name + " ", hint: c.Description})

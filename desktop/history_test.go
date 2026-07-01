@@ -66,6 +66,166 @@ func TestHistoryMessagesIncludeAssistantReasoning(t *testing.T) {
 	}
 }
 
+func TestHistoryMessagesDoNotReplayMemoryCompilerContract(t *testing.T) {
+	raw := historyMemoryCompilerContract(t, "ship the refactor")
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: raw},
+		{Role: provider.RoleAssistant, Content: "done"},
+	}
+
+	got := historyMessages(msgs, control.StripComposePrefixes)
+	if len(got) != 2 {
+		t.Fatalf("history length = %d, want 2: %+v", len(got), got)
+	}
+	if got[0].Content != "ship the refactor" {
+		t.Fatalf("visible user content = %q, want source_event", got[0].Content)
+	}
+	if got[0].SubmitText != "" {
+		t.Fatalf("raw Memory v5 contract should not be replay submitText, got %q", got[0].SubmitText)
+	}
+	assertNoHistoryMemoryContract(t, got[0].Content)
+}
+
+func TestHistoryMessagesCarryCheckpointTurnsAcrossHiddenSyntheticUsers(t *testing.T) {
+	msgs := []provider.Message{
+		{Role: provider.RoleSystem, Content: "sys"},
+		{Role: provider.RoleUser, Content: "first visible"},
+		{Role: provider.RoleAssistant, Content: "first answer"},
+		{Role: provider.RoleUser, Content: "Continue pursuing the active goal. If it is complete, provide the concise final result."},
+		{Role: provider.RoleAssistant, Content: "hidden continuation"},
+		{Role: provider.RoleUser, Content: "second visible"},
+		{Role: provider.RoleAssistant, Content: "second answer"},
+	}
+
+	got := historyMessagesWithPlannerDisplays(
+		msgs,
+		func(content string) string { return content },
+		nil,
+		map[int]int{1: 0, 5: 2},
+	)
+	var users []HistoryMessage
+	for _, msg := range got {
+		if msg.Role == "user" {
+			users = append(users, msg)
+		}
+	}
+	if len(users) != 2 {
+		t.Fatalf("visible users = %d, want 2: %+v", len(users), got)
+	}
+	if users[0].CheckpointTurn == nil || *users[0].CheckpointTurn != 0 {
+		t.Fatalf("first checkpoint turn = %v, want 0", users[0].CheckpointTurn)
+	}
+	if users[1].CheckpointTurn == nil || *users[1].CheckpointTurn != 2 {
+		t.Fatalf("second checkpoint turn = %v, want 2", users[1].CheckpointTurn)
+	}
+}
+
+func TestHistoryPageFromMessagesWindowsByUserTurn(t *testing.T) {
+	messages := []HistoryMessage{
+		{Role: "notice", Content: "session restored"},
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "one"},
+		{Role: "tool", ToolName: "bash", Content: "tool one"},
+		{Role: "user", Content: "second"},
+		{Role: "assistant", Content: "two"},
+		{Role: "user", Content: "third"},
+		{Role: "assistant", Content: "three"},
+	}
+
+	latest := historyPageFromMessages(messages, 0, 2)
+	if latest.StartTurn != 1 || latest.EndTurn != 3 || latest.TotalTurns != 3 || !latest.HasOlder {
+		t.Fatalf("latest page metadata = %+v, want turns 1-3/3 hasOlder", latest)
+	}
+	if len(latest.Messages) != 4 || latest.Messages[0].Content != "second" || latest.Messages[3].Content != "three" {
+		t.Fatalf("latest page messages = %+v, want second and third turns", latest.Messages)
+	}
+
+	older := historyPageFromMessages(messages, latest.StartTurn, 2)
+	if older.StartTurn != 0 || older.EndTurn != 1 || older.TotalTurns != 3 || older.HasOlder {
+		t.Fatalf("older page metadata = %+v, want turns 0-1/3 no older", older)
+	}
+	if len(older.Messages) != 4 || older.Messages[0].Content != "session restored" || older.Messages[1].Content != "first" {
+		t.Fatalf("older page messages = %+v, want prelude and first turn", older.Messages)
+	}
+}
+
+func TestHistoryPageFromProviderMessagesWindowsVisibleUsers(t *testing.T) {
+	msgs := []provider.Message{
+		{Role: provider.RoleSystem, Content: "sys"},
+		{Role: provider.RoleUser, Content: "first"},
+		{Role: provider.RoleAssistant, Content: "one"},
+		{Role: provider.RoleUser, Content: "Continue pursuing the active goal. If it is complete, provide the concise final result."},
+		{Role: provider.RoleAssistant, Content: "hidden continuation"},
+		{Role: provider.RoleUser, Content: "second"},
+		{Role: provider.RoleAssistant, Content: "two"},
+		{Role: provider.RoleUser, Content: agent.MidTurnSteerPrefix + "\nupdate the plan"},
+		{Role: provider.RoleUser, Content: "third"},
+		{Role: provider.RoleAssistant, Content: "three"},
+	}
+
+	latest := historyPageFromProviderMessages(
+		msgs,
+		func(content string) string { return content },
+		nil,
+		map[int]int{1: 0, 5: 2, 8: 3},
+		0,
+		2,
+	)
+	if latest.StartTurn != 1 || latest.EndTurn != 3 || latest.TotalTurns != 3 || !latest.HasOlder {
+		t.Fatalf("latest page metadata = %+v, want turns 1-3/3 hasOlder", latest)
+	}
+	if len(latest.Messages) != 5 {
+		t.Fatalf("latest page length = %d, want 5: %+v", len(latest.Messages), latest.Messages)
+	}
+	if latest.Messages[0].Role != "user" || latest.Messages[0].Content != "second" {
+		t.Fatalf("first latest message = %+v, want second user", latest.Messages[0])
+	}
+	if latest.Messages[0].CheckpointTurn == nil || *latest.Messages[0].CheckpointTurn != 2 {
+		t.Fatalf("second user checkpoint = %v, want 2", latest.Messages[0].CheckpointTurn)
+	}
+	if latest.Messages[2].Role != "notice" || !strings.Contains(latest.Messages[2].Content, "update the plan") {
+		t.Fatalf("steer message = %+v, want notice in second turn window", latest.Messages[2])
+	}
+	if latest.Messages[3].Role != "user" || latest.Messages[3].Content != "third" {
+		t.Fatalf("third latest message = %+v, want third user", latest.Messages[3])
+	}
+	if latest.Messages[3].CheckpointTurn == nil || *latest.Messages[3].CheckpointTurn != 3 {
+		t.Fatalf("third user checkpoint = %v, want 3", latest.Messages[3].CheckpointTurn)
+	}
+
+	older := historyPageFromProviderMessages(
+		msgs,
+		func(content string) string { return content },
+		nil,
+		map[int]int{1: 0, 5: 2, 8: 3},
+		latest.StartTurn,
+		2,
+	)
+	if older.StartTurn != 0 || older.EndTurn != 1 || older.TotalTurns != 3 || older.HasOlder {
+		t.Fatalf("older page metadata = %+v, want turns 0-1/3 no older", older)
+	}
+	if len(older.Messages) != 4 || older.Messages[0].Role != "system" || older.Messages[1].Content != "first" || older.Messages[3].Content != "hidden continuation" {
+		t.Fatalf("older page messages = %+v, want prelude and first visible turn", older.Messages)
+	}
+}
+
+func TestHistoryCheckpointTurnsSkipsHiddenUsers(t *testing.T) {
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: "first visible"},
+		{Role: provider.RoleAssistant, Content: "ok"},
+		{Role: provider.RoleUser, Content: "Continue pursuing the active goal. If it is complete, provide the concise final result."},
+		{Role: provider.RoleUser, Content: "second visible"},
+	}
+	got := historyCheckpointTurns(
+		msgs,
+		func(content string) string { return content },
+		map[int]int{0: 0, 2: 1, 3: 2},
+	)
+	if len(got) != 2 || got[0] != 0 || got[1] != 2 {
+		t.Fatalf("checkpoint turns = %v, want [0 2]", got)
+	}
+}
+
 func TestHistoryForTabRestoresPlannerDisplayAfterReload(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
@@ -128,6 +288,59 @@ func TestHistoryForTabRestoresPlannerDisplayAfterReload(t *testing.T) {
 	}
 }
 
+func TestHistoryForTabUsesPinnedSessionBeforeControllerReady(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	root := globalTabWorkspaceRoot()
+	dir := desktopSessionDir(root)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+	path := filepath.Join(dir, "pending-controller.jsonl")
+	writeHistoryTestSession(t, path, "warm prompt")
+
+	app := NewApp()
+	tab := &WorkspaceTab{
+		ID:            "pending",
+		Scope:         "global",
+		WorkspaceRoot: root,
+		SessionPath:   path,
+		Ready:         false,
+		disabledMCP:   map[string]ServerView{},
+	}
+	app.tabs[tab.ID] = tab
+	app.tabOrder = []string{tab.ID}
+	app.activeTabID = tab.ID
+
+	got := app.HistoryForTab(tab.ID)
+	if len(got) != 1 || got[0].Role != "user" || got[0].Content != "warm prompt" {
+		t.Fatalf("pending controller history = %+v, want warm prompt", got)
+	}
+}
+
+func historyMemoryCompilerContract(t *testing.T, sourceEvent string) string {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"type": "memory_v5_execution_contract",
+		"planner_ir": map[string]any{
+			"source_event": sourceEvent,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "<memory-compiler-execution>\n" + string(body) + "\n</memory-compiler-execution>"
+}
+
+func assertNoHistoryMemoryContract(t *testing.T, text string) {
+	t.Helper()
+	if strings.Contains(text, "<memory-compiler-execution>") ||
+		strings.Contains(text, "</memory-compiler-execution>") ||
+		strings.Contains(text, "memory_v5_execution_contract") ||
+		strings.Contains(text, "planner_ir") {
+		t.Fatalf("history leaked Memory v5 contract content: %q", text)
+	}
+}
+
 func TestHistoryMessagesArchiveCompletedToolPayloads(t *testing.T) {
 	largeArgs := `{"command":"` + strings.Repeat("printf x;", 300) + `"}`
 	largeOutput := strings.Repeat("line of output\n", 600)
@@ -168,6 +381,28 @@ func TestHistoryMessagesArchiveCompletedToolPayloads(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), largeArgs) || strings.Contains(string(encoded), largeOutput) {
 		t.Fatalf("initial history JSON still contains large args/output: %d bytes", len(encoded))
+	}
+}
+
+func TestHistoryMessagesKeepRunSkillSubjectWhenArchived(t *testing.T) {
+	args := `{"name":"code-reviewer","arguments":"review this branch"}`
+	msgs := []provider.Message{
+		{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{
+			ID: "call_skill", Name: "run_skill", Arguments: args,
+		}}},
+		{Role: provider.RoleTool, Name: "run_skill", ToolCallID: "call_skill", Content: "Skill completed"},
+	}
+
+	got := historyMessages(msgs, func(content string) string { return content })
+	if len(got) != 2 {
+		t.Fatalf("history length = %d, want 2", len(got))
+	}
+	call := got[0].ToolCalls[0]
+	if !call.ArgumentsArchived || call.Arguments != "" {
+		t.Fatalf("run_skill arguments should be archived after completion: %+v", call)
+	}
+	if call.Subject != "code-reviewer" {
+		t.Fatalf("run_skill subject = %q, want code-reviewer", call.Subject)
 	}
 }
 

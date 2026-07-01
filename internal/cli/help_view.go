@@ -55,10 +55,14 @@ func writeHelpItems(b *strings.Builder, width int, title string, items []compIte
 
 func builtinHelpItems() []compItem {
 	return []compItem{
+		// add by free1139, it can be used in some phone shell
+		{label: "/audit", hint: "switch mode (Auto/Plan/YOLO)"},
+
 		{label: "/compact", hint: i18n.M.CmdCompact},
 		{label: "/new", hint: i18n.M.CmdNew},
 		{label: "/rename", hint: i18n.M.CmdRename},
 		{label: "/clear", hint: i18n.M.CmdClear},
+		{label: "/cls", hint: i18n.M.CmdCls},
 		{label: "/rewind", hint: i18n.M.CmdRewind},
 		{label: "/tree", hint: i18n.M.CmdTree},
 		{label: "/branch", hint: i18n.M.CmdBranch},
@@ -80,9 +84,8 @@ func builtinHelpItems() []compItem {
 		{label: "/reasoning-language", hint: i18n.M.CmdReasonLang},
 		{label: "/reload-cmd", hint: i18n.M.CmdReloadCmd},
 		{label: "/help", hint: i18n.M.CmdHelp},
-
-		// add by free1139, it can be used in some phone shell
-		{label: "/audit", hint: "switch mode (Auto/Plan/YOLO)"},
+		{label: "/copy", hint: i18n.M.CmdCopy},
+		{label: "/export", hint: i18n.M.CmdExport},
 	}
 }
 

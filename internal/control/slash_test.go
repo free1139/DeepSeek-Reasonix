@@ -1,6 +1,8 @@
 package control
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -158,8 +160,8 @@ func TestSlashArgItems(t *testing.T) {
 	}
 	// /memory-v5
 	items, _ = SlashArgItems("/memory-v5 ", data)
-	if !has(items, "status") || !has(items, "off") || !has(items, "on") {
-		t.Errorf("/memory-v5 should offer status/off/on; got %v", labelsOf(items))
+	if !has(items, "status") || !has(items, "off") || !has(items, "observe") || !has(items, "compact") || !has(items, "on") {
+		t.Errorf("/memory-v5 should offer status/off/observe/compact/on; got %v", labelsOf(items))
 	}
 	// /theme
 	items, _ = SlashArgItems("/theme ", data)
@@ -258,6 +260,9 @@ func TestManagementMemoryV5WritesUserConfig(t *testing.T) {
 	if cfg.MemoryCompilerEnabled() {
 		t.Fatal("memory_compiler.enabled = true, want false")
 	}
+	if got := cfg.MemoryCompilerVerbosity(); got != config.MemoryCompilerVerbosityObserve {
+		t.Fatalf("memory_compiler.verbosity = %q, want observe", got)
+	}
 	if !strings.Contains(strings.Join(notices, "\n"), "memory-v5 set to off") {
 		t.Fatalf("missing memory-v5 notice: %v", notices)
 	}
@@ -281,6 +286,36 @@ func TestManagementMigrateEmitsProgress(t *testing.T) {
 		"migration rescue: scanning legacy memory",
 		"migration rescue: scanning legacy sessions",
 		"migration rescue complete:",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing notice %q in:\n%s", want, joined)
+		}
+	}
+}
+
+func TestManagementMigrateFromImportsExplicitSessions(t *testing.T) {
+	home := isolateControlConfigHome(t)
+	legacySessions := filepath.Join(home, "Old Reasonix", "sessions")
+	if err := os.MkdirAll(legacySessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacySessions, "old-chat.jsonl"), []byte(`{"role":"user","content":"hello from old install"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var notices []string
+	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
+		if e.Kind == event.Notice {
+			notices = append(notices, e.Text)
+		}
+	})})
+
+	if !c.managementNotice(`/migrate --from "` + filepath.Dir(legacySessions) + `"`) {
+		t.Fatal("/migrate --from was not handled")
+	}
+	joined := strings.Join(notices, "\n")
+	for _, want := range []string{
+		"migration rescue: scanning explicit legacy sessions from " + filepath.Dir(legacySessions),
+		"imported 1 past session(s) from " + legacySessions,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing notice %q in:\n%s", want, joined)

@@ -4,7 +4,7 @@ import { JSDOM } from "jsdom";
 import React from "react";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { Composer } from "../components/Composer";
+import { Composer, composerPickFileEntry } from "../components/Composer";
 import { LocaleProvider } from "../lib/i18n";
 import { ToastProvider } from "../lib/toast";
 import type { AppBindings } from "../lib/bridge";
@@ -87,9 +87,15 @@ async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {
   const root = createRoot(rootEl);
   const calls: {
     send: string[];
+    submit: (string | undefined)[];
+    cancel: number;
+    clearGoal: number;
     setCollaborationMode: CollaborationMode[];
   } = {
     send: [],
+    submit: [],
+    cancel: 0,
+    clearGoal: 0,
     setCollaborationMode: [],
   };
   let currentProps: Parameters<typeof Composer>[0] = {
@@ -100,16 +106,22 @@ async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {
     goal: "",
     cwd: "/repo",
     modelLabel: "DeepSeek-R1",
-    onSend: (displayText) => {
+    onSend: (displayText, submitText) => {
       calls.send.push(displayText);
+      calls.submit.push(submitText);
     },
-    onCancel: () => undefined,
+    onCancel: () => {
+      calls.cancel += 1;
+      return undefined;
+    },
     onCycleMode: () => {},
     onSetMode: () => {},
     onSetCollaborationMode: (mode) => calls.setCollaborationMode.push(mode),
     onSetToolApprovalMode: () => {},
     onToggleYoloApprovalMode: () => {},
-    onClearGoal: () => {},
+    onClearGoal: () => {
+      calls.clearGoal += 1;
+    },
     onSwitchModel: () => {},
     onSetEffort: () => {},
     onSetTokenMode: () => {},
@@ -160,6 +172,24 @@ function dispatchPasteFile(textarea: HTMLTextAreaElement, file: File) {
   textarea.dispatchEvent(event);
 }
 
+function nativeFileDropEvent(): Event {
+  const drop = new window.Event("drop", { bubbles: true, cancelable: true });
+  Object.defineProperty(drop, "dataTransfer", {
+    configurable: true,
+    value: {
+      types: ["Files"],
+      files: [{}],
+      items: [
+        {
+          kind: "file",
+          webkitGetAsEntry: () => ({ isFile: true }),
+        },
+      ],
+    },
+  });
+  return drop;
+}
+
 async function waitFor(label: string, predicate: () => boolean) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await act(async () => {
@@ -201,6 +231,32 @@ console.log("\ncomposer goal toggle");
   eq(calls.send.length, 0, "enabling goal mode with a draft does not send");
   eq(calls.setCollaborationMode.join(","), "goal", "enabling goal mode switches only the collaboration axis");
   eq(textarea.value, "ship the release notes", "enabling goal mode preserves the draft text");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  const { root, calls } = await renderComposer({
+    running: true,
+    collaborationMode: "goal",
+    goal: "finish the migration",
+    turnStartAt: Date.now(),
+  });
+
+  const stopButton = document.querySelector(".composer-runstatus__stop") as HTMLButtonElement | null;
+  if (!stopButton) throw new Error("composer stop button did not render");
+
+  await act(async () => {
+    stopButton.click();
+    await flushTimers();
+  });
+
+  eq(calls.cancel, 1, "goal-mode stop cancels the running turn");
+  eq(calls.clearGoal, 1, "goal-mode stop clears the active goal");
 
   await act(async () => {
     root.unmount();
@@ -342,24 +398,79 @@ console.log("\ncomposer goal toggle");
 
 {
   const dom = installDom();
+  let droppedCallback: ((x: number, y: number, paths: string[]) => void) | undefined;
+  window.runtime = {
+    EventsOn: () => () => {},
+    BrowserOpenURL: () => {},
+    OnFileDrop: (cb) => {
+      droppedCallback = cb;
+    },
+    OnFileDropOff: () => {},
+  };
+  mockApp({
+    AttachDropped: async () => ({
+      kind: "workspace",
+      path: "__reasonix_external_folder/mock/Folder-With-Spaces",
+      isDir: true,
+      displayPath: "/Users/example/Folder With Spaces",
+    }),
+  });
+  const { root, calls, rerender } = await renderComposer();
+  await rerender({ insertRequest: { id: 4, text: "inspect", mode: "replace" } });
+  if (!droppedCallback) throw new Error("native file drop handler did not register");
+
+  await act(async () => {
+    droppedCallback?.(0, 0, ["/Users/example/Folder With Spaces"]);
+    await flushTimers();
+  });
+  await waitFor("dropped external folder chip", () => document.body.textContent?.includes("Folder With Spaces/") === true);
+
+  ok(document.body.textContent?.includes("Folder With Spaces/") === true, "dropped external folder renders as a folder context chip");
+
+  const sendButton = document.querySelector(".composer__btn--send") as HTMLButtonElement | null;
+  if (!sendButton) throw new Error("composer send button did not render");
+  await act(async () => {
+    sendButton.click();
+    await flushTimers();
+  });
+
+  eq(calls.send.join(","), "inspect @/Users/example/Folder With Spaces/", "external folder display text uses the real folder path");
+  eq(calls.submit.join(","), "inspect @__reasonix_external_folder/mock/Folder-With-Spaces/", "external folder submit text uses the session ref token");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const externalToken = "__reasonix_external_folder/mock/Folder-With-Spaces/src/outside.txt";
+  const externalDisplayPath = "/Users/example/Folder With Spaces/src/outside.txt";
+  const picked = composerPickFileEntry("ask @outside", "outside", "", {
+    name: "src/outside.txt",
+    path: externalToken,
+    isDir: false,
+    displayName: "Folder With Spaces/src/outside.txt",
+    displayPath: externalDisplayPath,
+  });
+  eq(picked.text, "ask ", "external search selection removes the token fragment from the draft");
+  eq(picked.workspaceRef?.path, externalToken, "external search selection submits the session ref token");
+  eq(picked.workspaceRef?.displayPath, externalDisplayPath, "external search selection keeps the real display path");
+
+  const localFile = composerPickFileEntry("ask @src/mai", "src/mai", "src/", { name: "main.go", isDir: false });
+  eq(localFile.text, "ask @src/main.go ", "local file selection still completes inline text");
+
+  const localDir = composerPickFileEntry("ask @sr", "sr", "", { name: "src", isDir: true });
+  eq(localDir.text, "ask @src/", "local dir selection still keeps the menu-open slash");
+}
+
+{
+  const dom = installDom();
   const { root: dropNavRoot } = await renderComposer();
   const composer = document.querySelector(".composer") as HTMLElement | null;
   if (!composer) throw new Error("composer did not render");
 
-  const drop = new window.Event("drop", { bubbles: true, cancelable: true });
-  Object.defineProperty(drop, "dataTransfer", {
-    configurable: true,
-    value: {
-      types: ["Files"],
-      files: [{}],
-      items: [
-        {
-          kind: "file",
-          webkitGetAsEntry: () => ({ isFile: true }),
-        },
-      ],
-    },
-  });
+  const drop = nativeFileDropEvent();
   await act(async () => {
     composer.dispatchEvent(drop);
     await flushTimers();
@@ -368,6 +479,25 @@ console.log("\ncomposer goal toggle");
 
   await act(async () => {
     dropNavRoot.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  const { root: dropWrapRoot } = await renderComposer();
+  const wrap = document.querySelector(".composer-wrap") as HTMLElement | null;
+  if (!wrap) throw new Error("composer wrap did not render");
+
+  const drop = nativeFileDropEvent();
+  await act(async () => {
+    wrap.dispatchEvent(drop);
+    await flushTimers();
+  });
+  ok(drop.defaultPrevented, "outer native file drop target prevents browser image navigation");
+
+  await act(async () => {
+    dropWrapRoot.unmount();
   });
   dom.window.close();
 }
