@@ -1173,6 +1173,32 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, finalize(m, cmds)
 			}
 
+			// ":!<cmd>" is Vim-style shell execution: runs a system command directly.
+			if strings.HasPrefix(line, ":!") {
+				cmd := strings.TrimPrefix(line, ":!")
+				if strings.TrimSpace(cmd) == "" {
+					m.input.Reset()
+					m.pastedBlocks = nil
+					m.notice(i18n.M.ShellExecEmpty)
+					return m, finalize(m, cmds)
+				}
+				m.input.Reset()
+				m.pastedBlocks = nil
+				m.state = tuiRunning
+				m.runStart = time.Now()
+				m.elapsed = 0
+				m.turnTokens = 0
+				m.pendingRestore = line
+				m.bubbleStartIdx = len(m.transcript)
+				m.commitLine("")
+				m.commitLine(renderUserBubble(line, m.width, m.planMode))
+				m.bubblePending = true
+				m.turnDiscarded = false
+				m.confirmBubbleSent() // shell events arrive instantly
+				m.ctrl.RunShell(cmd)
+				return m, tea.Batch(m.spinner.Tick, elapsedTick())
+			}
+
 			// "!<cmd>" runs a shell command directly, bypassing the model.
 			if strings.HasPrefix(line, "!") {
 				cmd := strings.TrimPrefix(line, "!")
