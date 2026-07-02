@@ -190,6 +190,12 @@ func configureCLIThemeFromConfigNoProbe() {
 // workspaceRoot returns the nearest ancestor that has a .reasonix convention
 // directory — the marker written by IsProjectInitialized / InitProject — or
 // the current working directory when none is found.
+//
+// The search stops at the user's home directory and the filesystem root so
+// that a .reasonix directory under $HOME (used by earlier versions of
+// Reasonix as the user-config home) never causes a project above it to be
+// misidentified as the workspace root, which would suppress the per-project
+// initialization prompt.
 func workspaceRoot() string {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -199,12 +205,22 @@ func workspaceRoot() string {
 	if err != nil {
 		dir = filepath.Clean(wd)
 	}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		home, _ = filepath.Abs(home)
+	}
 	for {
 		if fi, err := os.Stat(filepath.Join(dir, ".reasonix")); err == nil && fi.IsDir() {
 			return dir
 		}
 		next := filepath.Dir(dir)
 		if next == dir {
+			return wd
+		}
+		// Never cross the home directory or the filesystem root — a
+		// .reasonix directory under $HOME (the old global config location
+		// ~/.reasonix) is not a project workspace marker.
+		if home != "" && dir == home {
 			return wd
 		}
 		dir = next
@@ -230,18 +246,17 @@ func setup(ctx context.Context, modelName string, maxStepsOverride int, requireK
 	})
 }
 
-// resolveCLISessionDir returns the session dir for CLI invocations. When the
-// current working directory maps to a project session dir, the project dir is
-// used so /resume shows project history. Falls back to the global session dir.
+// resolveCLISessionDir returns the project-local session dir for CLI
+// invocations: <workspace root>/.reasonix/sessions/. This keeps sessions
+// alongside the project in the convention .reasonix/ directory so /resume
+// and --continue find them. Falls back to the global session dir when the
+// working directory is the home directory or is otherwise unresolvable.
 func resolveCLISessionDir() string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return config.SessionDir()
 	}
-	if projDir := config.ProjectSessionDir(cwd); projDir != "" && projDir != config.SessionDir() {
-		return projDir
-	}
-	return config.SessionDir()
+	return config.ResolveSessionDir(cwd)
 }
 
 // setupQuiet is like setup but suppresses plugin subprocess stderr output.

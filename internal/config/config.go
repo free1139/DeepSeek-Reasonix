@@ -1560,17 +1560,28 @@ func IsProjectInitialized(root string) bool {
 }
 
 // InitProject creates the project-local .reasonix directory and its sessions
-// subdirectory. It returns the project-local sessions path on success. Safe to
+// subdirectory, plus attachments, autoresearch, skills, commands, and
+// output-styles so eager consumers and convention-dir scanners find them
+// ready. It returns the project-local sessions path on success. Safe to
 // call on an already-initialized project.
 func InitProject(root string) (string, error) {
 	if root == "" {
 		return "", fmt.Errorf("project root is empty")
 	}
-	dir := filepath.Join(root, ".reasonix", "sessions")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("creating .reasonix/sessions: %w", err)
+	base := filepath.Join(root, ".reasonix")
+	for _, sub := range []string{
+		"sessions",
+		"attachments",
+		"autoresearch",
+		"skills",
+		"commands",
+		"output-styles",
+	} {
+		if err := os.MkdirAll(filepath.Join(base, sub), 0o755); err != nil {
+			return "", fmt.Errorf("creating .reasonix/%s: %w", sub, err)
+		}
 	}
-	return dir, nil
+	return filepath.Join(base, "sessions"), nil
 }
 
 // ResolveSessionDir returns the project-local sessions path when root is
