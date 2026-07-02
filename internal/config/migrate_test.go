@@ -593,7 +593,7 @@ func TestMigrateImportsLegacyXDGConfigToPrimaryConfig(t *testing.T) {
 		t.Skip("legacy XDG paths are Unix-only")
 	}
 	_, dest, home := legacyHome(t)
-	legacy := filepath.Join(home, ".config", "reasonix", "config.toml")
+	legacy := filepath.Join(home, ".reasonix", "config.toml")
 	if samePath(legacy, dest) {
 		t.Skip("legacy XDG config path matches primary path on this platform")
 	}
@@ -975,7 +975,7 @@ api_key_env = "DEEPSEEK_API_KEY"
 `)
 
 	// Write a legacy TOML with an extra custom provider.
-	legacyPath := filepath.Join(home, ".config", "reasonix", "config.toml")
+	legacyPath := filepath.Join(home, ".reasonix", "config.toml")
 	writeLegacy(t, legacyPath, `
 config_version = 2
 default_model = "deepseek-flash/deepseek-v4-flash"
@@ -1055,7 +1055,7 @@ api_key_env = "MY_API_KEY"
 `)
 
 	// Write a legacy TOML with a different custom provider.
-	legacyPath := filepath.Join(home, ".config", "reasonix", "config.toml")
+	legacyPath := filepath.Join(home, ".reasonix", "config.toml")
 	writeLegacy(t, legacyPath, `
 config_version = 2
 

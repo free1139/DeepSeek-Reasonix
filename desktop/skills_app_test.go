@@ -114,7 +114,7 @@ func TestSkillRootsViewDedupesConfiguredConventionRoot(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("AppData", filepath.Join(home, "AppData"))
 	project := t.TempDir()
-	root := filepath.Join(home, ".reasonix", "skills")
+	root := filepath.Join(home, ".config", "reasonix", "skills")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestSkillRootsViewDedupesConfiguredConventionRoot(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cfgPath, []byte("[skills]\npaths = [\"~/.reasonix/skills\"]\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte("[skills]\npaths = [\"~/.config/reasonix/skills\"]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	wd, err := os.Getwd()

@@ -2835,7 +2835,7 @@ func desktopConfigDir() string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()
-		return filepath.Join(home, ".reasonix")
+		return filepath.Join(home, ".config", "reasonix")
 	}
 	return filepath.Join(dir, "reasonix")
 }
@@ -5469,7 +5469,7 @@ func globalWorkspaceRoot() string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()
-		return filepath.Join(home, ".reasonix", "global-workspace")
+		return filepath.Join(home, ".config", "reasonix", "global-workspace")
 	}
 	return filepath.Join(dir, "reasonix", "global-workspace")
 }

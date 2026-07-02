@@ -26,7 +26,7 @@ func expectedDefaultReasonixHome(home string) string {
 	if runtime.GOOS == "windows" {
 		return filepath.Join(home, "AppData", "Roaming", "reasonix")
 	}
-	return filepath.Join(home, ".reasonix")
+	return filepath.Join(home, ".config", "reasonix")
 }
 
 func TestUserConfigDisplayPathCollapsesHome(t *testing.T) {
