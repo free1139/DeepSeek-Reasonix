@@ -635,7 +635,9 @@ func (a *App) snapshotAllTabs() {
 	tabs := a.runtimeTabsLocked()
 	a.mu.RUnlock()
 	for _, t := range tabs {
-		_ = a.snapshotTab(t)
+		if err := a.snapshotTab(t); err != nil {
+			slog.Warn("desktop: snapshot all tabs failed", "tab", t.ID, "err", err)
+		}
 	}
 }
 
@@ -657,7 +659,9 @@ func (a *App) shutdown(context.Context) {
 	a.mu.RUnlock()
 	for _, t := range tabs {
 		if t.Ctrl != nil {
-			_ = a.snapshotTab(t)
+			if err := a.snapshotTab(t); err != nil {
+				slog.Warn("desktop: shutdown snapshot failed", "tab", t.ID, "err", err)
+			}
 			t.Ctrl.Close()
 		}
 	}
@@ -739,6 +743,7 @@ func (a *App) SubmitToTab(tabID, input string) error {
 	if ctrl == nil {
 		return workspaceNotReadyErr(tab)
 	}
+	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitDisplay(input, input)
 	return nil
 }
@@ -755,6 +760,7 @@ func (a *App) submitUserTurnToTab(tabID, input string) bool {
 	if ctrl == nil {
 		return false
 	}
+	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitUserTurn(input, input)
 	return true
 }
@@ -780,6 +786,7 @@ func (a *App) RunShellForTab(tabID, command string) error {
 	if ctrl == nil {
 		return workspaceNotReadyErr(tab)
 	}
+	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.RunShell(command)
 	return nil
 }
@@ -805,6 +812,7 @@ func (a *App) SubmitDisplayToTab(tabID, display, input string) error {
 	if ctrl == nil {
 		return workspaceNotReadyErr(tab)
 	}
+	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitDisplay(display, input)
 	return nil
 }
@@ -824,6 +832,7 @@ func (a *App) SubmitEditedDisplayToTab(tabID, display, input, original string) e
 	if ctrl == nil {
 		return workspaceNotReadyErr(tab)
 	}
+	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitEditedDisplay(display, input, original)
 	return nil
 }
@@ -908,6 +917,43 @@ func (a *App) snapshotTab(tab *WorkspaceTab) error {
 		return nil
 	}
 	return ctrl.Snapshot()
+}
+
+func snapshotTabDirect(tab *WorkspaceTab) error {
+	if tab == nil || tab.ReadOnly || tab.Ctrl == nil {
+		return nil
+	}
+	return tab.Ctrl.Snapshot()
+}
+
+func (a *App) snapshotTabForAction(tab *WorkspaceTab, action string) error {
+	if err := a.snapshotTab(tab); err != nil {
+		a.reportTabSnapshotError(tab, action, err)
+		if strings.TrimSpace(action) == "" {
+			return fmt.Errorf("save current session: %w", err)
+		}
+		return fmt.Errorf("save current session before %s: %w", action, err)
+	}
+	return nil
+}
+
+func (a *App) reportTabSnapshotError(tab *WorkspaceTab, action string, err error) {
+	if err == nil {
+		return
+	}
+	tabID := ""
+	if tab != nil {
+		tabID = tab.ID
+	}
+	slog.Warn("desktop: session snapshot failed", "tab", tabID, "action", action, "err", err)
+	if tab == nil || tab.sink == nil {
+		return
+	}
+	prefix := "Session autosave failed"
+	if strings.TrimSpace(action) != "" && action != "autosave" {
+		prefix = "Session save failed before " + action
+	}
+	tab.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: prefix + ": " + err.Error()})
 }
 
 func (a *App) reconciledSessionPathForTab(tab *WorkspaceTab) string {
@@ -1311,6 +1357,45 @@ func (a *App) assignFreshSessionTopic(tab *WorkspaceTab) {
 	_ = setTopicCreatedAt(topicTitleRoot(scope, workspaceRoot), topicID, time.Now().UnixMilli())
 }
 
+func (a *App) ensureTabTopicIndexedForUserTurn(tab *WorkspaceTab) {
+	if tab == nil || strings.TrimSpace(tab.TopicID) != "" {
+		return
+	}
+	scope := tab.Scope
+	workspaceRoot := tab.WorkspaceRoot
+	if strings.TrimSpace(scope) == "global" {
+		scope = "global"
+		workspaceRoot = ""
+	} else {
+		scope = "project"
+		workspaceRoot = normalizeProjectRoot(workspaceRoot)
+	}
+	topicID := newTopicID()
+	a.mu.Lock()
+	if current := a.tabs[tab.ID]; current == tab {
+		if strings.TrimSpace(tab.TopicID) != "" {
+			a.mu.Unlock()
+			return
+		}
+		tab.TopicID = topicID
+		tab.TopicTitle = defaultTopicTitle
+		a.saveTabsLocked()
+	} else {
+		if strings.TrimSpace(tab.TopicID) != "" {
+			a.mu.Unlock()
+			return
+		}
+		tab.TopicID = topicID
+		tab.TopicTitle = defaultTopicTitle
+	}
+	a.mu.Unlock()
+
+	_ = ensureTopicIndexed(scope, workspaceRoot, topicID, defaultTopicTitle, topicTitleSourceAuto)
+	_ = setTopicCreatedAt(topicTitleRoot(scope, workspaceRoot), topicID, time.Now().UnixMilli())
+	a.persistTabSessionPath(tab, tab.currentSessionPath())
+	a.emitProjectTreeChanged()
+}
+
 func messagesHaveConversationContent(messages []provider.Message) bool {
 	for _, msg := range messages {
 		if msg.Role != provider.RoleSystem {
@@ -1461,12 +1546,16 @@ func removeDesktopSessionArtifacts(path string) error {
 type CheckpointMeta struct {
 	Turn            int      `json:"turn"`
 	Prompt          string   `json:"prompt"`
-	Files           []string `json:"files"`         // cumulative files RestoreCode would affect from this turn
+	Files           []string `json:"files"`     // stable preview of cumulative files RestoreCode would affect from this turn
+	FileCount       int      `json:"fileCount"` // full cumulative file count, including entries omitted from Files
+	FilesTruncated  bool     `json:"filesTruncated,omitempty"`
 	TurnFileCount   int      `json:"turnFileCount"` // files changed during this turn only
 	Time            int64    `json:"time"`          // unix milliseconds
 	CanCode         bool     `json:"canCode"`
 	CanConversation bool     `json:"canConversation"`
 }
+
+const checkpointFilePreviewLimit = 60
 
 // Checkpoints lists the session's rewind points, oldest first, for the rewind UI.
 func (a *App) Checkpoints() []CheckpointMeta {
@@ -1503,21 +1592,46 @@ func (a *App) CheckpointsForTab(tabID string) []CheckpointMeta {
 	// files RestoreCode would actually affect from this turn.
 	hasCodeAfter := false
 	codeFileSet := make(map[string]bool, len(metas)*2)
+	codeFilePreview := []string{}
 	for i := len(out) - 1; i >= 0; i-- {
 		if len(out[i].Files) > 0 {
 			hasCodeAfter = true
 		}
 		for _, f := range out[i].Files {
+			if codeFileSet[f] {
+				continue
+			}
 			codeFileSet[f] = true
+			codeFilePreview = insertCheckpointFilePreview(codeFilePreview, f, checkpointFilePreviewLimit)
 		}
 		out[i].CanCode = hasCodeAfter
-		out[i].Files = make([]string, 0, len(codeFileSet))
-		for f := range codeFileSet {
-			out[i].Files = append(out[i].Files, f)
-		}
-		sort.Strings(out[i].Files) // map iteration is unordered; keep the list stable
+		out[i].FileCount = len(codeFileSet)
+		out[i].Files = append([]string{}, codeFilePreview...)
+		out[i].FilesTruncated = out[i].FileCount > len(out[i].Files)
 	}
 	return out
+}
+
+func insertCheckpointFilePreview(preview []string, path string, limit int) []string {
+	if limit <= 0 || path == "" {
+		return preview
+	}
+	idx := sort.SearchStrings(preview, path)
+	if idx < len(preview) && preview[idx] == path {
+		return preview
+	}
+	if len(preview) < limit {
+		preview = append(preview, "")
+		copy(preview[idx+1:], preview[idx:])
+		preview[idx] = path
+		return preview
+	}
+	if idx >= limit {
+		return preview
+	}
+	copy(preview[idx+1:], preview[idx:limit-1])
+	preview[idx] = path
+	return preview
 }
 
 // ToolResultForTab returns the full arguments and output for one tool call that
@@ -2315,11 +2429,7 @@ func (a *App) openFallbackRuntime(target fallbackRuntimeTarget) error {
 		root = ""
 	}
 	if topicID == "" {
-		topic, err := a.CreateTopic(scope, root, "")
-		if err != nil {
-			return err
-		}
-		topicID = topic.ID
+		return a.openTransientBlankRuntime(scope, root)
 	}
 	var err error
 	if a.singleSurfaceLayoutEnabled() {
@@ -2330,6 +2440,56 @@ func (a *App) openFallbackRuntime(target fallbackRuntimeTarget) error {
 		_, err = a.OpenProjectTab(root, topicID)
 	}
 	return err
+}
+
+func (a *App) openTransientBlankRuntime(scope, workspaceRoot string) error {
+	scope = strings.TrimSpace(scope)
+	if scope != "project" {
+		scope = "global"
+	}
+	actualRoot := ""
+	if scope == "project" {
+		workspaceRoot = normalizeProjectRoot(workspaceRoot)
+		if workspaceRoot == "" {
+			return fmt.Errorf("workspaceRoot is required")
+		}
+		saveWorkspace(workspaceRoot)
+		_ = addProject(workspaceRoot, "")
+		actualRoot = workspaceRoot
+	} else {
+		actualRoot = globalWorkspaceRoot()
+		if err := os.MkdirAll(actualRoot, 0o755); err != nil {
+			return fmt.Errorf("create global workspace: %w", err)
+		}
+	}
+
+	model, toolApprovalMode := desktopNewSessionDefaults()
+	sessionPath, err := createEmptySessionFile(desktopSessionDir(actualRoot), model)
+	if err != nil {
+		return err
+	}
+	tab := &WorkspaceTab{
+		Scope:            scope,
+		WorkspaceRoot:    actualRoot,
+		TopicTitle:       defaultTopicTitle,
+		SessionPath:      sessionPath,
+		model:            model,
+		tokenMode:        boot.TokenModeFull,
+		mode:             tabModeFromAxes(false, toolApprovalMode == control.ToolApprovalYolo),
+		toolApprovalMode: toolApprovalMode,
+		disabledMCP:      map[string]ServerView{},
+	}
+	a.mu.Lock()
+	tab.ID = a.newUniqueTabIDLocked()
+	tab.sink = &tabEventSink{tabID: tab.ID, app: a}
+	a.tabs[tab.ID] = tab
+	a.tabOrder = append(a.tabOrder, tab.ID)
+	a.activeTabID = tab.ID
+	a.saveTabsLocked()
+	a.mu.Unlock()
+
+	a.startTabControllerBuild(tab)
+	return nil
 }
 
 func (a *App) beginDestroySessionJobs(dir, sessionPath string) []control.SessionDestroyHandle {
@@ -2609,11 +2769,13 @@ func (a *App) rebindTabToLoadedSessionPath(tab *WorkspaceTab, sessionPath string
 	if sessionRuntimeKey(tab.currentSessionPath()) == sessionRuntimeKey(sessionPath) {
 		return nil
 	}
+	profile := loadTabSessionProfile(sessionPath)
 
 	ctrl := tab.Ctrl
 	if ctrl == nil {
 		a.mu.Lock()
 		tab.SessionPath = sessionPath
+		applyTabSessionProfile(tab, profile)
 		tab.Ready = false
 		tab.StartupErr = ""
 		tab.ActivityStatus = ""
@@ -2630,7 +2792,14 @@ func (a *App) rebindTabToLoadedSessionPath(tab *WorkspaceTab, sessionPath string
 		return nil
 	}
 
-	_ = a.snapshotTab(tab) // persist writable sessions before switching the view.
+	if err := a.snapshotTabForAction(tab, "switching sessions"); err != nil {
+		return err
+	}
+	if oldPath := a.reconciledSessionPathForTab(tab); oldPath != "" {
+		if err := saveTabSessionMeta(tab, oldPath); err != nil {
+			return fmt.Errorf("save current session metadata before switching sessions: %w", err)
+		}
+	}
 	if tab.hasActiveRuntimeWork() {
 		if !a.detachRuntimeForReplacement(tab) {
 			return fmt.Errorf("current session runtime cannot be detached")
@@ -2642,6 +2811,7 @@ func (a *App) rebindTabToLoadedSessionPath(tab *WorkspaceTab, sessionPath string
 	a.mu.Lock()
 	tab.Ctrl = nil
 	tab.SessionPath = sessionPath
+	applyTabSessionProfile(tab, profile)
 	tab.Ready = false
 	tab.StartupErr = ""
 	tab.ActivityStatus = ""
@@ -3249,8 +3419,10 @@ func (a *App) RemoveWorkspace(dir string) error {
 		if !tabInWorkspace(tab, dir) {
 			continue
 		}
-		if tab.Ctrl != nil && !tab.ReadOnly {
-			_ = tab.Ctrl.Snapshot()
+		if err := snapshotTabDirect(tab); err != nil {
+			a.mu.Unlock()
+			slog.Warn("desktop: snapshot before removing workspace failed", "tab", id, "workspace", dir, "err", err)
+			return fmt.Errorf("save current session before removing workspace: %w", err)
 		}
 		a.markTabRemovedLocked(tab)
 		closeTabs = append(closeTabs, tab)
@@ -6370,7 +6542,9 @@ func (a *App) SetModelForTab(tabID, name string) error {
 		if prevPath == "" {
 			prevPath = tab.Ctrl.SessionPath()
 		}
-		_ = a.snapshotTab(tab)
+		if err := a.snapshotTabForAction(tab, "changing model"); err != nil {
+			return err
+		}
 		carried = tab.Ctrl.History()
 		tab.Ctrl.Close()
 	}
@@ -6474,7 +6648,9 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 		if prevPath == "" {
 			prevPath = tab.Ctrl.SessionPath()
 		}
-		_ = a.snapshotTab(tab)
+		if err := a.snapshotTabForAction(tab, "changing effort"); err != nil {
+			return err
+		}
 		carried = tab.Ctrl.History()
 		tab.Ctrl.Close()
 	}
@@ -6551,7 +6727,9 @@ func (a *App) SetTokenModeForTab(tabID, mode string) error {
 		if prevPath == "" {
 			prevPath = oldCtrl.SessionPath()
 		}
-		_ = a.snapshotTab(tab)
+		if err := a.snapshotTabForAction(tab, "changing token mode"); err != nil {
+			return err
+		}
 		carried = oldCtrl.History()
 	}
 	sharedHost := a.lookupSharedHost(tab.SharedHostKey)

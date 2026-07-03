@@ -118,6 +118,10 @@ interface DesktopWindowState {
 // to AppBindings, then run `pnpm typecheck` to verify.
 export interface AppBindings {
   Platform(): Promise<string>;
+  MinimiseMainWindow(): Promise<void>;
+  ToggleMaximiseMainWindow(): Promise<void>;
+  IsMainWindowMaximised(): Promise<boolean>;
+  CloseMainWindow(): Promise<void>;
   // ── Heartbeat ──
   HeartbeatListTasks(): Promise<unknown>;
   HeartbeatReloadTasks(): Promise<unknown>;
@@ -584,6 +588,7 @@ function bridgeBreadcrumb(method: string): string {
     return `mcp ${method}`;
   if (/^(AddSkillPath|RemoveSkillPath|RefreshSkills|SetSkillEnabled|AcceptSkillSuggestion)/.test(method))
     return `skill ${method}`;
+  if (/^(MinimiseMainWindow|ToggleMaximiseMainWindow|IsMainWindowMaximised|CloseMainWindow)$/.test(method)) return `window ${method}`;
   if (/^(OpenProjectTab|OpenGlobalTab|OpenTopicSession|EnsureBlankTab|ActivateTopic|EnsureBlankSurface|SetActiveTab|CloseTab|ReorderTabs|CreateTopic|RenameTopic|DeleteTopic|TrashTopic|RenameProject|RemoveWorkspace|SwitchWorkspace|PickWorkspace)/.test(method))
     return `nav ${method}`;
   return "";
@@ -681,10 +686,11 @@ function browserPlatformOverride(): "darwin" | "windows" | "linux" | "" {
   return value === "darwin" || value === "windows" || value === "linux" ? value : "";
 }
 
-function mockScenario(): "demo" | "fresh" | "running" {
+function mockScenario(): "demo" | "fresh" | "running" | "guidance" {
   if (typeof window === "undefined") return "demo";
   const value = new URLSearchParams(window.location.search).get("mock")?.trim().toLowerCase();
   if (value === "fresh" || value === "empty" || value === "first-run") return "fresh";
+  if (value === "guidance" || value === "guide" || value === "steer") return "guidance";
   if (value === "running" || value === "busy" || value === "streaming") return "running";
   return "demo";
 }
@@ -692,7 +698,8 @@ function mockScenario(): "demo" | "fresh" | "running" {
 function makeMockApp(): AppBindings {
   const scenario = mockScenario();
   const freshMock = scenario === "fresh";
-  const runningMock = scenario === "running";
+  const guidanceMock = scenario === "guidance";
+  const runningMock = scenario === "running" || guidanceMock;
   let cancelled = false;
   let pendingAskPreview = false;
   let pendingApprovalPreview = false;
@@ -1381,7 +1388,7 @@ function makeMockApp(): AppBindings {
       collaborationMode: "normal",
       toolApprovalMode: "ask",
       tokenMode: "full",
-      active: true,
+      active: !guidanceMock,
       cwd: "~/projects/joyquant-db",
     },
     {
@@ -1401,7 +1408,7 @@ function makeMockApp(): AppBindings {
       collaborationMode: "normal",
       toolApprovalMode: "ask",
       tokenMode: "full",
-      active: false,
+      active: guidanceMock,
       cwd: "~/projects/joyquant-sys",
     },
     {
@@ -1453,6 +1460,18 @@ function makeMockApp(): AppBindings {
     }
   };
   return {
+    async MinimiseMainWindow() {
+      console.info("mock MinimiseMainWindow");
+    },
+    async ToggleMaximiseMainWindow() {
+      console.info("mock ToggleMaximiseMainWindow");
+    },
+    async IsMainWindowMaximised() {
+      return false;
+    },
+    async CloseMainWindow() {
+      console.info("mock CloseMainWindow");
+    },
     async Platform() {
       const override = browserPlatformOverride();
       if (override) return override;
@@ -1824,7 +1843,7 @@ function makeMockApp(): AppBindings {
         async ClearSession() {},
     async Checkpoints() {
       return [
-        { turn: 0, prompt: "你好呀", files: ["src/App.tsx"], turnFileCount: 1, time: Date.now() - 30_000, canCode: true, canConversation: true },
+        { turn: 0, prompt: "你好呀", files: ["src/App.tsx"], fileCount: 1, turnFileCount: 1, time: Date.now() - 30_000, canCode: true, canConversation: true },
       ];
     },
     async CheckpointsForTab() {

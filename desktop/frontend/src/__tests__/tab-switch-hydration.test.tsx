@@ -135,11 +135,13 @@ const historyB = deferred<HistoryMessage[]>();
 const historyD = deferred<HistoryMessage[]>();
 const contextDGate = deferred<ContextInfo>();
 const setActiveBGate = deferred<void>();
+const submitTabCGate = deferred<void>();
 const historyCalls: string[] = [];
 let contextDCalls = 0;
 let holdNextContextForD = false;
 let setActiveCalls = 0;
 let newSessionCalls = 0;
+let failSetActiveFor = "";
 const runningTabs = new Set<string>();
 const tabsById = new Map([tabA, tabB, tabC, tabD].map((tab) => [tab.id, tab]));
 const eventHandlers: Array<(e: WireEvent) => void> = [];
@@ -197,10 +199,12 @@ window.go = {
       SetActiveTab: async (tabID: string) => {
         setActiveCalls += 1;
         if (tabID === "tab-b") await setActiveBGate.promise;
+        if (tabID === failSetActiveFor) throw new Error("persist failed");
         backendActiveId = tabID;
       },
       SubmitToTab: async (tabID: string) => {
         runningTabs.add(tabID);
+        if (tabID === "tab-c") await submitTabCGate.promise;
       },
       SubmitDisplayToTab: async (tabID: string) => {
         runningTabs.add(tabID);
@@ -275,6 +279,32 @@ eq(controller?.activeTabId, "tab-a", "late history for another tab does not chan
 ok(controller?.state.items.some((item) => item.kind === "user" && item.text === "cached A") ?? false, "late history for another tab does not overwrite the active transcript");
 ok(!(controller?.state.items.some((item) => item.kind === "user" && item.text === "late B") ?? false), "late history stays scoped to its tab state");
 
+const historyCallsBeforeFallbackSync = historyCalls.length;
+backendActiveId = "tab-b";
+await act(async () => {
+  await controller?.syncActiveTab(false);
+  await flushPromises();
+});
+eq(controller?.activeTabId, "tab-b", "backend fallback sync activates the backend-selected cached tab");
+ok(controller?.state.items.some((item) => item.kind === "user" && item.text === "late B") ?? false, "backend fallback sync keeps the cached transcript");
+eq(historyCalls.length, historyCallsBeforeFallbackSync, "backend fallback sync preserves cached history instead of reloading it");
+await act(async () => {
+  await controller?.switchTab("tab-a", tabA);
+  await flushPromises();
+});
+await waitFor("tab-a restored after fallback sync", () => controller?.activeTabId === "tab-a" && controller.state.items.some((item) => item.kind === "user" && item.text === "cached A"));
+
+failSetActiveFor = "tab-b";
+const historyCallsBeforeFailedSwitch = historyCalls.length;
+await act(async () => {
+  await controller?.switchTab("tab-b", tabB);
+  await flushPromises();
+});
+eq(controller?.activeTabId, "tab-a", "failed backend tab switch reverts to the previous active tab");
+ok(controller?.state.items.some((item) => item.kind === "user" && item.text === "cached A") ?? false, "failed backend tab switch keeps the previous transcript visible");
+eq(historyCalls.length, historyCallsBeforeFailedSwitch, "failed backend tab switch does not hydrate the rejected target");
+failSetActiveFor = "";
+
 await act(async () => {
   for (const handler of eventHandlers) handler({ kind: "phase", text: "Planner is thinking", tabId: "tab-a" });
   for (const handler of eventHandlers) handler({ kind: "message", text: "Planner kept", reasoning: "Planner notes", tabId: "tab-a" });
@@ -293,10 +323,15 @@ eq(historyCalls.length, historyCallsBeforeReady, "agent ready with cached transc
 ok(controller?.state.items.some((item) => item.kind === "phase" && item.text === "Planner is thinking") ?? false, "agent ready keeps cached planner phase");
 ok(controller?.state.items.some((item) => item.kind === "assistant" && item.text === "Planner kept" && item.reasoning === "Planner notes") ?? false, "agent ready keeps cached planner answer");
 
+let tabCSendResolved = false;
 await act(async () => {
-  controller?.sendToTab("tab-c", "streaming C");
+  const sendPromise = controller?.sendToTab("tab-c", "streaming C");
+  sendPromise?.then(() => {
+    tabCSendResolved = true;
+  });
   await flushPromises();
 });
+eq(tabCSendResolved, true, "sendToTab resolves after optimistic dispatch before backend submit completes");
 await act(async () => {
   await controller?.switchTab("tab-c", tabC);
   await flushPromises();
@@ -304,6 +339,11 @@ await act(async () => {
 eq(controller?.activeTabId, "tab-c", "switching to a cached running tab still updates the active tab");
 ok(controller?.state.items.some((item) => item.kind === "user" && item.text === "streaming C") ?? false, "cached running tab keeps its optimistic transcript");
 ok(!historyCalls.includes("tab-c"), "cached running tab skips history hydration");
+await act(async () => {
+  submitTabCGate.resolve();
+  await submitTabCGate.promise;
+  await flushPromises();
+});
 
 holdNextContextForD = true;
 await act(async () => {
