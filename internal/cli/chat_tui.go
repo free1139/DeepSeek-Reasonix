@@ -544,7 +544,8 @@ func transcriptContentWidth(termW int, nativeScrollback bool) int {
 // wheel-scroll) without having to type "/mouse" each session.
 func mouseCaptureOffByDefault() bool {
 	v := strings.TrimSpace(os.Getenv("REASONIX_DISABLE_MOUSE"))
-	return v != "" && v != "0"
+	// default is disabled, by free1139
+	return v != "0"
 }
 
 func configureChatTextarea(ti *textarea.Model) {
