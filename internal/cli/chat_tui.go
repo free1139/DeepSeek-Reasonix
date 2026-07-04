@@ -1107,12 +1107,12 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			default:
 				// Idle (any mode): a double-Esc on an empty composer opens the
-				// rewind picker (Claude Code's gesture); a first Esc just arms
-				// it. Non-empty input clears as before.
+				// session picker (all saved sessions by title); a first Esc just
+				// arms it. Non-empty input clears as before.
 				if strings.TrimSpace(m.input.Value()) == "" {
 					if !m.lastEsc.IsZero() && time.Since(m.lastEsc) < 600*time.Millisecond {
 						m.lastEsc = time.Time{}
-						m.openRewind()
+						m.openResumePicker()
 					} else {
 						m.lastEsc = time.Now()
 					}
