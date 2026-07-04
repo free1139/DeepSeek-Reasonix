@@ -100,7 +100,7 @@ var (
 
 // cliCursorShape is the active cursor shape for the textarea input, configured
 // via [ui] cursor_shape. Defaults to "underline".
-var cliCursorShape = "underline"
+var cliCursorShape = "block"
 
 func configureCLITheme(mode string) {
 	configureCLIThemeWithStyle(mode, "")
