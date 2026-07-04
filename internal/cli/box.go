@@ -31,32 +31,10 @@ func padRight(s string, w int) string {
 // auto-fits the longest line plus one column of padding on each side. The
 // result always ends with a trailing newline so callers can Print it directly.
 func boxed(lines []string) string {
-	inner := 0
-	for _, l := range lines {
-		if w := visibleWidth(l); w > inner {
-			inner = w
-		}
-	}
-	inner += 2 // one space of padding on each side
-	bar := strings.Repeat("─", inner)
-
 	var b strings.Builder
-	b.WriteString(accent("╭" + bar + "╮"))
-	b.WriteByte('\n')
 	for _, l := range lines {
-		gap := inner - visibleWidth(l) - 2
-		if gap < 0 {
-			gap = 0
-		}
-		b.WriteString(accent("│"))
-		b.WriteByte(' ')
 		b.WriteString(l)
-		b.WriteString(strings.Repeat(" ", gap))
-		b.WriteByte(' ')
-		b.WriteString(accent("│"))
 		b.WriteByte('\n')
 	}
-	b.WriteString(accent("╰" + bar + "╯"))
-	b.WriteByte('\n')
 	return b.String()
 }
