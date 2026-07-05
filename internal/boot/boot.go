@@ -210,7 +210,10 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		sink.Emit(event.Event{Kind: event.Notice, Text: fmt.Sprintf("model %q is selected but its API key %s is not set — requests will fail until you set it", modelName, entry.APIKeyEnv)})
 	}
 	jm := jobs.NewManager(sink, jobs.WithStalledWarningAfter(time.Duration(cfg.BackgroundJobStalledWarningSeconds())*time.Second))
-	sessionDir := config.ResolveSessionDir(root)
+	sessionDir := opts.SessionDir
+	if sessionDir == "" {
+		sessionDir = config.ResolveSessionDir(root)
+	}
 	reconcileCleanupPending := opts.CleanupPendingReconciler
 	if reconcileCleanupPending == nil {
 		reconcileCleanupPending = control.ReconcileCleanupPending
@@ -1074,7 +1077,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		}
 	}
 
-	sessionDir = config.ResolveSessionDir(root) // add init project and move global session to project sessoin
+	if opts.SessionDir == "" {
+		sessionDir = config.ResolveSessionDir(root) // add init project and move global session to project sessoin
+	}
 
 	ctrlOpts := control.Options{
 		Runner:                 runner,
