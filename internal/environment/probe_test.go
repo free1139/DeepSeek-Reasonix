@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"reasonix/internal/secrets"
 )
 
 func TestFormatSectionSortsAndRedacts(t *testing.T) {
@@ -151,6 +153,7 @@ func TestRunProbesRejectsDeniedPathHit(t *testing.T) {
 }
 
 func TestRunProbesReportsTimeout(t *testing.T) {
+	setProbeTimeoutForTest(t, 200*time.Millisecond)
 	dir := t.TempDir()
 	toolPath := filepath.Join(dir, "slowtool")
 	body := "#!/bin/sh\nsleep 3\n"
@@ -269,6 +272,7 @@ func TestFormatSectionLimitsToolOutput(t *testing.T) {
 
 func writeProbeTool(t *testing.T, path, output string) string {
 	t.Helper()
+	setProbeTimeoutForTest(t, 10*time.Second)
 	body := "#!/bin/sh\nprintf '%s\\n'\n"
 	body = fmt.Sprintf(body, strings.ReplaceAll(output, "'", "'\\''"))
 	if runtime.GOOS == "windows" {
@@ -285,6 +289,7 @@ func writeProbeTool(t *testing.T, path, output string) string {
 
 func writeEnvProbeTool(t *testing.T, path string) string {
 	t.Helper()
+	setProbeTimeoutForTest(t, 10*time.Second)
 	body := "#!/bin/sh\nprintf '%s\\n' \"$REASONIX_PROBE_ENV\"\n"
 	if runtime.GOOS == "windows" {
 		if !strings.HasSuffix(path, ".bat") {
@@ -300,6 +305,7 @@ func writeEnvProbeTool(t *testing.T, path string) string {
 
 func writeStderrProbeTool(t *testing.T, path, output string) string {
 	t.Helper()
+	setProbeTimeoutForTest(t, 10*time.Second)
 	body := "#!/bin/sh\nprintf '%s\\n' >&2\n"
 	body = fmt.Sprintf(body, strings.ReplaceAll(output, "'", "'\\''"))
 	if runtime.GOOS == "windows" {
@@ -326,6 +332,7 @@ func resetProbeCacheForTest(t *testing.T, now time.Time) {
 		probeCache = map[string]probeCacheEntry{}
 		probeInflightCalls = map[string]*probeInflight{}
 		probeNow = time.Now
+		probeTimeout = ProbeTimeout
 		probeCacheMu.Unlock()
 	})
 }
@@ -334,4 +341,43 @@ func setProbeNowForTest(now time.Time) {
 	probeCacheMu.Lock()
 	probeNow = func() time.Time { return now }
 	probeCacheMu.Unlock()
+}
+
+func setProbeTimeoutForTest(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	probeCacheMu.Lock()
+	probeTimeout = timeout
+	probeCacheMu.Unlock()
+	t.Cleanup(func() {
+		probeCacheMu.Lock()
+		probeTimeout = ProbeTimeout
+		probeCacheMu.Unlock()
+	})
+}
+
+func TestRunProbesFilterSubprocessEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell probe tool")
+	}
+	resetProbeCacheForTest(t, time.Unix(90, 0))
+	setProbeTimeoutForTest(t, 10*time.Second)
+	dir := t.TempDir()
+	toolPath := filepath.Join(dir, "envtool")
+	body := "#!/bin/sh\nprintf 'tok=%s' \"${REASONIX_TEST_SECRET_TOKEN:-none}\"\n"
+	if err := os.WriteFile(toolPath, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REASONIX_TEST_SECRET_TOKEN", "ghp_abcdefghijklmnopqrstuvwxyz")
+	secrets.SetFilterSubprocessEnv(true)
+	t.Cleanup(func() { secrets.SetFilterSubprocessEnv(false) })
+
+	results := RunProbesWithOverrides(context.Background(), []string{"envtool --version"}, map[string]string{"envtool": toolPath})
+	if len(results) != 1 || !results[0].Found {
+		t.Fatalf("probe result = %+v", results)
+	}
+	// Probes declaring no extra env of their own must still get the filtered
+	// environment, not inherit the full one.
+	if results[0].Output != "tok=none" {
+		t.Fatalf("probe leaked filtered env: output = %q", results[0].Output)
+	}
 }

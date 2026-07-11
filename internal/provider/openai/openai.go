@@ -8,6 +8,8 @@
 //     knob) instead of reasoning_effort, since M3 has no level scale.
 //   - open.bigmodel.cn / api.z.ai (Zhipu GLM) → emits thinking.type=enabled|
 //     disabled instead of reasoning_effort, which Zhipu silently ignores.
+//   - api.longcat.chat → emits thinking.type=enabled|disabled and omits
+//     reasoning_effort, matching LongCat's OpenAI-compatible API.
 //   - ollama.com → accepts hosted Ollama Cloud's reasoning_effort scale,
 //     including max, and omits the field for none/disabled.
 //   - everything else (MiMo and other OpenAI-compatible gateways) uses the
@@ -81,6 +83,7 @@ func New(cfg provider.Config) (provider.Provider, error) {
 	deepseek := protocol == "deepseek" || (protocol == "" && IsDeepSeek(cfg.BaseURL))
 	minimax := protocol == "" && IsMiniMax(cfg.BaseURL)
 	zhipu := protocol == "" && IsZhipu(cfg.BaseURL)
+	longcat := protocol == "" && IsLongCat(cfg.BaseURL)
 	ollamaCloud := protocol == "" && IsOllamaCloud(cfg.BaseURL)
 	// Optional explicit `thinking` config field — a vendor-agnostic escape hatch
 	// (credit @eghrhegpe, #5063) for OpenAI-compatible providers we don't
@@ -134,6 +137,15 @@ func New(cfg provider.Config) (provider.Provider, error) {
 		default:
 			return nil, fmt.Errorf("openai: provider %q uses Zhipu thinking; effort must be enabled or disabled", name)
 		}
+	case longcat:
+		// LongCat exposes a binary thinking knob on its OpenAI-compatible endpoint:
+		// thinking.type=enabled|disabled. It documents reasoning text via
+		// reasoning_content, but not the generic reasoning_effort scale.
+		switch effort {
+		case "", "enabled", "disabled":
+		default:
+			return nil, fmt.Errorf("openai: provider %q uses LongCat thinking; effort must be enabled or disabled", name)
+		}
 	case ollamaCloud:
 		// Hosted Ollama Cloud uses top-level reasoning_effort. "none" and the
 		// legacy/off aliases intentionally omit the field, which lets the model
@@ -177,6 +189,7 @@ func New(cfg provider.Config) (provider.Provider, error) {
 		deepseek:     deepseek,
 		minimax:      minimax,
 		zhipu:        zhipu,
+		longcat:      longcat,
 		thinkingType: thinkingType,
 		vision:       vision,
 		visionDetail: visionDetail,
@@ -210,6 +223,7 @@ type client struct {
 	deepseek     bool
 	minimax      bool          // true for api.minimaxi.com — emits MiniMax-M3's thinking knob instead of reasoning_effort
 	zhipu        bool          // true for Zhipu GLM (bigmodel.cn / z.ai) — gates thinking via thinking.type, ignores reasoning_effort
+	longcat      bool          // true for LongCat — gates thinking via thinking.type, ignores reasoning_effort
 	thinkingType string        // explicit `thinking` config override (enabled|disabled); "" = no override
 	vision       bool          // model accepts image input — embed attached images as image_url parts
 	visionDetail string        // image_url detail hint (low|high); "" = auto/omit
@@ -222,6 +236,28 @@ type client struct {
 }
 
 func (c *client) Name() string { return c.name }
+
+func (c *client) RequiresToolCallReasoning() bool {
+	return c != nil && c.deepseek && c.thinkingType != "disabled"
+}
+
+func (c *client) WarnOnMissingToolCallReasoning() bool {
+	return c.RequiresToolCallReasoning() && expectsDeepSeekToolCallReasoning(c.model)
+}
+
+func expectsDeepSeekToolCallReasoning(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if !strings.Contains(model, "deepseek") || strings.Contains(model, "flash") {
+		return false
+	}
+	// "-pro" must end a name segment: a bare Contains would also match the
+	// deepseek-prover math models, which do not emit tool-call reasoning.
+	return strings.Contains(model, "reasoner") ||
+		strings.Contains(model, "deepseek-r1") ||
+		strings.HasSuffix(model, "-pro") ||
+		strings.Contains(model, "-pro-") ||
+		strings.Contains(model, "-pro.")
+}
 
 func (c *client) sendOpts() provider.SendOptions {
 	return provider.SendOptions{
@@ -451,11 +487,21 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 			ToolCallID: m.ToolCallID,
 			Name:       m.Name,
 		}
-		// DeepSeek thinking mode 400s a tool_calls turn whose reasoning_content was
-		// dropped on a cache-miss replay ("reasoning_content … must be passed back"),
-		// so round it back — but only on the turn that carries the tool calls.
+		// DeepSeek thinking mode 400s an assistant tool_calls turn whose
+		// reasoning_content KEY is absent from the request JSON ("reasoning_content
+		// … must be passed back"). The API accepts an empty string, and only
+		// validates turns after the last user message, but emitting the field on
+		// every tool_calls turn is uniform and verified accepted — so always send
+		// it (empty included) rather than fail the request when reasoning was lost
+		// upstream (e.g. a gateway renamed the field). With thinking disabled the
+		// API tolerates every shape, so keep the exact pre-fix bytes there: send
+		// the key only when a thinking-mode round left reasoning in the history
+		// (dropping it would invalidate the prompt-cache prefix of mixed
+		// thinking-on→off sessions for no gain).
 		if c.deepseek && m.Role == provider.RoleAssistant && len(m.ToolCalls) > 0 {
-			cm.ReasoningContent = m.ReasoningContent
+			if c.RequiresToolCallReasoning() || m.ReasoningContent != "" {
+				cm.ReasoningContent = &m.ReasoningContent
+			}
 		}
 		for _, tc := range m.ToolCalls {
 			wire := chatToolCall{ID: tc.ID, Type: "function"}
@@ -530,6 +576,19 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		}
 		if c.thinkingType != "" {
 			t = c.thinkingType // explicit `thinking` config overrides the effort knob
+		}
+		out.Thinking = &thinkingMode{Type: t}
+		out.ReasoningEffort = ""
+	case c.longcat:
+		// LongCat's binary thinking knob: "enabled" (default, thinking on) or
+		// "disabled". The API documents reasoning_content in OpenAI responses but
+		// not reasoning_effort, so keep depth out of the request.
+		t := c.effort
+		if t == "" {
+			t = c.thinkingType
+		}
+		if t == "" {
+			t = "enabled"
 		}
 		out.Thinking = &thinkingMode{Type: t}
 		out.ReasoningEffort = ""
@@ -639,9 +698,13 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 		}
 
 		delta := sr.Choices[0].Delta
-		if delta.ReasoningContent != "" {
+		reasoningDelta := delta.ReasoningContent
+		if reasoningDelta == "" {
+			reasoningDelta = delta.Reasoning
+		}
+		if reasoningDelta != "" {
 			emitted = true
-			if !sendChunk(ctx, out, provider.Chunk{Type: provider.ChunkReasoning, Text: delta.ReasoningContent}) {
+			if !sendChunk(ctx, out, provider.Chunk{Type: provider.ChunkReasoning, Text: reasoningDelta}) {
 				return emitted, ctx.Err()
 			}
 		}
@@ -814,8 +877,12 @@ type chatMessage struct {
 	// serializes as null (nil here); a string for every other text message
 	// (empty included — null is rejected by some backends for a tool message);
 	// and a []chatContentPart array for a vision user turn carrying images.
-	Content          any            `json:"content"`
-	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	Content any `json:"content"`
+	// A pointer so the field can serialize as an empty string: DeepSeek thinking
+	// mode requires the reasoning_content key to be PRESENT on assistant
+	// tool_calls turns (an empty value passes; a missing key 400s), while every
+	// other message must keep omitting it.
+	ReasoningContent *string        `json:"reasoning_content,omitempty"`
 	ToolCalls        []chatToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
 	Name             string         `json:"name,omitempty"`
@@ -869,6 +936,7 @@ type streamResponse struct {
 		Delta struct {
 			Content          string         `json:"content"`
 			ReasoningContent string         `json:"reasoning_content"`
+			Reasoning        string         `json:"reasoning"`
 			ToolCalls        []chatToolCall `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`

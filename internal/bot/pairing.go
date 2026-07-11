@@ -9,9 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"reasonix/internal/config"
+	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 )
 
 const (
@@ -42,6 +45,12 @@ type PairingRequest struct {
 type pairingFile struct {
 	Requests []PairingRequest `json:"requests"`
 }
+
+// pairingMu serializes every load-modify-save of the pairing store, so
+// concurrent adapter dispatch goroutines (offerPairing) and CLI approve/reject
+// can't interleave RMWs and drop each other's requests. It must not be held
+// across user-config edits (see ApprovePairingCode).
+var pairingMu sync.Mutex
 
 func NormalizePairingConfig(cfg PairingConfig) PairingConfig {
 	if cfg.RequestTTL <= 0 {
@@ -76,6 +85,8 @@ func CreateOrRefreshPairingRequest(msg InboundMessage, cfg PairingConfig) (Pairi
 	if path == "" {
 		return PairingRequest{}, false, errors.New("reasonix user state directory is unavailable")
 	}
+	pairingMu.Lock()
+	defer pairingMu.Unlock()
 	store, err := loadPairingFile(path)
 	if err != nil {
 		return PairingRequest{}, false, err
@@ -121,6 +132,8 @@ func ListPairingRequests() ([]PairingRequest, error) {
 	if path == "" {
 		return nil, errors.New("reasonix user state directory is unavailable")
 	}
+	pairingMu.Lock()
+	defer pairingMu.Unlock()
 	store, err := loadPairingFile(path)
 	if err != nil {
 		return nil, err
@@ -145,6 +158,8 @@ func ApprovePairingCode(code string) (PairingRequest, error) {
 	if userPath == "" {
 		return PairingRequest{}, errors.New("reasonix user config path is unavailable")
 	}
+	unlock := config.LockUserConfigEdits()
+	defer unlock()
 	cfg := config.LoadForEdit(userPath)
 	if approvePairingForConnectionAccess(&cfg.Bot, req) {
 		if err := cfg.SaveTo(userPath); err != nil {
@@ -256,6 +271,8 @@ func removePairingCode(code string) (PairingRequest, error) {
 	if path == "" {
 		return PairingRequest{}, errors.New("reasonix user state directory is unavailable")
 	}
+	pairingMu.Lock()
+	defer pairingMu.Unlock()
 	store, err := loadPairingFile(path)
 	if err != nil {
 		return PairingRequest{}, err
@@ -280,7 +297,7 @@ func removePairingCode(code string) (PairingRequest, error) {
 
 func loadPairingFile(path string) (pairingFile, error) {
 	var store pairingFile
-	data, err := os.ReadFile(path)
+	data, err := fileencoding.ReadFileUTF8(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return store, nil
 	}
@@ -296,15 +313,14 @@ func loadPairingFile(path string) (pairingFile, error) {
 	return store, nil
 }
 
+// savePairingFile persists the store via tmpfile+rename so a crash or a
+// concurrent reader never observes a truncated pairing.json.
 func savePairingFile(path string, store pairingFile) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(store, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o600)
+	return fileutil.AtomicWriteFile(path, append(data, '\n'), 0o600)
 }
 
 func pruneExpiredPairingRequests(reqs []PairingRequest, now time.Time) []PairingRequest {

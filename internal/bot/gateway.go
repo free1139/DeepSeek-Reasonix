@@ -59,6 +59,11 @@ type GatewayConfig struct {
 	// The gateway updates the live session and in-memory defaults first; this
 	// callback lets desktop save the chosen connection mode to user config.
 	OnToolApprovalModeChange func(InboundMessage, string) error
+	// Desktop, when the gateway is embedded in the desktop app, gives bot
+	// chats a god view over desktop sessions (/desktop commands): global
+	// status, event subscriptions, and remote approvals for any live desktop
+	// session. Nil when the gateway runs standalone (reasonix bot start).
+	Desktop DesktopBridge
 }
 
 // ChannelConfig overrides gateway defaults for one IM channel.
@@ -355,8 +360,12 @@ func (gw *BotGateway) Start(ctx context.Context) error {
 		gw.markAdapterStarted(binding)
 		started = append(started, binding)
 	}
+	// SendToAdapter reads gw.adapters under gw.mu; publish the started set under
+	// the same lock.
+	gw.mu.Lock()
 	gw.adapters = started
 	gw.startErr = startErr
+	gw.mu.Unlock()
 	if len(started) == 0 && len(startErr) > 0 {
 		return errors.Join(startErr...)
 	}
@@ -505,15 +514,16 @@ func (gw *BotGateway) ensureAdapterHealthLocked(binding AdapterBinding) *Adapter
 
 // Stop 停止所有适配器并关闭所有 session。
 func (gw *BotGateway) Stop() {
+	var states []*sessionState
 	gw.mu.Lock()
 	for key, state := range gw.controllers {
-		if state.cancel != nil {
-			state.cancel()
-		}
-		state.ctrl.Close()
+		states = append(states, state)
 		delete(gw.controllers, key)
 	}
 	gw.mu.Unlock()
+	for _, state := range states {
+		closeBotSessionState(state)
+	}
 
 	for _, binding := range gw.adapters {
 		if err := binding.Adapter.Stop(); err != nil {
@@ -599,6 +609,13 @@ func (gw *BotGateway) handleMessage(ctx context.Context, binding AdapterBinding,
 		return
 	}
 
+	// 已接管桌面会话的聊天：普通消息直接驱动那个桌面会话，不进 bot 自己的
+	// 会话机器（斜杠命令仍走上面的分支，/desktop release 永远可达）。
+	if gw.divertToDesktopTakeover(ctx, binding.Adapter, msg) {
+		gw.logger.Info("bot message diverted to desktop takeover", logFields...)
+		return
+	}
+
 	cleanup := gw.addPendingReaction(ctx, binding.Platform, binding.Adapter, msg)
 
 	queueMode := gw.queueMode(key, msg)
@@ -666,7 +683,7 @@ func (gw *BotGateway) queueMode(key string, msg InboundMessage) string {
 
 func (gw *BotGateway) steerActiveSession(ctx context.Context, adapter Adapter, key string, msg InboundMessage) bool {
 	text := strings.TrimSpace(msg.Text)
-	if text == "" && len(msg.MediaURLs) == 0 {
+	if text == "" && len(msg.MediaURLs) == 0 && len(msg.Media) == 0 {
 		return false
 	}
 	gw.mu.Lock()
@@ -684,14 +701,20 @@ func (gw *BotGateway) steerActiveSession(ctx context.Context, adapter Adapter, k
 }
 
 func (gw *BotGateway) cancelActiveSession(key string) {
+	// state.cancel is rewritten under gw.mu on every turn (runTurn), so copy it
+	// inside the lock and invoke it outside.
+	var cancel context.CancelFunc
 	gw.mu.Lock()
 	state, ok := gw.controllers[key]
+	if ok && state != nil {
+		cancel = state.cancel
+	}
 	gw.mu.Unlock()
 	if !ok || state == nil {
 		return
 	}
-	if state.cancel != nil {
-		state.cancel()
+	if cancel != nil {
+		cancel()
 		return
 	}
 	if state.ctrl != nil {
@@ -1091,25 +1114,42 @@ func (gw *BotGateway) currentPendingAskIDForReply(key string) string {
 func (gw *BotGateway) handleSlashCommand(ctx context.Context, adapter Adapter, key string, msg InboundMessage) {
 	switch {
 	case strings.HasPrefix(msg.Text, "/stop"):
+		var cancel context.CancelFunc
 		gw.mu.Lock()
-		state, ok := gw.controllers[key]
+		if state, ok := gw.controllers[key]; ok {
+			cancel = state.cancel
+		}
 		gw.mu.Unlock()
-		if ok && state.cancel != nil {
-			state.cancel()
+		if cancel != nil {
+			cancel()
 		}
 		gw.sessions.ForceRelease(key)
 		_ = gw.sendText(ctx, adapter, msg, "已停止当前任务。")
 
 	case strings.HasPrefix(msg.Text, "/new") || strings.HasPrefix(msg.Text, "/reset"):
+		var cancel context.CancelFunc
 		gw.mu.Lock()
 		state, ok := gw.controllers[key]
+		if ok {
+			cancel = state.cancel
+		}
 		gw.mu.Unlock()
 		if ok {
-			if state.cancel != nil {
-				state.cancel()
+			if cancel != nil {
+				cancel()
+			}
+			// NewSession refuses to rotate while a turn is running; the cancel
+			// above is asynchronous, so give the turn a bounded window to
+			// unwind before rotating.
+			deadline := time.Now().Add(5 * time.Second)
+			for state.ctrl.Running() && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
 			}
 			if err := state.ctrl.NewSession(); err != nil {
 				gw.logger.Warn("new session failed", "err", err)
+				gw.sessions.ForceRelease(key)
+				_ = gw.sendText(ctx, adapter, msg, "新会话创建失败，请稍后重试。")
+				return
 			}
 			gw.rememberSessionReady(msg, state.ctrl)
 		}
@@ -1257,6 +1297,15 @@ func (gw *BotGateway) handleSlashCommand(ctx context.Context, adapter Adapter, k
 		}
 		_ = gw.sendText(ctx, adapter, msg, gw.handleProjectSearchCommand(ctx, msg.Text))
 
+	case strings.HasPrefix(msg.Text, "/desktop"):
+		// God view over the embedding desktop app: listing every live desktop
+		// session and answering its approvals is strictly more power than the
+		// per-session approver role, so gate on admin.
+		if !gw.requireCommandRole(ctx, adapter, msg, "admin") {
+			return
+		}
+		_ = gw.sendText(ctx, adapter, msg, gw.handleDesktopCommand(msg))
+
 	case strings.HasPrefix(msg.Text, "/status"):
 		active := gw.sessions.ActiveCount()
 		pending := gw.sessions.PendingCount(key)
@@ -1282,6 +1331,7 @@ func (gw *BotGateway) handleSlashCommand(ctx context.Context, adapter Adapter, k
 			"/sessions search <关键词> - 搜索可 attach 的历史会话\n" +
 			"/attach session <id|关键词> - 绑定当前远端会话到已有历史会话\n" +
 			"/search all <关键词> - 跨已索引项目检索文件内容\n" +
+			"/desktop status|watch|approve|deny|answer - 桌面端上帝视角(需内嵌运行)\n" +
 			"/status - 查看状态\n" +
 			"/help - 显示帮助"
 		_ = gw.sendText(ctx, adapter, msg, help)
@@ -1664,7 +1714,13 @@ func (gw *BotGateway) runTurn(ctx context.Context, adapter Adapter, key string, 
 	// 构建输入文本：群聊中在消息前加上发送者名，并把 IM 媒体保存为 @附件引用。
 	input := gw.inputTextWithMedia(ctx, adapter, msg, state)
 	if msg.ChatType == ChatGroup {
-		input = fmt.Sprintf("[%s] %s", msg.UserName, input)
+		userName := strings.TrimSpace(msg.UserName)
+		if msg.ResolveUserName != nil {
+			if resolved := strings.TrimSpace(msg.ResolveUserName(ctx)); resolved != "" {
+				userName = resolved
+			}
+		}
+		input = fmt.Sprintf("[%s] %s", userName, input)
 	}
 
 	// 发送"正在输入"状态
@@ -1727,7 +1783,7 @@ func (gw *BotGateway) runTurn(ctx context.Context, adapter Adapter, key string, 
 
 func (gw *BotGateway) inputTextWithMedia(ctx context.Context, adapter Adapter, msg InboundMessage, state *sessionState) string {
 	input := msg.Text
-	if len(msg.MediaURLs) == 0 {
+	if len(msg.MediaURLs) == 0 && len(msg.Media) == 0 {
 		return input
 	}
 	workspaceRoot := ""
@@ -1738,11 +1794,14 @@ func (gw *BotGateway) inputTextWithMedia(ctx context.Context, adapter Adapter, m
 		_, workspaceRoot, _ = gw.sessionOptionsForMessage(msg)
 	}
 	refs, errs := saveInboundMedia(ctx, workspaceRoot, msg.MediaURLs)
+	itemRefs, fallbacks, itemErrs := saveInboundMediaItems(ctx, workspaceRoot, msg.Media)
+	refs = append(refs, itemRefs...)
+	errs = append(errs, itemErrs...)
 	if len(errs) > 0 {
 		gw.logger.Warn("bot media attachment failed", "platform", msg.Platform, "chat", hashID(msg.ChatID), "errors", len(errs))
 		_ = gw.sendText(ctx, adapter, msg, fmt.Sprintf("有 %d 个附件保存失败；我会先处理可用内容。", len(errs)))
 	}
-	return appendMediaRefs(input, refs)
+	return appendMediaRefs(appendMediaFallbacks(input, fallbacks), refs)
 }
 
 func (gw *BotGateway) getOrCreateSession(ctx context.Context, key string, msg InboundMessage) *sessionState {
@@ -1984,27 +2043,37 @@ func botSessionTarget(sessionPath string) string {
 }
 
 func (gw *BotGateway) sessionOptionsForMessage(msg InboundMessage) (model string, workspaceRoot string, toolApprovalMode string) {
+	// cfg.ToolApprovalMode / Channels / ConnectionChannels are rewritten under
+	// gw.mu at runtime (/yolo, UpdateConnectionToolApprovalMode), so snapshot them
+	// under a short lock and resolve outside it — applyRuntimeOverrideOptions
+	// takes gw.mu itself. Copying the ChannelConfig value is enough: writers
+	// replace whole map entries and never mutate SessionMappings in place.
+	gw.mu.Lock()
 	model = gw.cfg.Model
 	workspaceRoot = gw.cfg.WorkspaceRoot
 	toolApprovalMode = normalizeBotToolApprovalMode(gw.cfg.ToolApprovalMode)
-	var mappings []SessionMapping
-	if gw.cfg.ConnectionChannels != nil && msg.ConnectionID != "" {
-		if channel, ok := gw.cfg.ConnectionChannels[msg.ConnectionID]; ok {
-			applyBotChannelOptions(channel, &model, &workspaceRoot, &toolApprovalMode)
-			mappings = channel.SessionMappings
-			if mapping, ok := matchingSessionMapping(mappings, msg); ok {
-				workspaceRoot = workspaceRootForSessionMapping(mapping, workspaceRoot)
-			}
-			model, workspaceRoot, toolApprovalMode = gw.applyRouteOptions(msg, model, workspaceRoot, toolApprovalMode)
-			model, workspaceRoot, toolApprovalMode = gw.applyRuntimeOverrideOptions(msg, model, workspaceRoot, toolApprovalMode)
-			return model, workspaceRoot, toolApprovalMode
-		}
+	var connChannel ChannelConfig
+	connOK := false
+	if msg.ConnectionID != "" {
+		connChannel, connOK = gw.cfg.ConnectionChannels[msg.ConnectionID]
 	}
-	if gw.cfg.Channels != nil {
-		if channel, ok := gw.cfg.Channels[msg.Platform]; ok {
-			applyBotChannelOptions(channel, &model, &workspaceRoot, &toolApprovalMode)
-			mappings = channel.SessionMappings
+	platChannel, platOK := gw.cfg.Channels[msg.Platform]
+	gw.mu.Unlock()
+
+	var mappings []SessionMapping
+	if connOK {
+		applyBotChannelOptions(connChannel, &model, &workspaceRoot, &toolApprovalMode)
+		mappings = connChannel.SessionMappings
+		if mapping, ok := matchingSessionMapping(mappings, msg); ok {
+			workspaceRoot = workspaceRootForSessionMapping(mapping, workspaceRoot)
 		}
+		model, workspaceRoot, toolApprovalMode = gw.applyRouteOptions(msg, model, workspaceRoot, toolApprovalMode)
+		model, workspaceRoot, toolApprovalMode = gw.applyRuntimeOverrideOptions(msg, model, workspaceRoot, toolApprovalMode)
+		return model, workspaceRoot, toolApprovalMode
+	}
+	if platOK {
+		applyBotChannelOptions(platChannel, &model, &workspaceRoot, &toolApprovalMode)
+		mappings = platChannel.SessionMappings
 	}
 	if mapping, ok := matchingSessionMapping(mappings, msg); ok {
 		workspaceRoot = workspaceRootForSessionMapping(mapping, workspaceRoot)
@@ -2179,8 +2248,8 @@ func (gw *BotGateway) sendViaAdapter(ctx context.Context, binding AdapterBinding
 	}
 	result, err := binding.Adapter.Send(ctx, msg)
 	gw.markAdapterSend(binding, err)
-	if err == nil {
-		gw.rememberOutboundMessage(binding.Platform, binding.ID, binding.Domain, msg.ChatID, result.MessageID)
+	for _, messageID := range result.DeliveredMessageIDs() {
+		gw.rememberOutboundMessage(binding.Platform, binding.ID, binding.Domain, msg.ChatID, messageID)
 	}
 	return result, err
 }

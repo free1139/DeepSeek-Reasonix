@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/secrets"
 )
 
 const (
@@ -63,6 +64,9 @@ func (gw *BotGateway) buildProjectIndex() []botProjectEntry {
 	collector := newBotProjectCollector()
 	collector.add(gw.cfg.WorkspaceRoot, "default")
 
+	// cfg.Channels / cfg.ConnectionChannels are rewritten under gw.mu at runtime,
+	// so the whole scan shares the controllers critical section below.
+	gw.mu.Lock()
 	platforms := make([]string, 0, len(gw.cfg.Channels))
 	for platform := range gw.cfg.Channels {
 		platforms = append(platforms, string(platform))
@@ -91,7 +95,6 @@ func (gw *BotGateway) buildProjectIndex() []botProjectEntry {
 		collector.add(route.Channel.WorkspaceRoot, fmt.Sprintf("route:%d", i+1))
 	}
 
-	gw.mu.Lock()
 	for key, state := range gw.controllers {
 		root := ""
 		if state != nil {
@@ -175,6 +178,10 @@ func (gw *BotGateway) buildSessionIndex(projects []botProjectEntry) []botSession
 	}
 	collector := newBotSessionCollector(projectByRoot)
 
+	// cfg.Channels / cfg.ConnectionChannels are rewritten under gw.mu at runtime;
+	// collect the mapping-derived entries under a short lock, keeping the
+	// filesystem scan below outside it.
+	gw.mu.Lock()
 	platforms := make([]string, 0, len(gw.cfg.Channels))
 	for platform := range gw.cfg.Channels {
 		platforms = append(platforms, string(platform))
@@ -194,6 +201,7 @@ func (gw *BotGateway) buildSessionIndex(projects []botProjectEntry) []botSession
 		channel := gw.cfg.ConnectionChannels[id]
 		addMappingSessions(collector, channel, id, "connection:"+id)
 	}
+	gw.mu.Unlock()
 
 	for _, project := range projects {
 		dir := botSessionDir(project.Root)
@@ -609,6 +617,7 @@ func searchBotProjectsWithRG(ctx context.Context, rg string, projects []botProje
 	}
 	args = append(args, roots...)
 	cmd := exec.CommandContext(ctx, rg, args...)
+	cmd.Env = secrets.ProcessEnv()
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/store"
 )
 
@@ -37,9 +38,15 @@ type BranchMeta struct {
 	Recovered        bool      `json:"recovered,omitempty"`
 	RecoveryReason   string    `json:"recovery_reason,omitempty"`
 	RecoveryDigest   string    `json:"recovery_digest,omitempty"`
-	Revision         int64     `json:"revision,omitempty"`
-	ContentDigest    string    `json:"content_digest,omitempty"`
-	WriterID         string    `json:"writer_id,omitempty"`
+	// RecoveryDepth counts how many recovery forks separate this branch from a
+	// normal session (1 = forked from a normal session). SaveRecoveryBranch
+	// refuses to fork past SessionRecoveryMaxDepth so a conflict loop cannot
+	// spawn unbounded nested recovery chains (#5993 reached 8 levels). Legacy
+	// recovery metas without the field are treated as depth 1.
+	RecoveryDepth int    `json:"recovery_depth,omitempty"`
+	Revision      int64  `json:"revision,omitempty"`
+	ContentDigest string `json:"content_digest,omitempty"`
+	WriterID      string `json:"writer_id,omitempty"`
 	// SchemaVersion records the BranchMeta version that last wrote the listing
 	// fields (Turns/Preview) FROM the session's content. It is stamped only by the
 	// writers that actually derive those counts — Controller.snapshot's
@@ -114,7 +121,7 @@ func LoadBranchMeta(sessionPath string) (BranchMeta, bool, error) {
 	if metaPath == "" {
 		return BranchMeta{}, false, nil
 	}
-	b, err := os.ReadFile(metaPath)
+	b, err := fileencoding.ReadFileUTF8(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return BranchMeta{}, false, nil
@@ -129,6 +136,32 @@ func LoadBranchMeta(sessionPath string) (BranchMeta, bool, error) {
 		m.ID = BranchID(sessionPath)
 	}
 	return m, true, nil
+}
+
+// branchMetaReadBackoffs paces the re-reads of a branch-meta sidecar that
+// failed to load. On Windows fileutil.ReplaceFile can fall back to a
+// non-atomic in-place copy, so a concurrent reader may catch the sidecar
+// half-written (an open/read error or truncated JSON). Those tears heal in
+// milliseconds; a few short retries separate them from real corruption.
+var branchMetaReadBackoffs = []time.Duration{20 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
+
+// loadBranchMetaRetry reads the branch-meta sidecar like LoadBranchMeta but
+// retries transient failures (I/O errors and undecodable JSON) before giving
+// up. A missing sidecar is a legitimate state — a session that has never
+// recorded meta — and returns ok=false immediately without retrying.
+func loadBranchMetaRetry(sessionPath string) (BranchMeta, bool, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		meta, ok, err := LoadBranchMeta(sessionPath)
+		if err == nil {
+			return meta, ok, nil
+		}
+		lastErr = err
+		if attempt >= len(branchMetaReadBackoffs) {
+			return BranchMeta{}, false, lastErr
+		}
+		time.Sleep(branchMetaReadBackoffs[attempt])
+	}
 }
 
 func SaveBranchMeta(sessionPath string, m BranchMeta) error {
@@ -226,6 +259,8 @@ func EnsureBranchMeta(sessionPath string) (BranchMeta, error) {
 }
 
 func TouchBranchMeta(sessionPath string) error {
+	unlock := lockSessionSavePath(sessionPath)
+	defer unlock()
 	m, err := EnsureBranchMeta(sessionPath)
 	if err != nil {
 		return err
@@ -238,6 +273,11 @@ func MarkSessionInFlightTurn(sessionPath string, startMessageIndex int, preserve
 	if startMessageIndex < 0 {
 		startMessageIndex = 0
 	}
+	// The sidecar is read-modify-write; the per-path save lock keeps concurrent
+	// writers (autosave's UpdateSessionMeta, listing backfill) from dropping
+	// each other's fields.
+	unlock := lockSessionSavePath(sessionPath)
+	defer unlock()
 	m, err := EnsureBranchMeta(sessionPath)
 	if err != nil {
 		return err
@@ -251,6 +291,8 @@ func MarkSessionInFlightTurn(sessionPath string, startMessageIndex int, preserve
 }
 
 func ClearSessionInFlightTurn(sessionPath string) error {
+	unlock := lockSessionSavePath(sessionPath)
+	defer unlock()
 	m, ok, err := LoadBranchMeta(sessionPath)
 	if err != nil || !ok {
 		return err
@@ -272,7 +314,7 @@ func ListBranches(dir string) ([]BranchInfo, error) {
 	}
 	var out []BranchInfo
 	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
+		if e.IsDir() || !store.IsSessionTranscriptName(e.Name()) {
 			continue
 		}
 		info, err := e.Info()
@@ -326,6 +368,11 @@ func RenameSession(sessionPath string, title string) error {
 	if sessionPath == "" {
 		return fmt.Errorf("empty session path")
 	}
+	// Read-modify-write on the sidecar: hold the per-path meta lock so a
+	// concurrent save (recordSessionContentRevision) can't have its Revision
+	// bump clobbered by a stale read-back here.
+	unlock := lockSessionSavePath(sessionPath)
+	defer unlock()
 	m, err := EnsureBranchMeta(sessionPath)
 	if err != nil {
 		return err
@@ -354,6 +401,8 @@ func SetBranchModelPreserveUpdated(sessionPath, model string) error {
 	if sessionPath == "" {
 		return fmt.Errorf("empty session path")
 	}
+	unlock := lockSessionSavePath(sessionPath)
+	defer unlock()
 	meta, err := EnsureBranchMeta(sessionPath)
 	if err != nil {
 		return err
@@ -371,6 +420,8 @@ func UpdateSessionMeta(sessionPath, model, preview string, turns int, markActivi
 	if sessionPath == "" {
 		return fmt.Errorf("empty session path")
 	}
+	unlock := lockSessionSavePath(sessionPath)
+	defer unlock()
 	m, err := EnsureBranchMeta(sessionPath)
 	if err != nil {
 		return err

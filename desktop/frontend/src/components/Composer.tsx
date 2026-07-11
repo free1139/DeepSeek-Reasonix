@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
+import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { ArrowUp, Check, ChevronDown, ChevronUp, ChevronsUpDown, CornerDownRight, Eye, FileText, Folder, Gauge, List, MessageSquare, Search, Shield, ShieldAlert, ShieldCheck, SlidersHorizontal, Square, Target, Trash2, X } from "lucide-react";
 import { asArray } from "../lib/array";
 import { filterAtMatches } from "../lib/atMatches";
@@ -8,11 +8,11 @@ import { app, onFilesDropped } from "../lib/bridge";
 import { canUsePromptHistory, isFnKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
 import { cacheGeneration, loadOlder } from "../lib/composerHistory";
 import { SPINNER_WORDS, useI18n } from "../lib/i18n";
-import { detectShortcutPlatform, matchesShortcut } from "../lib/keyboardShortcuts";
+import { detectShortcutPlatform, formatShortcutCombo, matchesShortcut } from "../lib/keyboardShortcuts";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
 import { createRafResizeUpdater } from "../lib/resizeDrag";
 import { useToast } from "../lib/toast";
-import { type CollaborationMode, type CommandInfo, type ComposerInsertRequest, type DirEntry, type EffortInfo, type HistoryMessage, type Mode, type PromptHistoryEntry, type SessionMeta, type SessionReference, type SlashArgItem, type SlashArgsResult, type TokenMode, type ToolApprovalMode } from "../lib/types";
+import { type CollaborationMode, type CommandInfo, type ComposerInsertRequest, type ContextInfo, type DirEntry, type EffortInfo, type HistoryMessage, type Mode, type PromptHistoryEntry, type SessionMeta, type SessionReference, type SlashArgItem, type SlashArgsResult, type TokenMode, type ToolApprovalMode, type BalanceInfo } from "../lib/types";
 import {
   formatWorkspaceReference,
   parseWorkspaceReference,
@@ -26,10 +26,11 @@ import { EffortSwitcher } from "./EffortSwitcher";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { Tooltip } from "./Tooltip";
 import { ComposerContextCard } from "./ComposerContextCard";
+import { ContextWindowRing } from "./ContextWindowRing";
 import { ImageViewer } from "./ImageViewer";
 import { VirtualMenu } from "./VirtualMenu";
 import { dirEntryMenuLabel, dirEntrySubmitPath } from "./FileReferenceMenu";
-
+import { ContextMenu, contextMenuPointFromEvent, type ContextMenuItem, type ContextMenuPoint } from "./ContextMenu";
 interface Attachment {
   path: string;
   previewUrl?: string;
@@ -51,6 +52,9 @@ const LONG_PASTE_MIN_CHARS = 2000;
 const LONG_PASTE_MIN_LINES = 20;
 const COMPOSER_MIN_HEIGHT = 104;
 const COMPOSER_MAX_HEIGHT = 360;
+// Height reserved for the in-card run strip while a turn runs; applied via a
+// CSS calc so --composer-height always stays in "logical height" space.
+const COMPOSER_RUN_STRIP_RESERVED = 30;
 const COMPOSER_MAX_VIEWPORT_RATIO = 0.4;
 const COMPOSER_AUTO_RESERVED_HEIGHT = 58;
 const PROMPT_HISTORY_PREFETCH_REMAINING = 3;
@@ -87,6 +91,11 @@ type ComposerDraft = {
   nextPasteId: number;
   historyIndex: number;
   savedText: string;
+  pendingGuidance: PendingGuidance[];
+  guidanceExpanded: boolean;
+  guidanceSendingId: number | null;
+  pendingPaste: number;
+  submitting: boolean;
 };
 
 type WebkitFileEntry = {
@@ -173,6 +182,11 @@ function emptyComposerDraft(): ComposerDraft {
     nextPasteId: 1,
     historyIndex: -1,
     savedText: "",
+    pendingGuidance: [],
+    guidanceExpanded: false,
+    guidanceSendingId: null,
+    pendingPaste: 0,
+    submitting: false,
   };
 }
 
@@ -195,6 +209,11 @@ function cloneComposerDraft(draft: ComposerDraft): ComposerDraft {
     nextPasteId: draft.nextPasteId,
     historyIndex: draft.historyIndex,
     savedText: draft.savedText,
+    pendingGuidance: draft.pendingGuidance.map((item) => ({ ...item })),
+    guidanceExpanded: draft.guidanceExpanded,
+    guidanceSendingId: draft.guidanceSendingId,
+    pendingPaste: draft.pendingPaste,
+    submitting: draft.submitting,
   };
 }
 
@@ -250,9 +269,50 @@ async function dataURLHash(dataUrl: string): Promise<string> {
   }
 }
 
+function fallbackCopyText(value: string): boolean {
+  const activeElement = document.activeElement;
+  const selection = document.getSelection();
+  const ranges: Range[] = [];
+  if (selection) {
+    for (let index = 0; index < selection.rangeCount; index += 1) {
+      ranges.push(selection.getRangeAt(index));
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.inset = "0 auto auto 0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } finally {
+    textarea.remove();
+    if (selection) {
+      selection.removeAllRanges();
+      for (const range of ranges) selection.addRange(range);
+    }
+    if (activeElement instanceof HTMLElement) activeElement.focus();
+  }
+  return ok;
+}
+
 function composerMaxHeight(): number {
   if (typeof window === "undefined") return COMPOSER_MAX_HEIGHT;
   return Math.max(COMPOSER_MIN_HEIGHT, Math.min(COMPOSER_MAX_HEIGHT, Math.floor(window.innerHeight * COMPOSER_MAX_VIEWPORT_RATIO)));
+}
+
+// The rendered card includes the run strip while a turn runs; subtract it to
+// recover the user's logical height when measuring from the DOM.
+function composerLogicalHeight(card: HTMLElement): number {
+  const strip = card.querySelector(".composer-run-strip");
+  const stripHeight = strip ? strip.getBoundingClientRect().height : 0;
+  return card.getBoundingClientRect().height - stripHeight;
 }
 
 function clampComposerHeight(height: number): number {
@@ -430,6 +490,7 @@ export function Composer({
   tabId,
   effort,
   onSend,
+  onSteer,
   onCancel,
   onCycleMode,
   onSetMode,
@@ -449,12 +510,21 @@ export function Composer({
   turnStartAt,
   turnTokens,
   retry,
+  pendingApprovalLabel,
+  pendingAsk = false,
   transientDismissSignal,
   sessionKey,
+  workspaceScopeKey,
   fileRefRefreshKey,
   guidanceConsumedKey,
   guidanceConsumedText,
   guidanceQueuePreviewItems,
+  showContextWindowRing = false,
+  context,
+  turnCost,
+  cacheHitTokens,
+  cacheMissTokens,
+  balance,
 }: {
   running: boolean;
   collaborationMode: CollaborationMode;
@@ -466,7 +536,8 @@ export function Composer({
   imageInputEnabled?: boolean;
   tabId?: string;
   effort?: EffortInfo;
-  onSend: (displayText: string, submitText?: string) => void | Promise<void>;
+  onSend: (displayText: string, submitText?: string, tabId?: string) => void | Promise<void>;
+  onSteer?: (submitText: string, tabId?: string) => void | Promise<void>;
   // Returns the un-sent text when cancelling before the server replied (so it can
   // be restored to the input); undefined for a normal cancel.
   onCancel: () => string | undefined;
@@ -492,16 +563,29 @@ export function Composer({
   turnStartAt?: number;
   turnTokens?: number;
   retry?: { attempt: number; max: number };
+  // Resolved label of the tool waiting for approval (null/undefined when none);
+  // shifts the run strip into its waiting state so the ticking spinner does not
+  // claim the model is working while a prompt is blocked on the user.
+  pendingApprovalLabel?: string | null;
+  pendingAsk?: boolean;
   transientDismissSignal?: number;
   sessionKey?: string;
+  workspaceScopeKey?: string;
   fileRefRefreshKey?: number | string;
   guidanceConsumedKey?: string;
   guidanceConsumedText?: string;
   guidanceQueuePreviewItems?: readonly string[];
+  showContextWindowRing?: boolean;
+  context?: ContextInfo;
+  turnCost?: number;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
+  balance?: BalanceInfo;
 }) {
   const { t, locale } = useI18n();
   const { showToast } = useToast();
   const shortcutPlatform = useMemo(() => detectShortcutPlatform(), []);
+  const draftKey = sessionKey || tabId || DEFAULT_COMPOSER_DRAFT_KEY;
   const now = useTick(running);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -518,6 +602,7 @@ export function Composer({
   const [pastedBlocks, setPastedBlocks] = useState<PastedBlock[]>([]);
   const [openPastedLabels, setOpenPastedLabels] = useState<string[]>([]);
   const [pendingPaste, setPendingPaste] = useState(0);
+  const pendingPasteRef = useRef(0);
   const pastedBlocksRef = useRef<PastedBlock[]>([]);
   const nextPasteId = useRef(1);
   const [active, setActive] = useState(0);
@@ -538,9 +623,14 @@ export function Composer({
   const [pendingGuidance, setPendingGuidance] = useState<PendingGuidance[]>([]);
   const [guidanceExpanded, setGuidanceExpanded] = useState(false);
   const [guidanceSendingId, setGuidanceSendingId] = useState<number | null>(null);
+  const [guidanceDraftKey, setGuidanceDraftKey] = useState(draftKey);
+  const pendingGuidanceRef = useRef<PendingGuidance[]>([]);
+  const guidanceExpandedRef = useRef(false);
+  const guidanceSendingIdRef = useRef<number | null>(null);
   const nextGuidanceId = useRef(1);
   const [loadingPastChats, setLoadingPastChats] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [inputMenuPoint, setInputMenuPoint] = useState<ContextMenuPoint | null>(null);
   const [composerPrompt, setComposerPrompt] = useState<string | null>(null);
   // Prompt history navigation (plain ↑/↓)
   // Use refs for values read inside async closures to avoid stale captures
@@ -559,14 +649,16 @@ export function Composer({
   const moreMenuAnchorRef = useRef<HTMLButtonElement>(null);
   const intentCloseTimerRef = useRef<number | null>(null);
   const moreCloseTimerRef = useRef<number | null>(null);
-  const wasRunning = useRef(running);
+  const wasRunningByDraftRef = useRef<Record<string, boolean>>({ [draftKey]: running });
   const composingRef = useRef(false);
   const lastCompositionEndAt = useRef(0);
   const lastSelectionRef = useRef({ start: 0, end: 0 });
-  const consumedInsertIdRef = useRef(0);
+  const consumedInsertIdByDraftRef = useRef<Record<string, number>>({});
   const lastTransientDismissSignal = useRef(transientDismissSignal);
-  const lastGuidanceConsumedKey = useRef(guidanceConsumedKey);
-  const selfDispatchedGuidanceRef = useRef<string[]>([]);
+  const lastGuidanceConsumedKeyByDraftRef = useRef<Record<string, string | undefined>>(
+    guidanceConsumedKey ? { [draftKey]: guidanceConsumedKey } : {},
+  );
+  const selfDispatchedGuidanceByDraftRef = useRef<Record<string, string[]>>({});
   const submittingRef = useRef(false);
   const nativeClipboardPasteTimerRef = useRef<number | null>(null);
   // Snapshot of the current cwd so async callbacks (openPastChats) can detect
@@ -575,7 +667,6 @@ export function Composer({
   cwdRef.current = cwd;
   const attachmentDedupRef = useRef(new DedupIndex());
   const attachmentDedupKeysRef = useRef<Record<string, AttachmentDedupKey>>({});
-  const draftKey = sessionKey || tabId || DEFAULT_COMPOSER_DRAFT_KEY;
   const guidanceQueuePreviewKey = (guidanceQueuePreviewItems ?? []).map((item) => item.trim()).filter(Boolean).join("\n");
   const draftsBySessionRef = useRef<Record<string, ComposerDraft>>({});
   const activeDraftKeyRef = useRef(draftKey);
@@ -590,6 +681,11 @@ export function Composer({
   pastedBlocksRef.current = pastedBlocks;
   openPastedLabelsRef.current = openPastedLabels;
   sessionRefsRef.current = sessionRefs;
+  pendingGuidanceRef.current = pendingGuidance;
+  guidanceExpandedRef.current = guidanceExpanded;
+  guidanceSendingIdRef.current = guidanceSendingId;
+  pendingPasteRef.current = pendingPaste;
+  submittingRef.current = submitting;
 
   const snapshotComposerDraft = (): ComposerDraft => ({
     text: textRef.current,
@@ -602,10 +698,20 @@ export function Composer({
     nextPasteId: nextPasteId.current,
     historyIndex: historyIndexRef.current,
     savedText: savedTextRef.current,
+    pendingGuidance: pendingGuidanceRef.current.map((item) => ({ ...item })),
+    guidanceExpanded: guidanceExpandedRef.current,
+    guidanceSendingId: guidanceSendingIdRef.current,
+    pendingPaste: pendingPasteRef.current,
+    submitting: submittingRef.current,
   });
 
   const restoreComposerDraft = (draft: ComposerDraft) => {
     const next = cloneComposerDraft(draft);
+    textRef.current = next.text;
+    attachmentsRef.current = next.attachments;
+    workspaceRefsRef.current = next.workspaceRefs;
+    openPastedLabelsRef.current = next.openPastedLabels;
+    sessionRefsRef.current = next.sessionRefs;
     setText(next.text);
     setAttachments(next.attachments);
     setWorkspaceRefs(next.workspaceRefs);
@@ -618,23 +724,97 @@ export function Composer({
     nextPasteId.current = next.nextPasteId;
     historyIndexRef.current = next.historyIndex;
     savedTextRef.current = next.savedText;
+    pendingGuidanceRef.current = next.pendingGuidance;
+    guidanceExpandedRef.current = next.guidanceExpanded;
+    guidanceSendingIdRef.current = next.guidanceSendingId;
+    pendingPasteRef.current = next.pendingPaste;
+    submittingRef.current = next.submitting;
+    setPendingGuidance(next.pendingGuidance);
+    setGuidanceExpanded(next.guidanceExpanded);
+    setGuidanceSendingId(next.guidanceSendingId);
+    setPendingPaste(next.pendingPaste);
+    setSubmitting(next.submitting);
     setHistoryIndex(next.historyIndex);
     lastSelectionRef.current = { start: next.text.length, end: next.text.length };
     setComposerPrompt(null);
     setShowPastChats(false);
     setPastChatQuery("");
+    setLoadingPastChats(false);
     setActive(0);
+    setInputMenuPoint(null);
+    setDragOver(false);
+    setImageViewer((current) => current.open ? { ...current, open: false } : current);
     setIntentMenuOpen(false);
     setIntentMenuClosing(false);
     setMoreMenuOpen(false);
     setMoreMenuClosing(false);
   };
 
+  const updatePendingGuidanceForDraft = (
+    targetDraftKey: string,
+    update: (items: PendingGuidance[]) => PendingGuidance[],
+  ) => {
+    if (targetDraftKey === activeDraftKeyRef.current) {
+      const next = update(pendingGuidanceRef.current);
+      pendingGuidanceRef.current = next;
+      setPendingGuidance(next);
+      return;
+    }
+    const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+    draft.pendingGuidance = update(draft.pendingGuidance);
+    draftsBySessionRef.current[targetDraftKey] = draft;
+  };
+
+  const updateGuidanceSendingIdForDraft = (targetDraftKey: string, next: number | null) => {
+    if (targetDraftKey === activeDraftKeyRef.current) {
+      guidanceSendingIdRef.current = next;
+      setGuidanceSendingId(next);
+      return;
+    }
+    const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+    draft.guidanceSendingId = next;
+    draftsBySessionRef.current[targetDraftKey] = draft;
+  };
+
+  const updatePendingPasteForDraft = (targetDraftKey: string, delta: number) => {
+    if (targetDraftKey === activeDraftKeyRef.current) {
+      const next = Math.max(0, pendingPasteRef.current + delta);
+      pendingPasteRef.current = next;
+      setPendingPaste(next);
+      return;
+    }
+    const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+    draft.pendingPaste = Math.max(0, draft.pendingPaste + delta);
+    draftsBySessionRef.current[targetDraftKey] = draft;
+  };
+
+  const updateSubmittingForDraft = (targetDraftKey: string, next: boolean) => {
+    if (targetDraftKey === activeDraftKeyRef.current) {
+      submittingRef.current = next;
+      setSubmitting(next);
+      return;
+    }
+    const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+    draft.submitting = next;
+    draftsBySessionRef.current[targetDraftKey] = draft;
+  };
+
+  const draftIsSubmitting = (targetDraftKey: string): boolean =>
+    targetDraftKey === activeDraftKeyRef.current
+      ? submittingRef.current
+      : Boolean(draftsBySessionRef.current[targetDraftKey]?.submitting);
+
+  const draftHasPendingPaste = (targetDraftKey: string): boolean =>
+    targetDraftKey === activeDraftKeyRef.current
+      ? pendingPasteRef.current > 0
+      : (draftsBySessionRef.current[targetDraftKey]?.pendingPaste ?? 0) > 0;
+
   useLayoutEffect(() => {
     const previousKey = activeDraftKeyRef.current;
     if (previousKey === draftKey) return;
     draftsBySessionRef.current[previousKey] = snapshotComposerDraft();
     activeDraftKeyRef.current = draftKey;
+    setGuidanceDraftKey(draftKey);
     restoreComposerDraft(draftsBySessionRef.current[draftKey] ?? emptyComposerDraft());
   }, [draftKey]);
 
@@ -653,8 +833,8 @@ export function Composer({
   useEffect(() => () => clearNativeClipboardPasteTimer(), []);
 
   useEffect(() => {
-    if (wasRunning.current && !running) {
-      setPendingGuidance([]);
+    const wasRunning = wasRunningByDraftRef.current[draftKey] ?? running;
+    if (wasRunning && !running) {
       setGuidanceExpanded(false);
       if (text.trim() === "") {
         pastedBlocksRef.current = [];
@@ -662,23 +842,40 @@ export function Composer({
         setOpenPastedLabels([]);
       }
     }
-    wasRunning.current = running;
-  }, [running, text]);
+    wasRunningByDraftRef.current[draftKey] = running;
+  }, [draftKey, running, text]);
+
+  // A message queued while a turn was running (without the explicit "guide"
+  // steer click) is the user's next turn, not scratch text to discard — send
+  // it once the turn is done. Gated on submitDisabled, not just running:
+  // if the turn ends while the controller is still activating/hydrating,
+  // App's onSend silently no-ops on !controllerReady, but sendQueuedGuidance
+  // still removes the item as if it had sent — so wait for submitDisabled to
+  // clear instead of firing into that no-op window (#6210 follow-up). Once
+  // both conditions hold, a successful send removes the head and starts a
+  // new turn, which flips `running` true then false again, re-running this
+  // effect to drain the shelf one item at a time; a failed send is left in
+  // place (dismissible via the trash button) rather than silently dropped.
+  // guidanceDraftKey identifies which session the rendered queue belongs to:
+  // during a tab switch React still renders once with the previous queue, and
+  // that stale render must never submit through the new session's onSend.
+  useEffect(() => {
+    if (guidanceDraftKey !== draftKey || running || submitDisabled) return;
+    const next = pendingGuidance[0];
+    if (next) void sendQueuedGuidance(next, draftKey);
+  }, [draftKey, guidanceDraftKey, running, submitDisabled, pendingGuidance]);
 
   useEffect(() => {
-    setPendingGuidance([]);
+    if (guidanceDraftKey !== draftKey || !running || !guidanceQueuePreviewKey) return;
     setGuidanceExpanded(false);
-  }, [draftKey]);
-
-  useEffect(() => {
-    if (!running || !guidanceQueuePreviewKey) return;
-    setGuidanceExpanded(false);
-    setPendingGuidance(
-      guidanceQueuePreviewKey
-        .split("\n")
-        .map((text) => ({ id: nextGuidanceId.current++, text, submitText: text })),
+    updatePendingGuidanceForDraft(
+      draftKey,
+      () =>
+        guidanceQueuePreviewKey
+          .split("\n")
+          .map((text) => ({ id: nextGuidanceId.current++, text, submitText: text })),
     );
-  }, [guidanceQueuePreviewKey, running]);
+  }, [draftKey, guidanceDraftKey, guidanceQueuePreviewKey, running]);
 
   useEffect(() => {
     if (guidanceExpanded && pendingGuidance.length <= 2) setGuidanceExpanded(false);
@@ -762,6 +959,8 @@ export function Composer({
   const [searchEntries, setSearchEntries] = useState<DirEntry[]>([]);
   const dirCache = useRef<Record<string, DirEntry[]>>({});
   const searchCache = useRef<Record<string, FileRefSearchCacheEntry>>({});
+  const fileRefTabId = tabId ?? "";
+  const fileRefScopeKey = workspaceScopeKey ?? `${fileRefTabId}\u0000${cwd ?? ""}`;
 
   const clearFileRefState = useCallback(() => {
     dirCache.current = {};
@@ -776,16 +975,14 @@ export function Composer({
     setDismissed(false);
   }, []);
 
-  // When the workspace/project changes (cwd prop), invalidate all @ mention
-  // state so the picker reloads candidates for the new project. Without this,
-  // dirCache/searchCache retain entries from the old project and the picker
-  // shows stale results (issue #3601).
-  const prevCwdRef = useRef(cwd);
+  // Controller/session changes invalidate @ mention state even when tab and
+  // workspace identities stay the same (saved-session rebinds and rebuilds).
+  const prevFileRefScopeRef = useRef(fileRefScopeKey);
   useEffect(() => {
-    if (prevCwdRef.current === cwd) return; // skip mount — state already initial
-    prevCwdRef.current = cwd;
+    if (prevFileRefScopeRef.current === fileRefScopeKey) return;
+    prevFileRefScopeRef.current = fileRefScopeKey;
     clearFileRefState();
-  }, [clearFileRefState, cwd]);
+  }, [clearFileRefState, fileRefScopeKey]);
 
   const prevFileRefRefreshKeyRef = useRef(fileRefRefreshKey);
   useEffect(() => {
@@ -804,7 +1001,7 @@ export function Composer({
     }
     let live = true;
     app
-      .ListDir(atDir)
+      .ListDirForTab(fileRefTabId, atDir)
       .then((es) => {
         const list = asArray(es);
         if (!live) return;
@@ -817,7 +1014,7 @@ export function Composer({
     };
     // Re-fetch when the menu opens, the directory level changes, or the
     // workspace tree refreshes; cached data is only a fast first paint.
-  }, [atRaw === null, atDir, cwd, fileRefRefreshKey]);
+  }, [atRaw === null, atDir, fileRefRefreshKey, fileRefScopeKey, fileRefTabId]);
   useEffect(() => {
     if (atRaw === null || atDir !== "" || atFrag === "") {
       setSearchEntries([]);
@@ -832,7 +1029,7 @@ export function Composer({
     }
     let live = true;
     app
-      .SearchFileRefs(atFrag)
+      .SearchFileRefsForTab(fileRefTabId, atFrag)
       .then((es) => {
         const list = asArray(es);
         if (!live) return;
@@ -843,7 +1040,7 @@ export function Composer({
     return () => {
       live = false;
     };
-  }, [atRaw === null, atDir, atFrag, cwd, fileRefRefreshKey]);
+  }, [atRaw === null, atDir, atFrag, fileRefRefreshKey, fileRefScopeKey, fileRefTabId]);
   const atMatches = useMemo(
     () => {
       if (atRaw === null) return [];
@@ -900,19 +1097,22 @@ export function Composer({
     setDismissed(true);
   }, [transientDismissSignal]);
 
-  const takeSelfDispatchedGuidance = useCallback((text: string): boolean => {
-    const idx = selfDispatchedGuidanceRef.current.findIndex((queued) => guidanceTextMatches(queued, text));
+  const takeSelfDispatchedGuidance = useCallback((text: string, targetDraftKey: string): boolean => {
+    const selfDispatched = selfDispatchedGuidanceByDraftRef.current[targetDraftKey] ?? [];
+    const idx = selfDispatched.findIndex((queued) => guidanceTextMatches(queued, text));
     if (idx < 0) return false;
-    selfDispatchedGuidanceRef.current.splice(idx, 1);
+    selfDispatched.splice(idx, 1);
+    if (selfDispatched.length === 0) delete selfDispatchedGuidanceByDraftRef.current[targetDraftKey];
     return true;
   }, []);
 
   useEffect(() => {
-    if (!guidanceConsumedKey || guidanceConsumedKey === lastGuidanceConsumedKey.current) return;
-    lastGuidanceConsumedKey.current = guidanceConsumedKey;
+    if (guidanceDraftKey !== draftKey || !guidanceConsumedKey) return;
+    if (guidanceConsumedKey === lastGuidanceConsumedKeyByDraftRef.current[draftKey]) return;
+    lastGuidanceConsumedKeyByDraftRef.current[draftKey] = guidanceConsumedKey;
     const consumed = (guidanceConsumedText ?? "").trim();
-    if (consumed && takeSelfDispatchedGuidance(consumed)) return;
-    setPendingGuidance((items) => {
+    if (consumed && takeSelfDispatchedGuidance(consumed, draftKey)) return;
+    updatePendingGuidanceForDraft(draftKey, (items) => {
       if (items.length === 0) return items;
       const idx = consumed
         ? items.findIndex((item) => guidanceTextMatches(item.submitText, consumed) || guidanceTextMatches(item.text, consumed))
@@ -920,7 +1120,7 @@ export function Composer({
       const removeAt = idx >= 0 ? idx : 0;
       return items.filter((_, index) => index !== removeAt);
     });
-  }, [guidanceConsumedKey, guidanceConsumedText, takeSelfDispatchedGuidance]);
+  }, [draftKey, guidanceDraftKey, guidanceConsumedKey, guidanceConsumedText, takeSelfDispatchedGuidance]);
 
   // When the @ trigger disappears (user deleted the @), close the past:chats
   // sub-menu and reset related state. Without this, showPastChats can outlive
@@ -1034,8 +1234,8 @@ export function Composer({
   };
 
   useEffect(() => {
-    if (!insertRequest || insertRequest.id === consumedInsertIdRef.current) return;
-    consumedInsertIdRef.current = insertRequest.id;
+    if (!insertRequest || insertRequest.id === consumedInsertIdByDraftRef.current[draftKey]) return;
+    consumedInsertIdByDraftRef.current[draftKey] = insertRequest.id;
     if (insertRequest.mode === "replace") {
       replaceComposerText(insertRequest.text);
       return;
@@ -1046,11 +1246,11 @@ export function Composer({
       return;
     }
     insertTextAtCaret(insertRequest.text);
-  }, [insertRequest]);
+  }, [draftKey, insertRequest]);
 
-  const expandPastedBlocks = (displayText: string): string => {
+  const expandPastedBlocks = (displayText: string, blocks = pastedBlocksRef.current): string => {
     let expanded = displayText;
-    for (const block of pastedBlocksRef.current) {
+    for (const block of blocks) {
       if (expanded.includes(block.label)) {
         expanded = expanded.split(block.label).join(renderPastedBlock(block));
       }
@@ -1216,11 +1416,13 @@ export function Composer({
   }, [showToast, t]);
 
   const submit = async () => {
-    if (disabled || (!running && submitDisabled) || readOnly || submittingRef.current) return;
+    if (disabled || (!running && submitDisabled) || readOnly) return;
     const submitDraftKey = activeDraftKeyRef.current;
+    const submitTabId = tabId;
+    if (draftIsSubmitting(submitDraftKey)) return;
     const currentText = textRef.current;
     const trimmedText = currentText.trim();
-    if (pendingPaste > 0) return;
+    if (draftHasPendingPaste(submitDraftKey)) return;
     if (!imageInputEnabled && hasImageAttachments(attachmentsRef.current)) {
       warnImageInputFallback();
     }
@@ -1234,8 +1436,7 @@ export function Composer({
       return;
     }
     setComposerPrompt(null);
-    submittingRef.current = true;
-    setSubmitting(true);
+    updateSubmittingForDraft(submitDraftKey, true);
     try {
       const orderedAttachments = sortComposerAttachments(currentAttachments);
       const refs = [
@@ -1252,47 +1453,60 @@ export function Composer({
       // original prompt in the input preview). With no refs we keep the original
       // submitText verbatim — no header, no rewording, byte-identical to pre-PR-B.
       const currentSessionRefs = sessionRefsRef.current;
+      const currentPastedBlocks = [...pastedBlocksRef.current];
       const sessionContext = currentSessionRefs.length === 0 ? "" : await buildSessionContext(currentSessionRefs);
-      const baseSubmitText = [expandPastedBlocks(trimmedText), refs].filter(Boolean).join(trimmedText && refs ? " " : "");
+      const baseSubmitText = [expandPastedBlocks(trimmedText, currentPastedBlocks), refs].filter(Boolean).join(trimmedText && refs ? " " : "");
       const submitText = sessionContext ? `${sessionContext}${baseSubmitText}` : baseSubmitText;
       if (running) {
         const guidanceText = displayText.trim();
         const guidanceSubmitText = submitText.trim();
         if (guidanceText) {
           const id = nextGuidanceId.current++;
-          setPendingGuidance((items) => [...items, { id, text: guidanceText, submitText: guidanceSubmitText || guidanceText }]);
+          updatePendingGuidanceForDraft(submitDraftKey, (items) => [
+            ...items,
+            { id, text: guidanceText, submitText: guidanceSubmitText || guidanceText },
+          ]);
         }
         clearSubmittedDraft(submitDraftKey);
         return;
       }
-      await onSend(displayText, submitText);
+      await onSend(displayText, submitText, submitTabId);
       clearSubmittedDraft(submitDraftKey);
     } catch (error) {
       showToast(error instanceof Error ? error.message : String(error), "warn");
     } finally {
-      submittingRef.current = false;
-      setSubmitting(false);
+      updateSubmittingForDraft(submitDraftKey, false);
     }
   };
 
-  const sendQueuedGuidance = async (item: PendingGuidance) => {
-    if (disabled || readOnly || guidanceSendingId !== null) return;
+  const sendQueuedGuidance = async (
+    item: PendingGuidance,
+    targetDraftKey = activeDraftKeyRef.current,
+    targetTabId = tabId,
+  ) => {
+    if (targetDraftKey !== activeDraftKeyRef.current || disabled || readOnly || guidanceSendingIdRef.current !== null) return;
     const displayText = item.text.trim();
     const submitText = item.submitText.trim() || displayText;
     if (!displayText || !submitText) return;
-    selfDispatchedGuidanceRef.current.push(submitText);
-    setGuidanceSendingId(item.id);
+    const selfDispatched = selfDispatchedGuidanceByDraftRef.current[targetDraftKey] ?? [];
+    selfDispatched.push(submitText);
+    selfDispatchedGuidanceByDraftRef.current[targetDraftKey] = selfDispatched;
+    updateGuidanceSendingIdForDraft(targetDraftKey, item.id);
     try {
-      await onSend(displayText, submitText);
-      setPendingGuidance((items) => items.filter((queued) => queued.id !== item.id));
+      if (running && onSteer) await onSteer(submitText, targetTabId);
+      else await onSend(displayText, submitText, targetTabId);
+      updatePendingGuidanceForDraft(targetDraftKey, (items) => items.filter((queued) => queued.id !== item.id));
       window.setTimeout(() => {
-        takeSelfDispatchedGuidance(submitText);
+        takeSelfDispatchedGuidance(submitText, targetDraftKey);
       }, 5000);
     } catch (error) {
-      takeSelfDispatchedGuidance(submitText);
+      takeSelfDispatchedGuidance(submitText, targetDraftKey);
       showToast(error instanceof Error ? error.message : String(error), "warn");
     } finally {
-      setGuidanceSendingId((current) => (current === item.id ? null : current));
+      const current = targetDraftKey === activeDraftKeyRef.current
+        ? guidanceSendingIdRef.current
+        : draftsBySessionRef.current[targetDraftKey]?.guidanceSendingId;
+      if (current === item.id) updateGuidanceSendingIdForDraft(targetDraftKey, null);
     }
   };
 
@@ -1308,7 +1522,7 @@ export function Composer({
     const images = files.filter((f) => f.type.startsWith("image/"));
     if (images.length === 0) return;
     for (const file of images) {
-      setPendingPaste((n) => n + 1);
+      updatePendingPasteForDraft(sourceDraftKey, 1);
       try {
         const key = await fileDedupKey(file);
         if (attachmentSeenInDraft(sourceDraftKey, key)) continue;
@@ -1321,7 +1535,7 @@ export function Composer({
         showToast(t("composer.attachImageFailed"), "warn");
         // non-fatal: a failed image attach must not block normal text input
       } finally {
-        setPendingPaste((n) => Math.max(0, n - 1));
+        updatePendingPasteForDraft(sourceDraftKey, -1);
       }
     }
   };
@@ -1332,7 +1546,7 @@ export function Composer({
     const others = files.filter((f) => !f.type.startsWith("image/"));
     if (others.length === 0) return;
     for (const file of others) {
-      setPendingPaste((n) => n + 1);
+      updatePendingPasteForDraft(sourceDraftKey, 1);
       try {
         const key = await fileDedupKey(file);
         if (attachmentSeenInDraft(sourceDraftKey, key)) continue;
@@ -1344,7 +1558,7 @@ export function Composer({
         showToast(t("composer.attachFileFailed"), "warn");
         // non-fatal: a failed attach must not block normal text input
       } finally {
-        setPendingPaste((n) => Math.max(0, n - 1));
+        updatePendingPasteForDraft(sourceDraftKey, -1);
       }
     }
   };
@@ -1356,7 +1570,7 @@ export function Composer({
   };
 
   const attachNativeClipboardImage = async (notifyOnError: boolean, sourceDraftKey: string) => {
-    setPendingPaste((n) => n + 1);
+    updatePendingPasteForDraft(sourceDraftKey, 1);
     try {
       const path = await app.SaveClipboardImage();
       const previewUrl = await app.AttachmentDataURL(path);
@@ -1367,7 +1581,7 @@ export function Composer({
       console.warn("[composer] failed to read native clipboard image", error);
       if (notifyOnError) showToast(t("composer.pasteImageFailed"), "warn");
     } finally {
-      setPendingPaste((n) => Math.max(0, n - 1));
+      updatePendingPasteForDraft(sourceDraftKey, -1);
     }
   };
 
@@ -1377,7 +1591,7 @@ export function Composer({
   const attachDroppedPaths = async (paths: string[], sourceDraftKey = activeDraftKeyRef.current) => {
     setDragOver(false);
     for (const path of paths) {
-      setPendingPaste((n) => n + 1);
+      updatePendingPasteForDraft(sourceDraftKey, 1);
       try {
         const key = { hash: "", source: `path:${path}` };
         if (attachmentSeenInDraft(sourceDraftKey, key)) continue;
@@ -1392,7 +1606,7 @@ export function Composer({
         showToast(t("composer.attachDropFailed"), "warn");
         // non-fatal: a failed drop attach must not block normal text input
       } finally {
-        setPendingPaste((n) => Math.max(0, n - 1));
+        updatePendingPasteForDraft(sourceDraftKey, -1);
       }
     }
   };
@@ -1461,6 +1675,176 @@ export function Composer({
         node.selectionStart = node.selectionEnd = pos;
       });
     }
+  };
+
+  const getInputSelection = () => {
+    const node = taRef.current;
+    const start = node?.selectionStart ?? text.length;
+    const end = node?.selectionEnd ?? text.length;
+    const from = Math.min(start, end);
+    const to = Math.max(start, end);
+    return {
+      from,
+      to,
+      selected: text.slice(from, to),
+    };
+  };
+
+  const focusInputRange = (start: number, end = start) => {
+    requestAnimationFrame(() => {
+      const node = taRef.current;
+      if (!node) return;
+      node.focus();
+      node.setSelectionRange(start, end);
+      lastSelectionRef.current = { start, end };
+    });
+  };
+
+  const replaceInputRange = (
+    value: string,
+    start: number,
+    end: number,
+    targetDraftKey = activeDraftKeyRef.current,
+  ) => {
+    if (targetDraftKey === activeDraftKeyRef.current) {
+      const current = textRef.current;
+      const next = current.slice(0, start) + value + current.slice(end);
+      textRef.current = next;
+      setText(next);
+      focusInputRange(start + value.length);
+      return;
+    }
+    const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+    draft.text = draft.text.slice(0, start) + value + draft.text.slice(end);
+    draftsBySessionRef.current[targetDraftKey] = draft;
+  };
+
+  const insertPastedText = (
+    pasted: string,
+    start: number,
+    end: number,
+    targetDraftKey = activeDraftKeyRef.current,
+  ) => {
+    const normalizedPasted = pasted.replace(/\r\n/g, "\n");
+    if (targetDraftKey !== activeDraftKeyRef.current) {
+      const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+      if (shouldFoldPaste(pasted)) {
+        const id = draft.nextPasteId++;
+        const lines = lineCount(pasted);
+        const label = t("composer.pastedLabel", { id, lines });
+        draft.pastedBlocks = [...draft.pastedBlocks, { label, text: pasted }];
+        draft.text = draft.text.slice(0, start) + label + draft.text.slice(end);
+      } else {
+        draft.historyIndex = -1;
+        draft.text = draft.text.slice(0, start) + normalizedPasted + draft.text.slice(end);
+      }
+      draftsBySessionRef.current[targetDraftKey] = draft;
+      return;
+    }
+
+    if (shouldFoldPaste(pasted)) {
+      const id = nextPasteId.current++;
+      const lines = lineCount(pasted);
+      const label = t("composer.pastedLabel", { id, lines });
+      const block: PastedBlock = { label, text: pasted };
+      const current = textRef.current;
+      const next = current.slice(0, start) + label + current.slice(end);
+      pastedBlocksRef.current = [...pastedBlocksRef.current, block];
+      setPastedBlocks((prev) => [...prev, block]);
+      textRef.current = next;
+      setText(next);
+      focusInputRange(start + label.length);
+    } else {
+      resetPromptHistoryNavigation();
+      const current = textRef.current;
+      const next = current.slice(0, start) + normalizedPasted + current.slice(end);
+      textRef.current = next;
+      setText(next);
+      focusInputRange(start + normalizedPasted.length);
+    }
+  };
+
+  const copyComposerSelection = async (cut = false) => {
+    const selection = getInputSelection();
+    const sourceDraftKey = activeDraftKeyRef.current;
+    setInputMenuPoint(null);
+    if (!selection.selected) {
+      focusInputRange(selection.from, selection.to);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(selection.selected);
+    } catch {
+      // Fall back to Wails desktop runtime, then execCommand
+      try {
+        if (typeof window !== "undefined" && (await window.runtime?.ClipboardSetText?.(selection.selected))) {
+          /* ok */
+        } else if (!fallbackCopyText(selection.selected)) {
+          // Every clipboard path failed. Cutting now would delete text that
+          // never reached the clipboard, so keep the draft intact.
+          if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+          return;
+        }
+      } catch {
+        if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+        return;
+      }
+    }
+    if (cut) {
+      if (sourceDraftKey === activeDraftKeyRef.current) resetPromptHistoryNavigation();
+      replaceInputRange("", selection.from, selection.to, sourceDraftKey);
+    } else if (sourceDraftKey === activeDraftKeyRef.current) {
+      focusInputRange(selection.from, selection.to);
+    }
+  };
+
+  const pasteIntoComposer = async () => {
+    const selection = getInputSelection();
+    const sourceDraftKey = activeDraftKeyRef.current;
+    setInputMenuPoint(null);
+
+    // Try reading clipboard items for image detection (no event in menu path)
+    try {
+      const items = await navigator.clipboard.read();
+      if (items.some((item) => item.types.some((t) => t.startsWith("image/")))) {
+        void attachNativeClipboardImage(true, sourceDraftKey);
+        return;
+      }
+    } catch {
+      /* clipboard.read() not supported or permission denied; fall through */
+    }
+
+    if (!navigator.clipboard?.readText) {
+      if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+      return;
+    }
+    try {
+      const pasted = await navigator.clipboard.readText();
+      if (pasted === "") {
+        // Match the keyboard paste handler: an empty text read means "nothing
+        // to insert" (empty clipboard, files, or unsupported types) — never
+        // replace the current selection with nothing. An image may still be
+        // attachable through the native clipboard path.
+        if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+        void attachNativeClipboardImage(false, sourceDraftKey);
+        return;
+      }
+      insertPastedText(pasted, selection.from, selection.to, sourceDraftKey);
+    } catch {
+      if (sourceDraftKey === activeDraftKeyRef.current) focusInputRange(selection.from, selection.to);
+    }
+  };
+
+  const selectAllComposerText = () => {
+    setInputMenuPoint(null);
+    focusInputRange(0, text.length);
+  };
+
+  const openInputMenu = (event: ReactMouseEvent<HTMLTextAreaElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    rememberCaret();
+    setInputMenuPoint(contextMenuPointFromEvent(event));
   };
 
   const hasWorkspaceReferenceDrag = (dataTransfer: DataTransfer): boolean =>
@@ -1536,7 +1920,19 @@ export function Composer({
   const handleCancel = () => {
     const restored = onCancel();
     if (goalModeOn && activeGoal) onClearGoal();
-    if (typeof restored === "string") setTextCaretEnd(restored);
+    // A user-requested cancel must not let the natural-completion effect submit
+    // the queued follow-up. Fold it back into the draft: cancelling means "stop
+    // acting", not "discard what I typed" — the same contract onCancel already
+    // honors for un-sent text.
+    const queued = pendingGuidance.map((item) => item.text).filter((part) => part.trim() !== "");
+    if (queued.length === 0) {
+      if (typeof restored === "string") setTextCaretEnd(restored);
+      return;
+    }
+    updatePendingGuidanceForDraft(activeDraftKeyRef.current, () => []);
+    setGuidanceExpanded(false);
+    const base = typeof restored === "string" ? restored : text;
+    setTextCaretEnd([base, ...queued].filter((part) => part.trim() !== "").join("\n"));
   };
 
   const pickCommand = (c: CommandInfo) => setTextCaretEnd("/" + c.name + " ");
@@ -1637,7 +2033,7 @@ export function Composer({
 
     e.preventDefault();
     const startY = e.clientY;
-    const startHeight = composerHeight ?? card.getBoundingClientRect().height;
+    const startHeight = composerHeight ?? composerLogicalHeight(card);
     let nextHeight = clampComposerHeight(startHeight);
     let moved = false;
     card.style.setProperty("--composer-height", `${nextHeight}px`);
@@ -1675,7 +2071,7 @@ export function Composer({
 
   const onComposerResizeKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
     const card = composerCardRef.current;
-    const current = composerHeight ?? card?.getBoundingClientRect().height ?? COMPOSER_MIN_HEIGHT;
+    const current = composerHeight ?? (card ? composerLogicalHeight(card) : COMPOSER_MIN_HEIGHT);
     const step = e.shiftKey ? 32 : 16;
     let next: number | null = null;
     if (e.key === "ArrowUp" || e.key === "PageUp") next = current + step;
@@ -1703,6 +2099,7 @@ export function Composer({
   // --- past:chats session reference ---
   const openPastChats = async () => {
     const snapshotCwd = cwdRef.current;
+    const sourceDraftKey = activeDraftKeyRef.current;
     setShowPastChats(true);
     setActive(0);
     setPastChatQuery("");
@@ -1710,7 +2107,7 @@ export function Composer({
     try {
       const sessions = await app.ListSessions();
       // Discard stale response if workspace changed while the request was in-flight.
-      if (cwdRef.current !== snapshotCwd) return;
+      if (cwdRef.current !== snapshotCwd || activeDraftKeyRef.current !== sourceDraftKey) return;
       const sorted = asArray(sessions)
         .filter((s) => !s.current)
         .sort((a, b) => {
@@ -1721,10 +2118,10 @@ export function Composer({
         .slice(0, 50);
       setPastChats(sorted);
     } catch {
-      if (cwdRef.current !== snapshotCwd) return;
+      if (cwdRef.current !== snapshotCwd || activeDraftKeyRef.current !== sourceDraftKey) return;
       setPastChats([]);
     } finally {
-      if (cwdRef.current === snapshotCwd) setLoadingPastChats(false);
+      if (cwdRef.current === snapshotCwd && activeDraftKeyRef.current === sourceDraftKey) setLoadingPastChats(false);
     }
   };
 
@@ -1906,18 +2303,20 @@ export function Composer({
 
     if (canUseCurrentPromptHistory()) {
       e.preventDefault();
+      const sourceDraftKey = activeDraftKeyRef.current;
       void (async () => {
-        // Use refs for all mutable reads inside the async closure so rapid
-        // successive key presses always see the latest values.
+        // Keep the navigation result with the draft where the key was pressed;
+        // loading older history may outlive a tab switch.
         if (historyIndexRef.current === -1) {
           savedTextRef.current = text; // save current draft
         }
+        const sourceIndex = historyIndexRef.current;
         const target =
           historyDirection === "up"
-            ? historyIndexRef.current + 1
+            ? sourceIndex + 1
             : historyDirection === "down"
-              ? historyIndexRef.current - 1
-              : historyIndexRef.current;
+              ? sourceIndex - 1
+              : sourceIndex;
         if (target >= historyEntriesRef.current.length && !(await ensurePromptHistoryIndex(target))) {
           return;
         }
@@ -1926,16 +2325,20 @@ export function Composer({
             ? Math.min(target, historyEntriesRef.current.length - 1)
             : historyDirection === "down"
               ? Math.max(target, -1)
-              : historyIndexRef.current;
-        historyIndexRef.current = next;
-        setHistoryIndex(next);
-        if (next === -1) {
-          setTextCaretEnd(savedTextRef.current);
+              : sourceIndex;
+        const historyText = next === -1 ? null : historyEntriesRef.current[next]?.text ?? "";
+        if (sourceDraftKey === activeDraftKeyRef.current) {
+          historyIndexRef.current = next;
+          setHistoryIndex(next);
+          setTextCaretEnd(historyText ?? savedTextRef.current);
         } else {
-          setTextCaretEnd(historyEntriesRef.current[next].text);
-          if (historyDirection === "up" && historyEntriesRef.current.length - 1 - next <= PROMPT_HISTORY_PREFETCH_REMAINING) {
-            prefetchPromptHistoryTail();
-          }
+          const draft = cloneComposerDraft(draftsBySessionRef.current[sourceDraftKey] ?? emptyComposerDraft());
+          draft.historyIndex = next;
+          draft.text = historyText ?? draft.savedText;
+          draftsBySessionRef.current[sourceDraftKey] = draft;
+        }
+        if (historyDirection === "up" && historyEntriesRef.current.length - 1 - next <= PROMPT_HISTORY_PREFETCH_REMAINING) {
+          prefetchPromptHistoryTail();
         }
       })();
       return;
@@ -2006,7 +2409,18 @@ export function Composer({
     }
   };
 
-  const composerCardStyle = composerHeight === null ? undefined : ({ "--composer-height": `${composerHeight}px` } as CSSProperties);
+  // When the run strip is visible inside a user-resized card, the card grows
+  // by the strip's reserved height so the meta row stays fully visible.
+  // --composer-height carries only the user's logical height; the reservation
+  // is a separate variable consumed by the CSS calc, so the live resize drag
+  // (which writes raw logical heights) stays consistent with this render path.
+  const showRunStrip = Boolean(retry || running);
+  const composerCardStyle = composerHeight === null
+    ? undefined
+    : ({
+        "--composer-height": `${composerHeight}px`,
+        "--composer-run-strip-reserved": `${showRunStrip ? COMPOSER_RUN_STRIP_RESERVED : 0}px`,
+      } as CSSProperties);
   const textareaStyle = composerHeight === null && textareaAutoHeight !== null
     ? ({ height: `${textareaAutoHeight}px`, overflowY: textareaAutoOverflow ? "auto" : "hidden" } as CSSProperties)
     : undefined;
@@ -2054,17 +2468,45 @@ export function Composer({
       requestAnimationFrame(() => taRef.current?.focus());
     });
   };
-  const runActivity = retry
+  // Run-strip state machine: retry > waiting-approval > waiting-ask > streaming.
+  // The waiting states replace the whimsical ticker — while a prompt is blocked
+  // on the user, the strip must say so instead of counting "working" seconds.
+  const waitingPrompt = pendingApprovalLabel ? "approval" : pendingAsk ? "ask" : null;
+  // The pending approval itself disables the composer; keep the approval bar
+  // usable in exactly that case so the mode can still be changed mid-prompt.
+  const approvalBarDisabled = Boolean(disabled) && !pendingApprovalLabel;
+  // Waiting on the user (approval/ask) is not model work: pause the ticker's
+  // clock while a prompt is blocked so the elapsed time means "model time",
+  // matching what the waiting strip promises. Retries keep counting — they are
+  // system time, not user time. Accumulated in state via the effect cleanup so
+  // leaving the waiting state re-renders with the corrected time immediately.
+  const [waitAccumMs, setWaitAccumMs] = useState(0);
+  useEffect(() => {
+    setWaitAccumMs(0);
+  }, [turnStartAt]);
+  useEffect(() => {
+    if (!waitingPrompt) return;
+    const since = Date.now();
+    return () => setWaitAccumMs((total) => total + (Date.now() - since));
+  }, [waitingPrompt]);
+  const runStateText = retry
     ? t("status.retrying", { attempt: retry.attempt, max: retry.max })
-    : running && turnStartAt
-      ? (() => {
-          const elapsedMs = Math.max(0, now - turnStartAt);
-          const words = SPINNER_WORDS[locale];
-          const word = words[Math.floor(elapsedMs / 3000) % words.length];
-          const tok = turnTokens && turnTokens > 0 ? ` · ↓ ${fmtTokens(turnTokens)} ${t("status.tokens")}` : "";
-          return `${word}… ${fmtElapsed(elapsedMs)}${tok}`;
-        })()
-      : null;
+    : waitingPrompt === "approval"
+      ? t("composer.runWaitingApproval", { tool: pendingApprovalLabel ?? "" })
+      : waitingPrompt === "ask"
+        ? t("composer.runWaitingAsk")
+        : running
+          ? t("composer.runAnnounceRunning")
+          : null;
+  const runTicker = !retry && !waitingPrompt && running && turnStartAt
+    ? (() => {
+        const elapsedMs = Math.max(0, now - turnStartAt - waitAccumMs);
+        const words = SPINNER_WORDS[locale];
+        const word = words[Math.floor(elapsedMs / 3000) % words.length];
+        const tok = turnTokens && turnTokens > 0 ? ` · ↓ ${fmtTokens(turnTokens)} ${t("status.tokens")}` : "";
+        return `${word}… ${fmtElapsed(elapsedMs)}${tok}`;
+      })()
+    : null;
   const submitEmpty = !text.trim() && attachments.length === 0 && workspaceRefs.length === 0;
   const submitBlocked = submitting || pendingPaste > 0 || (submitEmpty && !(goalModeOn && !activeGoal)) || disabled || (!running && submitDisabled) || readOnly;
   const submitTooltip = running ? t("composer.queueGuidance") : t("composer.send");
@@ -2085,6 +2527,46 @@ export function Composer({
     hasEffort ? "composer-meta--has-effort" : "composer-meta--no-effort",
     planModeOn || goalModeOn || tokenModeOn ? "composer-meta--has-intent-chip" : "composer-meta--no-intent-chip",
   ].join(" ");
+
+  const inputSelection = getInputSelection();
+  const hasInputSelection = inputSelection.from !== inputSelection.to;
+  // Platform-correct hint: ⌘ on macOS, Ctrl elsewhere — same formatter the
+  // shortcut settings UI uses.
+  const editMenuShortcut = (key: string) =>
+    formatShortcutCombo(
+      shortcutPlatform === "darwin" ? { key, meta: true } : { key, ctrl: true },
+      shortcutPlatform,
+    );
+  const inputMenuItems: ContextMenuItem[] = [
+    {
+      key: "cut",
+      label: t("common.cut"),
+      shortcut: editMenuShortcut("x"),
+      disabled: disabled || !hasInputSelection,
+      onSelect: () => void copyComposerSelection(true),
+    },
+    {
+      key: "copy",
+      label: t("common.copy"),
+      shortcut: editMenuShortcut("c"),
+      disabled: !hasInputSelection,
+      onSelect: () => void copyComposerSelection(),
+    },
+    {
+      key: "paste",
+      label: t("common.paste"),
+      shortcut: editMenuShortcut("v"),
+      disabled,
+      onSelect: () => void pasteIntoComposer(),
+    },
+    {
+      key: "select-all",
+      label: t("common.selectAll"),
+      shortcut: editMenuShortcut("a"),
+      disabled: text.length === 0,
+      onSelect: selectAllComposerText,
+    },
+  ];
 
   return (
     <div
@@ -2322,20 +2804,6 @@ export function Composer({
           />
         )
       )}
-      {runActivity && (
-        <div className="composer-toolbar composer-toolbar--status-only">
-          <div className="composer-runstatus" role="status" aria-live="polite">
-            <span className="composer-runstatus__dot" />
-            <span className="composer-runstatus__text">{runActivity}</span>
-            <Tooltip label={t("composer.stop")}>
-              <button className="composer-runstatus__stop" type="button" onClick={handleCancel}>
-                <Square size={10} fill="currentColor" />
-                <span>{t("composer.stopShort")}</span>
-              </button>
-            </Tooltip>
-          </div>
-        </div>
-      )}
       {pendingGuidance.length > 0 && (
         <div className="composer-guidance-shelf" aria-label={t("composer.guidanceQueue")}>
           <div className="composer-guidance-head">
@@ -2367,7 +2835,10 @@ export function Composer({
                     type="button"
                     aria-label={t("composer.guidanceDismiss")}
                     disabled={guidanceSendingId === item.id}
-                    onClick={() => setPendingGuidance((items) => items.filter((queued) => queued.id !== item.id))}
+                    onClick={() => updatePendingGuidanceForDraft(
+                      activeDraftKeyRef.current,
+                      (items) => items.filter((queued) => queued.id !== item.id),
+                    )}
                   >
                     <Trash2 size={14} />
                   </button>
@@ -2484,7 +2955,7 @@ export function Composer({
         </div>
       )}
       <div
-        className={`composer-card${composerHeight !== null || composerResizing ? " composer-card--resized" : ""}${composerAutoExpanded ? " composer-card--autosized" : ""}${composerResizing ? " composer-card--resizing" : ""}${running ? " composer-card--running" : ""}`}
+        className={`composer-card${composerHeight !== null || composerResizing ? " composer-card--resized" : ""}${composerAutoExpanded ? " composer-card--autosized" : ""}${composerResizing ? " composer-card--resizing" : ""}${running ? (waitingPrompt ? " composer-card--waiting" : " composer-card--running") : ""}`}
         ref={composerCardRef}
         style={composerCardStyle}
       >
@@ -2502,6 +2973,17 @@ export function Composer({
           onKeyDown={onComposerResizeKeyDown}
           onDoubleClick={resetComposerHeight}
         />
+        {runStateText && (
+          <div className={`composer-run-strip${waitingPrompt ? " composer-run-strip--waiting" : ""}`}>
+            <span className="composer-run-strip__dot" aria-hidden="true" />
+            {/* The ticker re-renders every second; keep it out of the accessibility
+                tree and announce only the stable state text via the live region. */}
+            <span className="composer-run-strip__text" aria-hidden={runTicker ? true : undefined}>
+              {runTicker ?? runStateText}
+            </span>
+            <span className="sr-only" role="status">{runStateText}</span>
+          </div>
+        )}
         <div
           className={`composer${dragOver ? " composer--dragover" : ""}${disabled || readOnly ? " composer--disabled" : ""}${shellModeActive ? " composer--shell" : ""}`}
           onDrop={onDrop}
@@ -2524,6 +3006,7 @@ export function Composer({
             onClick={rememberCaret}
             onKeyUp={rememberCaret}
             onFocus={rememberCaret}
+            onContextMenu={openInputMenu}
             onPaste={onPaste}
             onKeyDown={onKeyDown}
             onCompositionStart={() => {
@@ -2543,6 +3026,18 @@ export function Composer({
               {composerPrompt}
             </span>
           )}
+          {running && (
+            <Tooltip label={t("composer.stop")}>
+              <button
+                className="composer__btn composer__btn--stop"
+                type="button"
+                onClick={handleCancel}
+                aria-label={t("composer.stop")}
+              >
+                <Square size={12} fill="currentColor" />
+              </button>
+            </Tooltip>
+          )}
           <Tooltip label={submitTooltip}>
             <button
               className={`composer__btn composer__btn--send${running ? " composer__btn--steer" : ""}`}
@@ -2550,10 +3045,19 @@ export function Composer({
               disabled={submitBlocked}
               aria-label={submitTooltip}
             >
-              <ArrowUp size={16} />
+              {running ? <CornerDownRight size={16} /> : <ArrowUp size={16} />}
             </button>
           </Tooltip>
         </div>
+        <ContextMenu
+          open={inputMenuPoint !== null}
+          point={inputMenuPoint}
+          items={inputMenuItems}
+          className="context-menu--composer-input"
+          minWidth={64}
+          ariaLabel={t("composer.inputActions")}
+          onClose={() => setInputMenuPoint(null)}
+        />
         <div className={composerMetaClass}>
           <div className="composer-meta__params">
             <div className="composer-meta__control composer-meta__control--intent">
@@ -2634,13 +3138,17 @@ export function Composer({
               )}
             </div>
             <div className="composer-meta__control composer-meta__control--approval">
+              {/* A pending tool approval disables the composer, but the approval
+                  bar stays usable so mode changes remain possible mid-prompt;
+                  the approval card explains that the pending request still needs
+                  an explicit decision. */}
               <div className="composer-modebar composer-modebar--approval" data-mode={toolApprovalMode} title={t("composer.accessMenuTitle")}>
                 <span className="composer-modebar__thumb" aria-hidden="true" />
                 <button
                   type="button"
                   className={`composer-modebar__item composer-modebar__item--ask${toolApprovalMode === "ask" ? " composer-modebar__item--active" : ""}`}
                   onClick={() => chooseApprovalMode("ask")}
-                  disabled={disabled}
+                  disabled={approvalBarDisabled}
                   aria-pressed={toolApprovalMode === "ask"}
                   title={t("composer.accessAskTitle")}
                 >
@@ -2651,7 +3159,7 @@ export function Composer({
                   type="button"
                   className={`composer-modebar__item composer-modebar__item--auto${toolApprovalMode === "auto" ? " composer-modebar__item--active" : ""}`}
                   onClick={() => chooseApprovalMode("auto")}
-                  disabled={disabled}
+                  disabled={approvalBarDisabled}
                   aria-pressed={toolApprovalMode === "auto"}
                   title={t("composer.accessAutoTitle")}
                 >
@@ -2662,7 +3170,7 @@ export function Composer({
                   type="button"
                   className={`composer-modebar__item composer-modebar__item--yolo${toolApprovalMode === "yolo" ? " composer-modebar__item--active" : ""}`}
                   onClick={() => chooseApprovalMode("yolo")}
-                  disabled={disabled}
+                  disabled={approvalBarDisabled}
                   aria-pressed={toolApprovalMode === "yolo"}
                   title={t("composer.accessYoloTitle")}
                 >
@@ -2672,6 +3180,17 @@ export function Composer({
               </div>
             </div>
             <div className="composer-meta__control composer-meta__control--model">
+              {showContextWindowRing && (
+                <ContextWindowRing
+                  enabled={showContextWindowRing}
+                  context={context}
+                  tabId={tabId}
+                  turnCost={turnCost}
+                  cacheHitTokens={cacheHitTokens}
+                  cacheMissTokens={cacheMissTokens}
+                  balance={balance}
+                />
+              )}
               <ModelSwitcher label={modelLabel} tabId={tabId} onPick={onSwitchModel} />
             </div>
             {hasEffort && (

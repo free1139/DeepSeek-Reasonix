@@ -1,5 +1,5 @@
 import { lazy, memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent, type ReactNode } from "react";
-import { Bot as BotIcon, Check, CheckCircle2, ChevronDown, ChevronUp, Clipboard, GripVertical, KeyRound, Loader2, MessageCircle, Play, QrCode, RefreshCw, Send } from "lucide-react";
+import { Bot as BotIcon, Check, CheckCircle2, ChevronDown, ChevronUp, Clipboard, GripVertical, KeyRound, Loader2, MessageCircle, Minus, Play, Plus, QrCode, RefreshCw, RotateCcw, Send } from "lucide-react";
 import { asArray } from "../lib/array";
 import { useDeferredClose } from "../lib/useMountTransition";
 import { app } from "../lib/bridge";
@@ -17,7 +17,7 @@ import {
   type ThemeStyle,
 } from "../lib/theme";
 import { TEXT_SIZES, applyTextSize, getTextSize, type TextSize } from "../lib/textSize";
-import { snapZoom, zoomToPercent, saveRestartZoom, getRestartZoom, type ZoomLevel } from "../lib/dpiScale";
+import { DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP, snapZoom, zoomToPercent, saveRestartZoom, getRestartZoom, type ZoomLevel } from "../lib/dpiScale";
 import {
   applyFontFamily,
   applyMonoFontFamily,
@@ -102,6 +102,7 @@ export function SettingsPanel({
   const [tab, setTab] = useState<SettingsTab>(initialTab === "providers" ? "models" : initialTab ?? "general");
   // Play the modal exit animation, then let the parent unmount us.
   const { status, requestClose } = useDeferredClose(onClose, 240);
+  const zoomSaveSeq = useRef(0);
 
   const reload = useCallback(async () => {
     setLoadingSettings(true);
@@ -129,6 +130,24 @@ export function SettingsPanel({
     setThemeState(nextTheme);
     setThemeStyleState(nextStyle);
   }, [s?.desktopTheme, s?.desktopThemeStyle]);
+  useEffect(() => {
+    if (desktopPlatform !== "windows") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const persisted = await app.GetDesktopZoomFactor();
+        if (cancelled || typeof persisted !== "number" || !Number.isFinite(persisted)) return;
+        const snapped = snapZoom(persisted);
+        saveRestartZoom(snapped);
+        setZoomPct(zoomToPercent(snapped));
+      } catch {
+        // Older mocks or startup races can lack the binding; keep the local fallback.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [desktopPlatform]);
 
   // apply runs a mutation, re-reads settings, and refreshes the topbar/model.
   const apply = useCallback(async (fn: () => Promise<unknown>) => {
@@ -143,11 +162,11 @@ export function SettingsPanel({
         setWarning(result.trim());
       }
     } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
+      setErr(formatSettingsError(e, t));
     } finally {
       setBusy(false);
     }
-  }, [reload, onChanged]);
+  }, [reload, onChanged, t]);
   const backgroundApply = useCallback(async (fn: () => Promise<void>) => {
     setErr(null);
     setWarning(null);
@@ -156,9 +175,24 @@ export function SettingsPanel({
       const next = await reload();
       onChanged(next);
     } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
+      setErr(formatSettingsError(e, t));
     }
-  }, [reload, onChanged]);
+  }, [reload, onChanged, t]);
+  const setRestartZoom = useCallback(async (zoom: ZoomLevel) => {
+    const snapped = snapZoom(zoom);
+    const seq = ++zoomSaveSeq.current;
+    setErr(null);
+    setWarning(null);
+    setZoomPct(zoomToPercent(snapped));
+    try {
+      await app.SetDesktopZoomFactor(snapped);
+      if (seq === zoomSaveSeq.current) saveRestartZoom(snapped);
+    } catch (e) {
+      if (seq !== zoomSaveSeq.current) return;
+      setErr(formatSettingsError(e, t));
+      setZoomPct(zoomToPercent(getRestartZoom()));
+    }
+  }, [t]);
 
   // Close on Esc
   useEffect(() => {
@@ -177,7 +211,7 @@ export function SettingsPanel({
   const lazySettingsPageFallback = <div className="empty">{t("settings.loading")}</div>;
 
   return (
-    <div className="management-modal-backdrop settings-modal-backdrop" data-state={status} onClick={(e) => { if (e.target === e.currentTarget) requestClose(); }}>
+    <div className="management-modal-backdrop settings-modal-backdrop" data-state={status} onMouseDown={(e) => { if (e.target === e.currentTarget) requestClose(); }}>
       <div className="management-modal settings-modal" data-state={status}>
         <header className="management-modal__head settings-modal__head">
           <div className="management-modal__title settings-modal__title">{t("settings.title")}</div>
@@ -220,7 +254,7 @@ export function SettingsPanel({
                 {tab === "hooks" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><HooksSection onChanged={onChanged} /></SettingsPageShell>}
                 {tab === "shortcuts" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><ShortcutsSection /></SettingsPageShell>}
                 {tab === "permissions" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><PermissionsSection s={s} busy={busy} apply={apply} /></SettingsPageShell>}
-                {tab === "sandbox" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><SandboxSection s={s} busy={busy} apply={apply} /></SettingsPageShell>}
+                {tab === "sandbox" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><SandboxSection s={s} busy={busy} apply={apply} windows={desktopPlatform === "windows"} /></SettingsPageShell>}
                 {tab === "network" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><NetworkSection s={s} busy={busy} apply={apply} /></SettingsPageShell>}
                 {tab === "appearance" && s && (
                   <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}>
@@ -248,18 +282,7 @@ export function SettingsPanel({
                         applyTextSize(size);
                         setTextSizeState(size);
                       }}
-                      onRestartZoom={async (zoom) => {
-                        const snapped = snapZoom(zoom);
-                        setErr(null);
-                        setWarning(null);
-                        try {
-                          await app.SetDesktopZoomFactor(snapped);
-                          saveRestartZoom(snapped);
-                          setZoomPct(zoomToPercent(snapped));
-                        } catch (e) {
-                          setErr(String((e as Error)?.message ?? e));
-                        }
-                      }}
+                      onRestartZoom={setRestartZoom}
                       onFontFamily={(font) => {
                         applyFontFamily(font);
                         setFontFamilyState(font);
@@ -746,17 +769,38 @@ function sortedJSONValue(value: unknown): unknown {
   return value;
 }
 
-function validateProviderExtraBodyValue(value: unknown, path = "extra_body"): void {
+function formatSettingsError(error: unknown, t: ReturnType<typeof useT>): string {
+  const msg = String((error as Error)?.message ?? error ?? "").trim();
+  const unknownModel = /^unknown model (.+)$/i.exec(msg);
+  if (unknownModel) return t("settings.errorUnknownModel", { model: unknownModel[1] });
+  const providerNotAdded = /^model (.+) is not available because provider (.+) is not added$/i.exec(msg);
+  if (providerNotAdded) return t("settings.errorModelProviderMissing", { model: providerNotAdded[1], provider: providerNotAdded[2] });
+  const providerNoKey = /^model (.+) is not available because provider (.+) has no key$/i.exec(msg);
+  if (providerNoKey) return t("settings.errorModelProviderNoKey", { model: providerNoKey[1], provider: providerNoKey[2] });
+  const removeAccessBusy = /^finish or cancel active work using (.+) before removing the provider access$/i.exec(msg);
+  if (removeAccessBusy) return t("settings.errorRemoveAccessBusy", { provider: removeAccessBusy[1] });
+  const deleteProviderBusy = /^finish or cancel active work using (.+) before deleting the provider$/i.exec(msg);
+  if (deleteProviderBusy) return t("settings.errorDeleteProviderBusy", { provider: deleteProviderBusy[1] });
+  const saveBeforeRemoveAccess = /^save current session before removing provider access: (.+)$/is.exec(msg);
+  if (saveBeforeRemoveAccess) return t("settings.errorSaveBeforeRemoveAccess", { err: saveBeforeRemoveAccess[1] });
+  const saveBeforeDeleteProvider = /^save current session before deleting provider: (.+)$/is.exec(msg);
+  if (saveBeforeDeleteProvider) return t("settings.errorSaveBeforeDeleteProvider", { err: saveBeforeDeleteProvider[1] });
+  const removeProviderUsed = /^remove provider: (.+) is used by open tabs and no other configured provider exists$/i.exec(msg);
+  if (removeProviderUsed) return t("settings.errorRemoveProviderNoFallback", { provider: removeProviderUsed[1] });
+  return msg || t("settings.errorUnknown");
+}
+
+function validateProviderExtraBodyValue(value: unknown, path = "extra_body", t?: ReturnType<typeof useT>): void {
   if (value === null) {
-    throw new Error(`${path} cannot contain null`);
+    throw new Error(t ? t("settings.providerExtraBodyNull", { path }) : `${path} cannot contain null`);
   }
   if (Array.isArray(value)) {
-    value.forEach((item, index) => validateProviderExtraBodyValue(item, `${path}[${index}]`));
+    value.forEach((item, index) => validateProviderExtraBodyValue(item, `${path}[${index}]`, t));
     return;
   }
   if (typeof value === "object") {
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      validateProviderExtraBodyValue(child, `${path}.${key}`);
+      validateProviderExtraBodyValue(child, `${path}.${key}`, t);
     }
   }
 }
@@ -772,20 +816,26 @@ export function formatProviderExtraBody(extraBody: Record<string, unknown> | nul
   return JSON.stringify(sortedJSONValue(cleaned), null, 2);
 }
 
-export function parseProviderExtraBody(raw: string): Record<string, unknown> {
+export function parseProviderExtraBody(raw: string, t?: ReturnType<typeof useT>): Record<string, unknown> {
   const trimmed = raw.trim();
   if (!trimmed) return {};
   const parsed = JSON.parse(trimmed) as unknown;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("extra body must be a JSON object");
+    throw new Error(t ? t("settings.providerExtraBodyObjectRequired") : "extra body must be a JSON object");
   }
-  validateProviderExtraBodyValue(parsed);
+  validateProviderExtraBodyValue(parsed, "extra_body", t);
   const out: Record<string, unknown> = {};
   for (const [rawKey, value] of Object.entries(parsed as Record<string, unknown>)) {
     const key = rawKey.trim();
     if (key) out[key] = value;
   }
   return out;
+}
+
+export function providerExtraBodyParseError(error: unknown, t: ReturnType<typeof useT>): string {
+  if (error instanceof SyntaxError) return t("settings.providerExtraBodyError");
+  const message = String((error as Error)?.message ?? error ?? "").trim();
+  return message || t("settings.providerExtraBodyError");
 }
 
 function providerModelFetchFallbackMessage(error: unknown, t: ReturnType<typeof useT>): string {
@@ -1155,7 +1205,7 @@ function normalizeProviderPresetView(p: ProviderPresetView): ProviderPresetView 
 function normalizeSettingsView(view: SettingsView | null | undefined): SettingsView | null {
   if (!view) return null;
   const permissions = view.permissions ?? { mode: "ask", allow: [], ask: [], deny: [] };
-  const sandbox = view.sandbox ?? { bash: "enforce", network: false, workspaceRoot: "", allowWrite: [], effectiveWorkspaceRoot: "", effectiveWriteRoots: [], shell: "auto" };
+  const sandbox = view.sandbox ?? { bash: "enforce", network: false, workspaceRoot: "", allowWrite: [], effectiveWorkspaceRoot: "", effectiveWriteRoots: [], shell: "auto", effectiveShell: "" };
   const network = view.network ?? {
     proxyMode: "auto",
     proxyUrl: "",
@@ -1184,6 +1234,7 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
       allowWrite: asArray(sandbox.allowWrite),
       effectiveWorkspaceRoot: String(sandbox.effectiveWorkspaceRoot ?? ""),
       effectiveWriteRoots: asArray(sandbox.effectiveWriteRoots),
+      effectiveShell: String(sandbox.effectiveShell ?? sandbox.shell ?? ""),
     },
     network: {
       ...network,
@@ -4479,7 +4530,7 @@ function ProvidersSection({ s, busy, apply }: SectionProps) {
     setGroupModelDraft(group.id, null);
     try {
       await apply(async () => {
-        await app.SetProviderKey(apiKeyEnv, value);
+        await app.SaveProviderKey(apiKeyEnv, value);
         try {
           const fetched = await app.FetchProviderModels({ ...probe, apiKeyEnv });
           if (fetched.length > 0) {
@@ -4585,7 +4636,7 @@ function ProvidersSection({ s, busy, apply }: SectionProps) {
               setAdding(null);
             }}
             onResetPreset={(id) => apply(() => app.ResetProviderPresetAccess(id)).then(() => setAdding(null))}
-            onAddCustom={(pv) => apply(() => app.SaveProvider(pv)).then(() => setAdding(null))}
+            onAddCustom={(pv, key) => apply(() => key ? app.SaveProviderWithKey(pv, key) : app.SaveProvider(pv)).then(() => setAdding(null))}
           />
         )}
         {adding === null && groups.map((group) => (
@@ -4601,7 +4652,7 @@ function ProvidersSection({ s, busy, apply }: SectionProps) {
             kinds={s.providerKinds}
             onEdit={setEditing}
             onCancelEdit={() => setEditing(null)}
-            onSave={(pv) => apply(() => app.SaveProvider(pv)).then(() => {
+            onSave={(pv, key) => apply(() => key ? app.SaveProviderWithKey(pv, key) : app.SaveProvider(pv)).then(() => {
               setEditing(null);
               setGroupModelDraft(group.id, null);
             })}
@@ -4705,6 +4756,10 @@ function providerTemplateConflictProviderName(choice: ProviderTemplateChoice): s
 
 function providerPresetDescription(preset: ProviderPresetView, t: ReturnType<typeof useT>): string {
   switch (preset.id) {
+    case "longcat-openai":
+      return t("settings.addProvider.preset.longcatOpenAIDesc");
+    case "longcat-anthropic":
+      return t("settings.addProvider.preset.longcatAnthropicDesc");
     case "kimi-cn":
       return t("settings.addProvider.preset.kimiCnDesc");
     case "kimi-global":
@@ -4811,7 +4866,7 @@ function AddProviderPanel({
   onAddPreset: (id: string, key: string) => Promise<void>;
   onViewPresetConflict: (providerName: string) => void;
   onResetPreset: (id: string) => Promise<void>;
-  onAddCustom: (p: ProviderView) => void | Promise<void>;
+  onAddCustom: (p: ProviderView, key?: string) => void | Promise<void>;
 }) {
   const t = useT();
   const templateChoices = useMemo<ProviderTemplateChoice[]>(() => [
@@ -5026,7 +5081,7 @@ function ProviderAccessCard({
   kinds: string[];
   onEdit: (name: string) => void;
   onCancelEdit: () => void;
-  onSave: (p: ProviderView) => void | Promise<void>;
+  onSave: (p: ProviderView, key?: string) => void | Promise<void>;
   onRefresh: () => void;
   onToggleDraftModel: (model: string) => void;
   onToggleDraftVision: (model: string) => void;
@@ -5517,7 +5572,7 @@ function ProviderEditor({
   kinds: string[];
   busy: boolean;
   onCancel: () => void;
-  onSave: (p: ProviderView) => void;
+  onSave: (p: ProviderView, key?: string) => void | Promise<void>;
   onSaveKey?: (apiKeyEnv: string, value: string) => Promise<void>;
   onClearKey?: (apiKeyEnv: string) => Promise<void>;
 }) {
@@ -5564,9 +5619,9 @@ function ProviderEditor({
   const effectiveHeaders = parseProviderHeaders(headersDraft);
   const extraBodyParse = useMemo(() => {
     try {
-      return { value: parseProviderExtraBody(extraBodyDraft), error: "" };
-    } catch {
-      return { value: {}, error: t("settings.providerExtraBodyError") };
+      return { value: parseProviderExtraBody(extraBodyDraft, t), error: "" };
+    } catch (e) {
+      return { value: {}, error: providerExtraBodyParseError(e, t) };
     }
   }, [extraBodyDraft, t]);
   const effectiveExtraBody = extraBodyParse.value;
@@ -5594,7 +5649,7 @@ function ProviderEditor({
     try {
       const effectiveApiKeyEnv = providerApiKeyEnvForSave(name, apiKeyEnv, keyDraft);
       if (!apiKeyEnv.trim()) setApiKeyEnv(effectiveApiKeyEnv);
-      if (keyDraft.trim()) await app.SetProviderKey(effectiveApiKeyEnv, keyDraft.trim());
+      if (keyDraft.trim()) await app.SaveProviderKey(effectiveApiKeyEnv, keyDraft.trim());
       const fetched = await app.FetchProviderModels({
         name: name.trim() || t("settings.newProviderDraftName"),
         builtIn: initial?.builtIn ?? false,
@@ -5642,11 +5697,12 @@ function ProviderEditor({
 
   const save = async () => {
     if (extraBodyInvalid) return;
+    setFetchStatus(null);
+    setFetchFallback(null);
     const ms = parseProviderListInput(models);
     const vms = parseProviderListInput(visionModels).filter((model) => ms.includes(model));
     const effectiveApiKeyEnv = providerApiKeyEnvForSave(name, apiKeyEnv, keyDraft);
-    if (keyDraft.trim()) await app.SetProviderKey(effectiveApiKeyEnv, keyDraft.trim());
-    onSave({
+    const provider: ProviderView = {
       name: name.trim(),
       builtIn: initial?.builtIn ?? false,
       added: initial?.added ?? true,
@@ -5672,7 +5728,12 @@ function ProviderEditor({
       // NormalizeEffort would otherwise silently ignore an unsupported value.
       defaultEffort: cleanedSupportedEfforts.length > 0 ? cleanDefaultEffort : "",
       modelOverrides: initial?.modelOverrides ?? [],
-    });
+    };
+    try {
+      await onSave(provider, keyDraft.trim() || undefined);
+    } catch (e) {
+      setFetchFallback(String((e as Error)?.message ?? e));
+    }
   };
 
   if (builtIn) {
@@ -6185,7 +6246,7 @@ function HooksSection({ onChanged }: { onChanged: (settings?: SettingsView | nul
 
   const parseHooksEditorJSON = (raw = jsonText): { hooks: HookConfigView[]; text: string } | null => {
     try {
-      const hooks = parseHooksJSON(raw, view?.events ?? []);
+      const hooks = parseHooksJSON(raw, view?.events ?? [], t);
       const text = formatHooksJSON(hooks, view?.events ?? []);
       setJsonText(text);
       setJsonError(null);
@@ -6376,7 +6437,7 @@ function formatHooksJSON(hooks: HookConfigView[], eventOrder: string[]): string 
   return JSON.stringify({ hooks: ordered }, null, 2);
 }
 
-function parseHooksJSON(raw: string, validEvents: string[]): HookConfigView[] {
+function parseHooksJSON(raw: string, validEvents: string[], t: ReturnType<typeof useT>): HookConfigView[] {
   const trimmed = raw.trim();
   if (!trimmed) return [];
   let parsed: unknown;
@@ -6386,21 +6447,21 @@ function parseHooksJSON(raw: string, validEvents: string[]): HookConfigView[] {
     throw new Error(String((e as Error)?.message ?? e));
   }
   if (Array.isArray(parsed)) {
-    return parsed.map((item) => normalizeHookConfig(parseHookArrayItem(item, validEvents))).filter((h) => h.event);
+    return parsed.map((item) => normalizeHookConfig(parseHookArrayItem(item, validEvents, t))).filter((h) => h.event);
   }
   if (!parsed || typeof parsed !== "object") {
-    throw new Error("expected an object or array");
+    throw new Error(t("settings.hooksJsonExpectedObjectArray"));
   }
   const obj = parsed as Record<string, unknown>;
   const hooksValue = obj.hooks && typeof obj.hooks === "object" && !Array.isArray(obj.hooks) ? obj.hooks : obj;
-  return flattenHooksMap(hooksValue as Record<string, unknown>, validEvents);
+  return flattenHooksMap(hooksValue as Record<string, unknown>, validEvents, t);
 }
 
-function parseHookArrayItem(item: unknown, validEvents: string[]): HookConfigView {
-  if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("hook item must be an object");
+function parseHookArrayItem(item: unknown, validEvents: string[], t: ReturnType<typeof useT>): HookConfigView {
+  if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(t("settings.hooksJsonItemObject"));
   const obj = item as Record<string, unknown>;
   const event = stringField(obj, "event") || "PreToolUse";
-  if (validEvents.length > 0 && !validEvents.includes(event)) throw new Error(`unknown hook event ${event}`);
+  if (validEvents.length > 0 && !validEvents.includes(event)) throw new Error(t("settings.hooksJsonUnknownEvent", { event }));
   return {
     event,
     match: stringField(obj, "match"),
@@ -6411,14 +6472,14 @@ function parseHookArrayItem(item: unknown, validEvents: string[]): HookConfigVie
   };
 }
 
-function flattenHooksMap(hooks: Record<string, unknown>, validEvents: string[]): HookConfigView[] {
+function flattenHooksMap(hooks: Record<string, unknown>, validEvents: string[], t: ReturnType<typeof useT>): HookConfigView[] {
   const valid = new Set(validEvents);
   const out: HookConfigView[] = [];
   for (const [event, value] of Object.entries(hooks)) {
-    if (valid.size > 0 && !valid.has(event)) throw new Error(`unknown hook event ${event}`);
+    if (valid.size > 0 && !valid.has(event)) throw new Error(t("settings.hooksJsonUnknownEvent", { event }));
     const items = Array.isArray(value) ? value : [value];
     for (const item of items) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`hook ${event} item must be an object`);
+      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(t("settings.hooksJsonEventItemObject", { event }));
       const obj = item as Record<string, unknown>;
       out.push(normalizeHookConfig({
         event,
@@ -6454,11 +6515,23 @@ function normalizeHookConfig(h: HookConfigView): HookConfigView {
   };
 }
 
-function SandboxSection({ s, busy, apply }: SectionProps) {
+function effectiveShellLabel(value: string, t: ReturnType<typeof useT>): string {
+  switch (value) {
+    case "git-bash": return t("settings.effectiveShellGitBash");
+    case "pwsh": return t("settings.effectiveShellPwsh");
+    case "powershell": return t("settings.effectiveShellPowershell");
+    case "bash": return t("settings.effectiveShellBash");
+    case "auto": return t("common.auto");
+    default: return value.trim() || t("common.none");
+  }
+}
+
+function SandboxSection({ s, busy, apply, windows }: SectionProps & { windows: boolean }) {
   const t = useT();
   const sb = s.sandbox;
   const [root, setRoot] = useState(sb.workspaceRoot);
   const effectiveWriteRoots = asArray(sb.effectiveWriteRoots).filter((path) => String(path).trim());
+  const effectiveShell = effectiveShellLabel(String(sb.effectiveShell || sb.shell || ""), t);
   const set = (next: Partial<typeof sb>) =>
     apply(() => app.SetSandbox(next.bash ?? sb.bash, next.network ?? sb.network, next.workspaceRoot ?? sb.workspaceRoot, next.allowWrite ?? sb.allowWrite, next.shell ?? sb.shell));
   const reload = () => apply(() => app.ReloadSettings());
@@ -6478,15 +6551,20 @@ function SandboxSection({ s, busy, apply }: SectionProps) {
     >
       <SettingsField label={t("settings.shellInterpreter")}>
         <select className="mem-select set-grow" value={sb.shell || "auto"} disabled={busy} onChange={(e) => void set({ shell: e.target.value })}>
-          <option value="auto">{t("settings.shellAuto")}</option>
+          <option value="auto">{windows ? t("settings.shellAutoWindows") : t("settings.shellAuto")}</option>
           <option value="bash">{t("settings.shellBash")}</option>
           <option value="powershell">{t("settings.shellPowershell")}</option>
           <option value="pwsh">{t("settings.shellPwsh")}</option>
         </select>
       </SettingsField>
+      <SettingsField label={t("settings.effectiveShell")}>
+        <div className="settings-readonly-field">{effectiveShell}</div>
+      </SettingsField>
       <SettingsField label={t("settings.bashSandbox")}>
-        <select className="mem-select set-grow" value={sb.bash} disabled={busy} onChange={(e) => void set({ bash: e.target.value })}>
-          <option value="enforce">{t("settings.bashEnforce")}</option>
+        {/* Windows force-resolves bash to "off" (see config.BashModeForGOOS), so
+            offering enforce there would silently snap back on save. */}
+        <select className="mem-select set-grow" value={sb.bash} disabled={busy || windows} onChange={(e) => void set({ bash: e.target.value })}>
+          <option value="enforce" disabled={windows}>{t("settings.bashEnforce")}</option>
           <option value="off">{t("settings.bashOff")}</option>
         </select>
       </SettingsField>
@@ -6582,6 +6660,15 @@ function AppearanceSection({
   const themeOptions: Theme[] = ["auto", "light", "dark"];
   const availableFontFamilies = useMemo(() => getAvailableFontFamilies(fontFamily), [fontFamily]);
   const availableMonoFontFamilies = useMemo(() => getAvailableMonoFontFamilies(monoFontFamily), [monoFontFamily]);
+  const zoomMinPct = zoomToPercent(MIN_ZOOM);
+  const zoomMaxPct = zoomToPercent(MAX_ZOOM);
+  const zoomStepPct = Math.round(ZOOM_STEP * 100);
+  const zoomProgressPct = Math.min(100, Math.max(0, ((zoomPct - zoomMinPct) / (zoomMaxPct - zoomMinPct)) * 100));
+  const canDecreaseZoom = zoomPct > zoomMinPct;
+  const canIncreaseZoom = zoomPct < zoomMaxPct;
+  const setZoomPercent = (pct: number) => {
+    void onRestartZoom(pct / 100);
+  };
   return (
     <SettingsSection title={t("settings.appearance")}>
       <SettingsField label={t("settings.theme")}>
@@ -6647,30 +6734,62 @@ function AppearanceSection({
       {showDisplayZoom && (
         <SettingsField label={t("settings.displayZoom")}>
           <div className="zoom-slider-wrap">
-            <div className="zoom-slider__value">{zoomPct}%</div>
+            <div className="zoom-slider__head">
+              <div className="zoom-slider__value">{zoomPct}%</div>
+              <div className="zoom-stepper">
+                <button
+                  type="button"
+                  className="zoom-stepper__btn"
+                  aria-label={t("settings.displayZoomDecrease")}
+                  title={t("settings.displayZoomDecrease")}
+                  disabled={!canDecreaseZoom}
+                  onClick={() => setZoomPercent(zoomPct - zoomStepPct)}
+                >
+                  <Minus size={13} aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className="zoom-stepper__reset"
+                  aria-label={t("settings.displayZoomReset")}
+                  title={t("settings.displayZoomReset")}
+                  disabled={zoomPct === zoomToPercent(DEFAULT_ZOOM)}
+                  onClick={() => { void onRestartZoom(DEFAULT_ZOOM); }}
+                >
+                  <RotateCcw size={12} aria-hidden="true" />
+                  <span>100%</span>
+                </button>
+                <button
+                  type="button"
+                  className="zoom-stepper__btn"
+                  aria-label={t("settings.displayZoomIncrease")}
+                  title={t("settings.displayZoomIncrease")}
+                  disabled={!canIncreaseZoom}
+                  onClick={() => setZoomPercent(zoomPct + zoomStepPct)}
+                >
+                  <Plus size={13} aria-hidden="true" />
+                </button>
+              </div>
+            </div>
             <div className="zoom-slider-row">
-              <span className="zoom-slider__label">50%</span>
+              <span className="zoom-slider__label">{zoomMinPct}%</span>
               <div className="slider-track">
                 <div className="slider-track__bg" />
                 <div
                   className="slider-track__fill"
-                  style={{ width: `calc(${((zoomPct - 50) / 150) * 100}% + 15px)` }}
+                  style={{ width: `calc(${zoomProgressPct}% + 15px)` }}
                 />
-                <div className="slider-thumb" style={{ left: `${((zoomPct - 50) / 150) * 100}%` }}>
-                  <div className="slider-thumb__left" />
-                  <div className="slider-thumb__mid" />
-                  <div className="slider-thumb__right" />
-                </div>
+                <div className="slider-thumb" style={{ left: `${zoomProgressPct}%` }} />
                 <input
+                  aria-label={t("settings.displayZoom")}
                   type="range"
-                  min={50}
-                  max={200}
-                  step={5}
+                  min={zoomMinPct}
+                  max={zoomMaxPct}
+                  step={zoomStepPct}
                   value={zoomPct}
-                  onChange={(e) => { void onRestartZoom(Number(e.target.value) / 100); }}
+                  onChange={(e) => setZoomPercent(Number(e.target.value))}
                 />
               </div>
-              <span className="zoom-slider__label">200%</span>
+              <span className="zoom-slider__label">{zoomMaxPct}%</span>
             </div>
           </div>
         </SettingsField>

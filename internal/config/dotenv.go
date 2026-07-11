@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/joho/godotenv"
+
+	fileencoding "reasonix/internal/fileutil/encoding"
 )
 
 type dotEnvFile struct {
@@ -92,6 +94,7 @@ func legacyCredentialsPaths() []string {
 	}
 	if dir := userSupportDir(); dir != "" {
 		add(filepath.Join(dir, "credentials"))
+		add(filepath.Join(dir, ".env"))
 	}
 	for _, cfg := range legacyXDGConfigPaths() {
 		add(filepath.Join(filepath.Dir(cfg), "credentials"))
@@ -121,7 +124,11 @@ func loadDotEnvFileAs(path string, source CredentialSource) {
 }
 
 func readDotEnvFile(path string) (dotEnvFile, bool) {
-	values, err := godotenv.Read(path)
+	raw, err := fileencoding.ReadFileUTF8(path)
+	if err != nil {
+		return dotEnvFile{}, false
+	}
+	values, err := godotenv.Unmarshal(string(raw))
 	if err != nil {
 		return dotEnvFile{}, false
 	}
@@ -159,7 +166,7 @@ func (f dotEnvFile) warnings() []string {
 }
 
 func detectDotEnvDuplicateKeys(path string) []string {
-	raw, err := os.ReadFile(path)
+	raw, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return nil
 	}

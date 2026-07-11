@@ -4,6 +4,8 @@ import "testing"
 
 func TestCuratedProviderPresetsCoverRequestedProviders(t *testing.T) {
 	wantIDs := []string{
+		"longcat-openai",
+		"longcat-anthropic",
 		"kimi-cn",
 		"kimi-global",
 		"kimi-coding-plan",
@@ -73,6 +75,72 @@ func TestCuratedProviderPresetsCoverRequestedProviders(t *testing.T) {
 	}
 }
 
+func TestCuratedProviderPresetsDisplayOrder(t *testing.T) {
+	wantPrefix := []string{
+		"glm-cn",
+		"zai-global",
+		"glm-coding-plan-cn",
+		"glm-coding-plan-cn-anthropic",
+		"zai-coding-plan-global",
+		"zai-coding-plan-global-anthropic",
+		"longcat-openai",
+		"longcat-anthropic",
+		"kimi-cn",
+		"kimi-global",
+		"kimi-coding-plan",
+		"minimax-cn-api",
+		"minimax-global-api",
+		"minimax-cn-anthropic",
+		"minimax-global-anthropic",
+	}
+	got := CuratedProviderPresets()
+	if len(got) < len(wantPrefix) {
+		t.Fatalf("got %d presets, want at least %d", len(got), len(wantPrefix))
+	}
+	for i, want := range wantPrefix {
+		if got[i].ID != want {
+			t.Fatalf("preset[%d] = %q, want %q", i, got[i].ID, want)
+		}
+	}
+}
+
+func TestCuratedProviderPresetsStepFunUsesOfficialBaseURLs(t *testing.T) {
+	tests := []struct {
+		id      string
+		kind    string
+		baseURL string
+	}{
+		{
+			id:      "stepfun",
+			kind:    "openai",
+			baseURL: "https://api.stepfun.com/step_plan/v1",
+		},
+		{
+			id:      "stepfun-anthropic",
+			kind:    "anthropic",
+			baseURL: "https://api.stepfun.com/step_plan",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			preset, ok := CuratedProviderPreset(tt.id)
+			if !ok {
+				t.Fatalf("missing preset %q", tt.id)
+			}
+			if len(preset.Entries) != 1 {
+				t.Fatalf("preset %q has %d entries, want 1", tt.id, len(preset.Entries))
+			}
+			entry := preset.Entries[0]
+			if entry.Kind != tt.kind {
+				t.Fatalf("preset %q kind = %q, want %q", tt.id, entry.Kind, tt.kind)
+			}
+			if entry.BaseURL != tt.baseURL {
+				t.Fatalf("preset %q base_url = %q, want %q", tt.id, entry.BaseURL, tt.baseURL)
+			}
+		})
+	}
+}
+
 func TestCuratedProviderPresetReturnsDeepCopy(t *testing.T) {
 	preset, ok := CuratedProviderPreset("minimax-cn-api")
 	if !ok {
@@ -127,6 +195,27 @@ func TestCuratedProviderPresetCapabilities(t *testing.T) {
 	}
 	if kimiPlan.Kind != "anthropic" || kimiPlan.DefaultModel() != "kimi-for-coding" || !kimiPlan.HasVisionModel("kimi-for-coding") || kimiPlan.Thinking != "adaptive" || kimiPlan.HasModel("kimi-code") {
 		t.Fatalf("kimi-coding-plan capability mismatch: %+v", kimiPlan)
+	}
+
+	longcat, ok := cfg.ResolveModel("longcat-openai/LongCat-2.0")
+	if !ok {
+		t.Fatal("longcat-openai/LongCat-2.0 did not resolve")
+	}
+	if longcat.BaseURL != "https://api.longcat.chat/openai/v1" || longcat.ModelsURL != "https://api.longcat.chat/openai/v1/models" || longcat.APIKeyEnv != "LONGCAT_API_KEY" {
+		t.Fatalf("longcat-openai endpoint/key mismatch: %+v", longcat)
+	}
+	if cap := EffortCapabilityForEntry(longcat); !cap.Supported || cap.Default != "enabled" || !containsString(cap.Levels, "disabled") {
+		t.Fatalf("longcat-openai effort capability = %+v, want enabled/disabled", cap)
+	}
+	if price := longcat.PriceForModel("LongCat-2.0"); price == nil || price.Currency != "¥" || price.Input != 2 || price.Output != 8 || price.CacheHit != 0.04 {
+		t.Fatalf("LongCat-2.0 price = %+v, want RMB discounted pricing", price)
+	}
+	longcatAnthropic, ok := cfg.Provider("longcat-anthropic")
+	if !ok {
+		t.Fatal("longcat-anthropic provider missing")
+	}
+	if longcatAnthropic.Kind != "anthropic" || longcatAnthropic.BaseURL != "https://api.longcat.chat/anthropic" || longcatAnthropic.ModelsURL != "https://api.longcat.chat/anthropic/v1/models" || !longcatAnthropic.AuthHeader || longcatAnthropic.Thinking != "enabled" {
+		t.Fatalf("longcat-anthropic capability mismatch: %+v", longcatAnthropic)
 	}
 
 	mimo, ok := cfg.Provider("mimo-api")
@@ -348,5 +437,43 @@ func TestCuratedProviderPresetCapabilities(t *testing.T) {
 	}
 	if cap := EffortCapabilityForEntry(ollama); !cap.Supported || cap.Default != "auto" || !containsString(cap.Levels, "max") || !containsString(cap.Levels, "none") {
 		t.Fatalf("ollama-cloud effort capability = %+v, want none/max", cap)
+	}
+}
+
+func TestCuratedProviderPresetDeepSeekReasoningProtocolScope(t *testing.T) {
+	var cfg Config
+	for _, preset := range CuratedProviderPresets() {
+		for _, entry := range preset.Entries {
+			if err := cfg.UpsertProvider(entry); err != nil {
+				t.Fatalf("upsert preset %q: %v", preset.ID, err)
+			}
+		}
+	}
+
+	tests := []struct {
+		ref  string
+		want string
+	}{
+		{ref: "opencode-go/deepseek-v4-pro", want: ReasoningProtocolDeepSeek},
+		{ref: "opencode-go/deepseek-v4-flash", want: ReasoningProtocolDeepSeek},
+		{ref: "ollama-cloud/deepseek-v4-pro", want: ReasoningProtocolDeepSeek},
+		{ref: "ollama-cloud/deepseek-v4-flash", want: ReasoningProtocolDeepSeek},
+		{ref: "novita/deepseek/deepseek-v4-pro"},
+		{ref: "novita/deepseek/deepseek-v4-flash"},
+		{ref: "gmi/deepseek-ai/DeepSeek-V4-Pro"},
+		{ref: "gmi/deepseek-ai/DeepSeek-V4-Flash"},
+		{ref: "nvidia/deepseek-ai/deepseek-v4-pro"},
+		{ref: "vercel-ai-gateway/deepseek/deepseek-v4-pro"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.ref, func(t *testing.T) {
+			entry, ok := cfg.ResolveModel(tc.ref)
+			if !ok {
+				t.Fatalf("ResolveModel(%q) failed", tc.ref)
+			}
+			if got := ReasoningProtocolForEntry(entry); got != tc.want {
+				t.Fatalf("ReasoningProtocolForEntry(%q) = %q, want %q", tc.ref, got, tc.want)
+			}
+		})
 	}
 }

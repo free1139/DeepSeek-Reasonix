@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/netclient"
 	"reasonix/internal/provider"
 )
@@ -62,10 +63,40 @@ type Config struct {
 	LSP              LSPConfig           `toml:"lsp"`
 	Bot              BotConfig           `toml:"bot"`
 	Serve            ServeConfig         `toml:"serve"`
+	Secrets          SecretsConfig       `toml:"secrets"`
 
 	providerSources          map[string]providerSourceScope
 	shadowedProjectProviders []ProviderEntry
 	expansionEnv             map[string]string
+	pluginPackageOwners      map[string]string
+}
+
+// SecretsConfig controls the credential protection layers. It is a user-global
+// setting: project reasonix.toml values are ignored (see LoadForRoot), so a
+// cloned repository cannot silently switch off redaction or opt the user into
+// workflow-breaking protections.
+type SecretsConfig struct {
+	// RedactToolOutput masks credential-shaped values in tool output before it
+	// enters model context and UI events. Nil keeps the default enabled.
+	// Session transcripts and background-job artifacts on disk are always
+	// redacted, regardless of this switch.
+	RedactToolOutput *bool `toml:"redact_tool_output"`
+	// FilterSubprocessEnv strips credential-like environment variables
+	// (*_API_KEY, *TOKEN*, *SECRET*, ...) from tool subprocesses (bash, hooks,
+	// LSP, MCP stdio). Default off: it breaks token-based workflows such as
+	// `gh`, HTTPS `git push`, and `npm publish`.
+	FilterSubprocessEnv bool `toml:"filter_subprocess_env"`
+	// ProtectSensitiveFiles makes read/list/search tools treat credential
+	// paths (.env, .git-credentials, .netrc, *.pem/*.key/*.p12/*.pfx, ~/.ssh)
+	// as invisible. Default off: output redaction already masks the values,
+	// and hiding the files breaks legitimate "edit my .env" workflows.
+	ProtectSensitiveFiles bool `toml:"protect_sensitive_files"`
+}
+
+// SecretsRedactToolOutput reports whether live tool output redaction is
+// enabled (default true).
+func (c *Config) SecretsRedactToolOutput() bool {
+	return c == nil || c.Secrets.RedactToolOutput == nil || *c.Secrets.RedactToolOutput
 }
 
 type providerSourceScope string
@@ -503,6 +534,20 @@ type BotConfig struct {
 	Weixin             WeixinBotConfig       `toml:"weixin"`
 	Routes             []BotRouteConfig      `toml:"routes"`
 	Connections        []BotConnectionConfig `toml:"connections"`
+	// DesktopWatchers persists /desktop watch subscriptions so god-view
+	// notifications survive a desktop restart. Managed by the desktop bot
+	// bridge, not the settings UI.
+	DesktopWatchers []BotDesktopWatcherConfig `toml:"desktop_watchers"`
+}
+
+// BotDesktopWatcherConfig is one bot chat subscribed to desktop events
+// (/desktop watch on).
+type BotDesktopWatcherConfig struct {
+	Platform     string `toml:"platform"`
+	ConnectionID string `toml:"connection_id"`
+	Domain       string `toml:"domain"`
+	ChatType     string `toml:"chat_type"`
+	ChatID       string `toml:"chat_id"`
 }
 
 type BotSelfUserIDs struct {
@@ -586,6 +631,11 @@ type FeishuBotConfig struct {
 	Mode              string `toml:"mode"`               // webhook（默认）| websocket
 	WebhookPort       int    `toml:"webhook_port"`       // webhook 模式端口
 	RequireMention    bool   `toml:"require_mention"`
+	// OutboundMediaRoots contains absolute local directories the loopback /send
+	// control API may attach files from. Media refs must be bare filenames and
+	// must exist in exactly one configured root. Empty (the default) disables
+	// outbound file sending.
+	OutboundMediaRoots []string `toml:"outbound_media_roots"`
 }
 
 // WeixinBotConfig 微信 iLink Bot 配置。
@@ -840,9 +890,9 @@ type SandboxConfig struct {
 	WorkspaceRoot string   `toml:"workspace_root"`
 	AllowWrite    []string `toml:"allow_write"`
 	ForbidRead    []string `toml:"forbid_read"`
-	// Bash is the OS-sandbox mode for the bash tool: "enforce" (default) jails
-	// each command when an OS sandbox is available and refuses bash otherwise;
-	// "off" runs it unconfined.
+	// Bash is the OS-sandbox mode for the bash tool: "enforce" jails each
+	// command when an OS sandbox is available and refuses bash otherwise; "off"
+	// runs it unconfined. Empty uses the platform default.
 	Bash string `toml:"bash"`
 	// Network allows network egress from inside the bash sandbox. Defaults true
 	// so module/package downloads keep working; the boundary is then writes.
@@ -882,6 +932,20 @@ func (c *Config) WriteRootsForRoot(fallbackRoot string) []string {
 	return roots
 }
 
+// AllowWriteRoots returns only the configured [sandbox] allow_write extras with
+// ${VAR} expanded — the explicit escape-hatch entries, without the workspace
+// root that WriteRoots prepends. The session-data write guard treats these as
+// user-sanctioned raw access.
+func (c *Config) AllowWriteRoots() []string {
+	var roots []string
+	for _, d := range c.Sandbox.AllowWrite {
+		if d = c.expandVars(d); d != "" {
+			roots = append(roots, d)
+		}
+	}
+	return roots
+}
+
 // ForbidReadRoots returns the directories the agent is forbidden from reading
 // or listing, with ${VAR} expanded. Relative roots are resolved against the
 // current working directory; the confiner resolves them to symlink-free paths.
@@ -913,14 +977,30 @@ func (c *Config) ForbidReadRootsForRoot(fallbackRoot string) []string {
 	return roots
 }
 
-// BashMode normalises the bash-sandbox mode: only an explicit "off" disables
-// it; empty or any other value resolves to "enforce", so the sandbox is on by
-// default and fails safe.
+// BashMode normalises the bash-sandbox mode for the current host.
 func (c *Config) BashMode() string {
-	if c.Sandbox.Bash == "off" {
+	return c.BashModeForGOOS(runtimeGOOS)
+}
+
+// BashModeForGOOS normalises the bash-sandbox mode for tests and cross-platform
+// rendering. Windows currently forces bash sandboxing off, even when older
+// configs explicitly requested "enforce", because the native backend still
+// breaks common Git Bash/MSYS2, Docker, and git workflows. macOS/Linux keep the
+// existing explicit-mode behavior.
+func (c *Config) BashModeForGOOS(goos string) string {
+	if goos == "windows" {
 		return "off"
 	}
-	return "enforce"
+	switch strings.TrimSpace(c.Sandbox.Bash) {
+	case "enforce":
+		return "enforce"
+	case "off":
+		return "off"
+	case "":
+		return "enforce"
+	default:
+		return "enforce"
+	}
 }
 
 // AgentConfig configures the harness loop. PlannerModel is optional: when set
@@ -1463,7 +1543,7 @@ const LanguagePolicy = `Reply in the same language the user is using in their mo
 // Default returns the built-in default configuration.
 func Default() *Config {
 	return &Config{
-		ConfigVersion:    3,
+		ConfigVersion:    4,
 		DefaultModel:     "deepseek-flash",
 		CredentialsStore: CredentialsStoreAuto,
 		UI:               UIConfig{Theme: "auto"},
@@ -1492,11 +1572,11 @@ func Default() *Config {
 		// resolves to allow) while `reasonix` prompts before writers. Users add
 		// deny/allow rules to harden or quiet specific tools.
 		Permissions: PermissionsConfig{Mode: "ask"},
-		// Sandbox on by default: bash is jailed (macOS), network allowed so
-		// builds/downloads work. Set bash = "off" to disable. Network=true here
-		// so an absent [sandbox] in a user's file keeps egress (zero value would
-		// wrongly deny it).
-		Sandbox: SandboxConfig{Bash: "enforce", Network: true},
+		// Sandbox uses platform defaults: macOS/Linux jail bash by default;
+		// Windows forces bash off until the native sandbox backend is reliable.
+		// Network=true here so an absent [sandbox] in a user's file keeps egress
+		// (zero value would wrongly deny it).
+		Sandbox: SandboxConfig{Network: true},
 		// LSP tools on by default, but dormant until a language server is on PATH;
 		// a missing server yields an install hint rather than an error.
 		LSP:     LSPConfig{Enabled: true},
@@ -1957,7 +2037,7 @@ func (c *Config) ResolveSystemPromptForRoot(root string) (string, error) {
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(resolveRoot(root), path)
 		}
-		b, err := os.ReadFile(path)
+		b, err := fileencoding.ReadFileUTF8(path)
 		if err != nil {
 			return "", fmt.Errorf("system_prompt_file: %w", err)
 		}

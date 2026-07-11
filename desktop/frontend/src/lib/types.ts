@@ -155,6 +155,7 @@ export interface MemoryCompilerStats {
 export interface WireEvent {
   kind: EventKind;
   text?: string;
+  detail?: string;
   reasoning?: string;
   memoryCitations?: MemoryCitation[];
   memoryCompiler?: MemoryCompilerStats;
@@ -324,10 +325,12 @@ export interface ChangedFileInfo {
 export interface HistoryMessage {
   role: string;
   content: string;
+  detail?: string;
   submitText?: string;
   checkpointTurn?: number;
   createdAt?: number;
   reasoning?: string;
+  workDurationMs?: number;
   memoryCitations?: MemoryCitation[];
   level?: "info" | "warn";
   toolCalls?: HistoryToolCall[];
@@ -413,6 +416,8 @@ export interface SessionMeta {
   userId?: string;
   threadId?: string;
   sessionSource?: string;
+  recovered?: boolean; // created by conflict recovery, including a continued branch
+  recoveryCopy?: boolean; // actual branch content is unchanged and covered by its parent
 }
 
 // SessionReference is a session selected via @ past:chats for context injection.
@@ -668,12 +673,14 @@ export interface ServerView {
   tools: number;
   prompts: number;
   resources: number;
+  hasTools?: boolean;
   error?: string;
   toolList?: MCPToolView[];
   trustedReadOnlyTools?: string[];
   authStatus?: "none" | "possible" | "required" | string;
   authUrl?: string;
   authConfigured?: boolean;
+  managedByPlugin?: string;
 }
 export interface MCPToolView {
   name: string;
@@ -951,6 +958,7 @@ export interface SandboxView {
   effectiveWorkspaceRoot: string;
   effectiveWriteRoots: string[];
   shell: string; // "auto" | "bash" | "powershell" | "pwsh"
+  effectiveShell?: string; // "bash" | "git-bash" | "powershell" | "pwsh"
 }
 
 export interface NetworkProxyView {
