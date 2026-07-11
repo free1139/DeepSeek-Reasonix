@@ -1621,19 +1621,6 @@ func backfillMimoDomesticPrices(e *ProviderEntry) {
 	}
 }
 
-func resetOfficialProviderPricingDefaults(c *Config) {
-	if c == nil {
-		return
-	}
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		switch {
-		case officialProviderKind(p) == "deepseek":
-			resetDeepSeekOfficialPricing(p)
-		}
-	}
-}
-
 func resetMimoOfficialPricing(p *ProviderEntry) {
 	if p == nil {
 		return
