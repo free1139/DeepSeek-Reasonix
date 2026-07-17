@@ -1360,23 +1360,24 @@ func TestViewMouseModeFollowsCapture(t *testing.T) {
 	}
 }
 
-// TestCtrlMTogglesMouse proves Ctrl+M flips mouseCaptureOff (like /mouse).
-func TestCtrlMTogglesMouse(t *testing.T) {
+// TestAltMTogglesMouse proves Alt+M flips mouseCaptureOff (like /mouse).
+// TestCtrlETogglesMouse proves Ctrl+E flips mouseCaptureOff (like /mouse).
+func TestCtrlETogglesMouse(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{})
 	m.cfg = config.Default()
 
-	ctrlM := tea.KeyPressMsg{Code: 'm', Mod: tea.ModCtrl}
-	out, _ := m.Update(ctrlM)
+	ctrlE := tea.KeyPressMsg{Code: 'e', Mod: tea.ModCtrl}
+	out, _ := m.Update(ctrlE)
 	m = out.(chatTUI)
 	if !m.mouseCaptureOff {
-		t.Fatal("Ctrl+M first press should turn mouse capture off")
+		t.Fatal("Ctrl+E first press should turn mouse capture off")
 	}
 
-	out, _ = m.Update(ctrlM)
+	out, _ = m.Update(ctrlE)
 	m = out.(chatTUI)
 	if m.mouseCaptureOff {
-		t.Fatal("Ctrl+M second press should turn mouse capture back on")
+		t.Fatal("Ctrl+E second press should turn mouse capture back on")
 	}
 }
 

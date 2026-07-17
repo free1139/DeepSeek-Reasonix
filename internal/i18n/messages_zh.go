@@ -51,7 +51,7 @@ var Chinese = Messages{
 	ChatStatusCancellingFmt:                "%s 正在停止… (%d 秒 · Ctrl+C 退出)",
 	ChatStatusIdle:                         "就绪",
 	ChatStatusYoloIdle:                     "已跳过工具批准",
-	ChatStatusCycleHint:                    "shift+tab 循环询问/自动/计划 · ctrl+y yolo · ctrl+m 鼠标 · ctrl+k/j PgUp/PgDn",
+	ChatStatusCycleHint:                    "shift+tab 循环询问/自动/计划 · ctrl+y yolo · ctrl+e 鼠标 · ctrl+k/j PgUp/PgDn",
 	ChatStatusCacheNowFmt:                  "本次命中 %s",
 	ChatStatusCacheAvgFmt:                  "平均 %s",
 	ChatStatusPlanApproval:                 "Enter/y 批准并执行 · n/Esc 继续规划 · PgUp/PgDn/Ctrl+Home/End 滚动",
