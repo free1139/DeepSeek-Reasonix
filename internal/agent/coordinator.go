@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -128,7 +127,7 @@ func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerP
 		plannerOptions.Temperature = temperature
 		plannerOptions.Pricing = plannerPricing
 		plannerOptions.UsageSource = event.UsageSourcePlanner
-		plannerAgent = New(planner, plannerTools, plannerSession, plannerOptions, plannerSink(sink))
+		plannerAgent = NewReadOnlyAgent(planner, plannerTools, plannerSession, plannerOptions, plannerSink(sink))
 	}
 	if executor != nil {
 		executor.executorHandoffGuard = true
@@ -205,7 +204,7 @@ func (c *Coordinator) SetResponseLanguage(lang string) {
 	}
 }
 
-// SetPlanMode propagates the read-only gate to both planner and executor agents
+// SetPlanMode propagates the plan-first workflow flag to both planner and executor agents
 // in two-model mode. Callers that only set the controller's executor would miss
 // the planner agent inside the Coordinator, causing stale plan-mode state after
 // approvals or manual mode switches.
@@ -221,8 +220,8 @@ func (c *Coordinator) SetPlanMode(v bool) {
 	}
 }
 
-// SetPlanModeReadOnlyTrustGate propagates MCP read-only trust approvals to both
-// tool-using agents in two-model mode.
+// SetPlanModeReadOnlyTrustGate propagates plan-mode bash read-only command
+// approvals to both tool-using agents in two-model mode.
 func (c *Coordinator) SetPlanModeReadOnlyTrustGate(g PlanModeReadOnlyTrustGate) {
 	if c == nil {
 		return
@@ -297,8 +296,7 @@ func (c *Coordinator) Run(ctx context.Context, input string) error {
 		// failures: the first is the user aborting the turn, the second has
 		// saved work in the planner session and asks the user to continue.
 		// Neither may silently restart on the executor.
-		var pause *maxStepsPause
-		if ctx.Err() != nil || errors.As(err, &pause) {
+		if ctx.Err() != nil || isToolLoopPause(err) {
 			return fmt.Errorf("planner: %w", err)
 		}
 		// A planner failure must not take down the turn: the executor is
@@ -737,10 +735,9 @@ func (c *Coordinator) planWithTools(ctx context.Context, input string) (string, 
 		// (and possibly partial assistant/tool rounds) to the planner
 		// session, and Coordinator.Run degrades to the executor on planner
 		// failure, so a dangling user message would produce consecutive
-		// user roles on the next plan. A max-steps pause is exempt: its
-		// saved work is what the user is asked to continue from.
-		var pause *maxStepsPause
-		if !errors.As(err, &pause) {
+		// user roles on the next plan. A deliberate tool-loop pause is exempt:
+		// its saved work is what the user is asked to continue from.
+		if !isToolLoopPause(err) {
 			c.rollbackPlannerTurn(before, rewriteBefore)
 		}
 		return "", err

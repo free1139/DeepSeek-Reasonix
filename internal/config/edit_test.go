@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -204,6 +205,27 @@ func TestDesktopLayoutStyleNormalizes(t *testing.T) {
 	}
 }
 
+func TestDesktopExternalOpenerValidation(t *testing.T) {
+	c := Default()
+	if got := c.DesktopExternalOpener(); got != "" {
+		t.Fatalf("default external opener = %q, want empty platform fallback", got)
+	}
+	if err := c.SetDesktopExternalOpener(" Cursor "); err != nil {
+		t.Fatalf("SetDesktopExternalOpener: %v", err)
+	}
+	if got := c.DesktopExternalOpener(); got != "cursor" {
+		t.Fatalf("DesktopExternalOpener = %q, want cursor", got)
+	}
+	for _, invalid := range []string{"../../bin/sh", "vscode;open", "app id"} {
+		if err := c.SetDesktopExternalOpener(invalid); err == nil {
+			t.Fatalf("SetDesktopExternalOpener(%q) unexpectedly succeeded", invalid)
+		}
+	}
+	if err := c.SetDesktopExternalOpener(""); err != nil || c.DesktopExternalOpener() != "" {
+		t.Fatalf("clearing external opener = (%q, %v), want empty", c.DesktopExternalOpener(), err)
+	}
+}
+
 func TestDesktopStatusBarStyleNormalizes(t *testing.T) {
 	if got := Default().DesktopStatusBarStyle(); got != "text" {
 		t.Fatalf("default desktop status bar style = %q, want text", got)
@@ -344,6 +366,9 @@ func TestSetAutoPlan(t *testing.T) {
 
 func TestSetDesktopDefaultToolApprovalMode(t *testing.T) {
 	c := Default()
+	if got := c.DesktopDefaultToolApprovalMode(); got != "auto" {
+		t.Fatalf("desktop default tool approval mode = %q, want built-in auto", got)
+	}
 	for _, mode := range []string{"ask", "auto", "yolo"} {
 		if err := c.SetDesktopDefaultToolApprovalMode(mode); err != nil {
 			t.Fatalf("SetDesktopDefaultToolApprovalMode(%q): %v", mode, err)
@@ -360,6 +385,16 @@ func TestSetDesktopDefaultToolApprovalMode(t *testing.T) {
 	}
 	if err := c.SetDesktopDefaultToolApprovalMode("maybe"); err == nil {
 		t.Fatal("expected error for invalid desktop default tool approval mode")
+	}
+}
+
+func TestLoadForEditMissingDesktopApprovalDefaultsAuto(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("config_version = 4\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if got := LoadForEdit(path).DesktopDefaultToolApprovalMode(); got != "auto" {
+		t.Fatalf("missing desktop default tool approval mode = %q, want auto", got)
 	}
 }
 
@@ -469,10 +504,11 @@ func TestUpsertProvider(t *testing.T) {
 
 	// Missing required fields error.
 	for _, bad := range []ProviderEntry{
-		{Kind: "openai", BaseURL: "u", Model: "m"}, // no name
-		{Name: "a", BaseURL: "u", Model: "m"},      // no kind
-		{Name: "a", Kind: "openai", Model: "m"},    // no base_url
-		{Name: "a", Kind: "openai", BaseURL: "u"},  // no model
+		{Kind: "openai", BaseURL: "u", Model: "m"},                                   // no name
+		{Name: "a", BaseURL: "u", Model: "m"},                                        // no kind
+		{Name: "a", Kind: "openai", Model: "m"},                                      // no base_url
+		{Name: "a", Kind: "openai", BaseURL: "u"},                                    // no model
+		{Name: "a", Kind: "openai", BaseURL: "u", Model: "m", APIKeyEnv: "grok-4.5"}, // invalid credential variable name
 	} {
 		if err := c.UpsertProvider(bad); err == nil {
 			t.Errorf("expected validation error for %+v", bad)
@@ -908,6 +944,15 @@ func TestPluginMutators(t *testing.T) {
 	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", ToolTimeoutSeconds: map[string]int{" ": 1}}); err == nil {
 		t.Error("empty tool_timeout_seconds key should error")
 	}
+	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", DefaultToolsApprovalMode: "always"}); err == nil {
+		t.Error("invalid MCP approval mode should error")
+	}
+	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", Tools: map[string]MCPToolPolicy{"wipe": {ApprovalMode: "sometimes"}}}); err == nil {
+		t.Error("invalid per-tool MCP approval mode should error")
+	}
+	if err := c.UpsertPlugin(PluginEntry{Name: "bad", Command: "x", ApprovalsReviewer: "nobody"}); err == nil {
+		t.Error("invalid MCP approvals reviewer should error")
+	}
 
 	// Replace in place.
 	if err := c.UpsertPlugin(PluginEntry{Name: "ex", Command: "other-cmd"}); err != nil {
@@ -1221,7 +1266,7 @@ api_key_env = "PROJECT_ONLY_KEY"
 	}
 }
 
-func TestLoadForRootKeepsGlobalAgentStepLimitsOverProject(t *testing.T) {
+func TestMigrateDeprecatedAgentStepLimitsForRootRunsOnce(t *testing.T) {
 	isolateUserConfigHome(t)
 	root := t.TempDir()
 	userPath := UserConfigPath()
@@ -1233,6 +1278,9 @@ func TestLoadForRootKeepsGlobalAgentStepLimitsOverProject(t *testing.T) {
 max_steps = 17
 planner_max_steps = 9
 temperature = 0.4
+
+[bot]
+max_steps = 21
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1247,30 +1295,12 @@ temperature = 0.8
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadForRoot(root)
+	changed, err := MigrateLegacyAgentStepLimitsForRoot(root)
 	if err != nil {
-		t.Fatalf("LoadForRoot: %v", err)
+		t.Fatalf("MigrateLegacyAgentStepLimitsForRoot: %v", err)
 	}
-	if cfg.Agent.MaxSteps != 17 || cfg.Agent.PlannerMaxSteps != 9 {
-		t.Fatalf("agent steps = max:%d planner:%d, want global 17/9", cfg.Agent.MaxSteps, cfg.Agent.PlannerMaxSteps)
-	}
-	if cfg.Agent.Temperature != 0.8 {
-		t.Fatalf("agent temperature = %v, want project override to keep working for other agent settings", cfg.Agent.Temperature)
-	}
-	if cfg.DefaultModel != "deepseek-pro" {
-		t.Fatalf("default_model = %q, want project config to keep overriding unrelated fields", cfg.DefaultModel)
-	}
-}
-
-func TestLoadForRootIgnoresProjectAgentStepLimitsWithoutUserConfig(t *testing.T) {
-	isolateUserConfigHome(t)
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "reasonix.toml"), []byte(`
-[agent]
-max_steps = 3
-planner_max_steps = 4
-`), 0o644); err != nil {
-		t.Fatal(err)
+	if !changed {
+		t.Fatal("first migration should remove deprecated step-limit keys")
 	}
 
 	cfg, err := LoadForRoot(root)
@@ -1278,7 +1308,75 @@ planner_max_steps = 4
 		t.Fatalf("LoadForRoot: %v", err)
 	}
 	if cfg.Agent.MaxSteps != 0 || cfg.Agent.PlannerMaxSteps != 0 {
-		t.Fatalf("agent steps = max:%d planner:%d, want built-in global defaults 0/0", cfg.Agent.MaxSteps, cfg.Agent.PlannerMaxSteps)
+		t.Fatalf("deprecated agent steps = max:%d planner:%d, want automatic 0/0", cfg.Agent.MaxSteps, cfg.Agent.PlannerMaxSteps)
+	}
+	if cfg.IgnoredLegacyAgentStepLimits() {
+		t.Fatal("migrated config should no longer report legacy step limits")
+	}
+	if cfg.Agent.Temperature != 0.8 {
+		t.Fatalf("agent temperature = %v, want project override to keep working for other agent settings", cfg.Agent.Temperature)
+	}
+	if cfg.DefaultModel != "deepseek-pro" {
+		t.Fatalf("default_model = %q, want project config to keep overriding unrelated fields", cfg.DefaultModel)
+	}
+	if cfg.Bot.MaxSteps != 21 {
+		t.Fatalf("bot.max_steps = %d, want independent bot limit preserved", cfg.Bot.MaxSteps)
+	}
+	for _, path := range []string{userPath, filepath.Join(root, "reasonix.toml")} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, changed := stripLegacyAgentStepLimitLines(string(raw)); changed {
+			t.Fatalf("runtime migration left deprecated [agent] step limits in %s:\n%s", path, raw)
+		}
+	}
+	userRaw, err := os.ReadFile(userPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(userRaw), "[bot]\nmax_steps = 21") {
+		t.Fatalf("migration removed independent bot.max_steps:\n%s", userRaw)
+	}
+
+	again, err := MigrateLegacyAgentStepLimitsForRoot(root)
+	if err != nil {
+		t.Fatalf("second migration: %v", err)
+	}
+	if again {
+		t.Fatal("migration notice should be one-shot after deprecated keys are removed")
+	}
+}
+
+func TestLoadForRootReadOnlyIgnoresDeprecatedAgentStepLimitsWithoutRewriting(t *testing.T) {
+	isolateUserConfigHome(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "reasonix.toml")
+	original := []byte(`
+[agent]
+max_steps = 3
+planner_max_steps = 4
+`)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadForRootReadOnly(root)
+	if err != nil {
+		t.Fatalf("LoadForRootReadOnly: %v", err)
+	}
+	if cfg.Agent.MaxSteps != 0 || cfg.Agent.PlannerMaxSteps != 0 {
+		t.Fatalf("deprecated steps = max:%d planner:%d, want automatic 0/0", cfg.Agent.MaxSteps, cfg.Agent.PlannerMaxSteps)
+	}
+	if !cfg.IgnoredLegacyAgentStepLimits() {
+		t.Fatal("read-only load should report ignored deprecated step limits")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, original) {
+		t.Fatalf("read-only load rewrote config:\n%s", raw)
 	}
 }
 
@@ -1423,6 +1521,79 @@ func TestSaveToExistingProjectPersistsTopLevelDelta(t *testing.T) {
 	}
 	if got.ConfigVersion != 2 {
 		t.Fatalf("config_version = %d, want 2", got.ConfigVersion)
+	}
+}
+
+func TestSaveToExistingProjectPersistsProviderAccessWithoutReplacingDesktopSection(t *testing.T) {
+	projectPath := filepath.Join(t.TempDir(), "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte("[desktop]\nlegacy_preference = \"keep\"\n\n[permissions]\nallow = [\"Bash(go test:*)\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := LoadForEditWithoutCredentials(projectPath)
+	cfg.Desktop.ProviderAccess = []string{"project-relay"}
+	if err := cfg.SaveTo(projectPath); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	body, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{`provider_access = ["project-relay"]`, `legacy_preference = "keep"`, `[permissions]`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("existing project config missing %q after provider access update:\n%s", want, text)
+		}
+	}
+	cfg.Desktop.ProviderAccess = []string{}
+	if err := cfg.SaveTo(projectPath); err != nil {
+		t.Fatalf("SaveTo explicit empty access: %v", err)
+	}
+	body, err = os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "provider_access = []") {
+		t.Fatalf("explicit empty project provider access was not persisted:\n%s", body)
+	}
+}
+
+func TestProviderEntriesConfigEqualIgnoresResolvedCredentialState(t *testing.T) {
+	a := ProviderEntry{Name: "relay", Kind: "openai", BaseURL: "https://relay.example/v1", Model: "m", APIKeyEnv: "RELAY_API_KEY"}
+	b := a
+	a.resolvedAPIKey = "old-secret"
+	a.resolvedSource = CredentialSource{Kind: CredentialSourceCredentials, Label: "old"}
+	b.resolvedAPIKey = "new-secret"
+	b.resolvedSource = CredentialSource{Kind: CredentialSourceEnvironment, Label: "new"}
+	if !ProviderEntriesConfigEqual(a, b) {
+		t.Fatal("runtime-only credential state caused a persisted provider conflict")
+	}
+	b.Headers = map[string]string{"X-External": "changed"}
+	if ProviderEntriesConfigEqual(a, b) {
+		t.Fatal("persisted provider field change was ignored")
+	}
+	snapshot := ProviderEntryConfigSnapshot(a)
+	if snapshot.resolvedAPIKey != "" || snapshot.resolvedSource != (CredentialSource{}) {
+		t.Fatal("provider config snapshot retained runtime credential state")
+	}
+	cfg := &Config{Providers: []ProviderEntry{a}}
+	updated := a
+	updated.resolvedAPIKey = ""
+	updated.resolvedSource = CredentialSource{}
+	updated.Headers = map[string]string{"X-Replayed": "yes"}
+	if err := cfg.UpsertProviderPreservingRuntime(updated); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := cfg.Provider("relay")
+	if got.APIKey() != "old-secret" || got.Headers["X-Replayed"] != "yes" {
+		t.Fatalf("runtime-preserving upsert = %+v", got)
+	}
+	updated.APIKeyEnv = "NEW_RELAY_API_KEY"
+	if err := cfg.UpsertProviderPreservingRuntime(updated); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = cfg.Provider("relay")
+	if got.resolvedAPIKey != "" || got.resolvedSource != (CredentialSource{}) {
+		t.Fatal("runtime credential survived an api_key_env change")
 	}
 }
 

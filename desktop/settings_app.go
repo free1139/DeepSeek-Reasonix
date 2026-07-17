@@ -302,6 +302,7 @@ type DesktopStartupSettingsView struct {
 	StatusBarStyle     string          `json:"statusBarStyle"`
 	StatusBarItems     []string        `json:"statusBarItems"`
 	CheckUpdates       bool            `json:"checkUpdates"`
+	SafeMode           bool            `json:"safeMode,omitempty"`
 }
 
 func nonNil(s []string) []string {
@@ -768,6 +769,7 @@ func desktopStartupSettingsFromConfig(cfg *config.Config) DesktopStartupSettings
 		StatusBarStyle:     cfg.DesktopStatusBarStyle(),
 		StatusBarItems:     cfg.DesktopStatusBarItems(),
 		CheckUpdates:       cfg.DesktopCheckUpdates(),
+		SafeMode:           cfg.SafeMode(),
 	}
 }
 
@@ -777,9 +779,13 @@ func desktopStartupSettingsFromConfig(cfg *config.Config) DesktopStartupSettings
 func (a *App) DesktopStartupSettings() DesktopStartupSettingsView {
 	cfg, _, err := a.loadDesktopUserConfigForView()
 	if err != nil {
-		return desktopStartupSettingsFromConfig(nil)
+		view := desktopStartupSettingsFromConfig(nil)
+		view.SafeMode = config.SafeModeRequested()
+		return view
 	}
-	return desktopStartupSettingsFromConfig(cfg)
+	view := desktopStartupSettingsFromConfig(cfg)
+	view.SafeMode = config.SafeModeRequested()
+	return view
 }
 
 // Settings returns the current configuration for the Settings panel.
@@ -808,7 +814,7 @@ func (a *App) Settings() SettingsView {
 			DisplayMode:             "standard",
 			StatusBarStyle:          "text",
 			StatusBarItems:          config.DefaultDesktopStatusBarItems(),
-			DefaultToolApprovalMode: "ask",
+			DefaultToolApprovalMode: "auto",
 			CheckUpdates:            true,
 			Telemetry:               true,
 			Metrics:                 true,
@@ -1517,6 +1523,8 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	if tab == nil {
 		return fmt.Errorf("no active tab")
 	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	if controllerHasActiveRuntimeWork(a.controllerForTab(tab)) {
 		return rebuildControllerActiveWorkError(setting)
 	}
@@ -1556,6 +1564,7 @@ func (a *App) rebuildSettingLocked(setting string) error {
 		carried = oldCtrl.History()
 	}
 	snap := a.tabRuntimeSnapshot(tab)
+	runtime := snap.normalizedRuntime()
 	model := snap.model
 	if cfg, err := config.LoadForRoot(snap.workspaceRoot); err == nil {
 		if resolved, fallback, ok := cfg.ResolveModelWithFallback(model); ok {
@@ -1572,7 +1581,7 @@ func (a *App) rebuildSettingLocked(setting string) error {
 		WorkspaceRoot:            snap.workspaceRoot,
 		SessionDir:               sessionDirForSnapshot(snap),
 		EffortOverride:           cloneStringPtr(snap.effort),
-		TokenMode:                snap.currentTokenMode(),
+		TokenMode:                runtime.tokenMode,
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
 		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
@@ -1593,25 +1602,17 @@ func (a *App) rebuildSettingLocked(setting string) error {
 		return err
 	}
 	a.bindControllerDisplayRecorder(ctrl)
-	ctrl.EnableInteractiveApproval()
-	applyTabModeToController(ctrl, snap.mode)
-	// applyTabModeToController only encodes plan+yolo from tab.mode.
-	// Apply the explicit toolApprovalMode (ask/auto/yolo) afterwards so
-	// "auto" is not lost — otherwise rebuild would silently downgrade
-	// auto to ask (#5424 regression).
-	if mode := strings.TrimSpace(snap.toolApprovalMode); mode != "" {
-		applyTabToolApprovalModeToController(ctrl, mode)
-	}
+	configureControllerRuntime(ctrl, oldCtrl, runtime)
 	path := agent.ContinueSessionPath(prevPath, ctrl.SessionDir(), ctrl.Label())
 	if err := a.ensureTabSessionLeaseForRebuild(tab, path, setting); err != nil {
 		ctrl.Close()
 		return err
 	}
-	resumeWithFreshSystemPrompt(ctrl, carried, path)
-	if oldCtrl != nil {
-		oldCtrl.Close()
+	restoredRuntime, err := resumeControllerRuntimeWithMessages(ctrl, carried, path, runtime)
+	if err != nil {
+		ctrl.Close()
+		return err
 	}
-	a.persistTabSessionPath(tab, path)
 	a.mu.Lock()
 	if current := a.tabs[tab.ID]; current != tab {
 		a.mu.Unlock()
@@ -1622,6 +1623,7 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	tab.Ctrl = ctrl
 	tab.model = model
 	tab.Label = ctrl.Label()
+	applyNormalizedRuntimeToTabLocked(tab, restoredRuntime)
 	clearTabStartupError(tab)
 	tab.Ready = true
 	// Supersede any in-flight startup build: it would otherwise finish later,
@@ -1629,6 +1631,10 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	a.supersedeTabBuildLocked(tab)
 	a.saveTabsLocked()
 	a.mu.Unlock()
+	if oldCtrl != nil {
+		oldCtrl.Close()
+	}
+	a.persistTabSessionPath(tab, path)
 	a.clearDeferredRebuild(tab.ID)
 	a.emitReady(a.ctx)
 	return nil
@@ -1735,6 +1741,87 @@ func (a *App) SetSubagentEffort(level string) error {
 	})
 }
 
+// deleteSubagentOverrideAliases removes every underscore/hyphen alias entry
+// for name (boot.SubagentModelKeys — the same key set runtime dispatch
+// reads). Deleting only the exact key would leave a legacy alias entry (e.g.
+// `security_review` for the security-review skill) silently active.
+func deleteSubagentOverrideAliases(overrides map[string]string, name string) {
+	for _, key := range boot.SubagentModelKeys(name) {
+		delete(overrides, key)
+	}
+}
+
+// SetSubagentProfileModel sets (or clears) a per-name model override for a
+// subagent — the only way to influence a built-in subagent's model in the
+// Subagents settings page, since built-ins have no editable frontmatter file
+// to carry a `model:` line. Writes into the same cfg.Agent.SubagentModels map
+// internal/boot's subagentModelRef already reads at dispatch time. Set and
+// clear both sweep the underscore/hyphen alias keys so a legacy alias entry
+// can neither shadow the new value nor survive a clear.
+func (a *App) SetSubagentProfileModel(name, ref string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	return a.applyConfigChange(func(c *config.Config) error {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			deleteSubagentOverrideAliases(c.Agent.SubagentModels, name)
+			return nil
+		}
+		resolved, err := selectableDesktopModelRef(c, ref)
+		if err != nil {
+			return err
+		}
+		if c.Agent.SubagentModels == nil {
+			c.Agent.SubagentModels = map[string]string{}
+		}
+		deleteSubagentOverrideAliases(c.Agent.SubagentModels, name)
+		c.Agent.SubagentModels[name] = resolved
+		return nil
+	})
+}
+
+// SetSubagentProfileEffort sets (or clears) a per-name effort override. See
+// SetSubagentProfileModel.
+func (a *App) SetSubagentProfileEffort(name, level string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	return a.applyConfigChange(func(c *config.Config) error {
+		level = strings.TrimSpace(level)
+		if level == "" || level == "auto" {
+			deleteSubagentOverrideAliases(c.Agent.SubagentEfforts, name)
+			return nil
+		}
+		// Validate against the model the override will actually apply to:
+		// the alias-aware per-name model override first, then the global
+		// subagent default, then the session default.
+		model := subagentOverrideFor(c.Agent.SubagentModels, name)
+		if model == "" {
+			model = strings.TrimSpace(c.Agent.SubagentModel)
+		}
+		if model == "" {
+			model = c.DefaultModel
+		}
+		entry, ok := c.ResolveModel(model)
+		if !ok {
+			return fmt.Errorf("unknown subagent model %q", model)
+		}
+		effort, err := config.NormalizeEffort(entry, level)
+		if err != nil {
+			return err
+		}
+		if c.Agent.SubagentEfforts == nil {
+			c.Agent.SubagentEfforts = map[string]string{}
+		}
+		deleteSubagentOverrideAliases(c.Agent.SubagentEfforts, name)
+		c.Agent.SubagentEfforts[name] = effort
+		return nil
+	})
+}
+
 func desktopMaxSubagentDepth(depth int) int {
 	if depth <= 0 {
 		return agent.DefaultMaxSubagentDepth
@@ -1753,7 +1840,7 @@ func (a *App) SetMaxSubagentDepth(depth int) error {
 	})
 }
 
-// SetAutoPlan updates the automatic plan-mode gate (off|on).
+// SetAutoPlan updates the automatic plan-first workflow setting (off|on).
 func (a *App) SetAutoPlan(mode string) error {
 	if err := a.ensureLiveControllersRuntimeMutationAllowed("auto-plan"); err != nil {
 		return err
@@ -2978,13 +3065,14 @@ func (a *App) MigrateDesktopPreferences(language, theme, style string) error {
 	})
 }
 
-// SetAgentParams updates sampling temperature, optional step guards, and the
-// base system prompt.
+// SetAgentParams updates sampling temperature and the base system prompt. The
+// step arguments remain in the Wails contract for older frontends, but are
+// retired and deliberately normalized to automatic execution.
 func (a *App) SetAgentParams(temperature float64, maxSteps int, plannerMaxSteps int, systemPrompt string) error {
 	return a.applyConfigChange(func(c *config.Config) error {
 		c.Agent.Temperature = temperature
-		c.Agent.MaxSteps = maxSteps
-		c.Agent.PlannerMaxSteps = plannerMaxSteps
+		c.Agent.MaxSteps = 0
+		c.Agent.PlannerMaxSteps = 0
 		c.Agent.SystemPrompt = systemPrompt
 		return nil
 	})

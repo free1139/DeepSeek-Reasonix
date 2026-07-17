@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	"reasonix/internal/agent"
@@ -11,6 +12,9 @@ import (
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/jobs"
+	"reasonix/internal/provider"
+	"reasonix/internal/skill"
+	"reasonix/internal/tool"
 )
 
 // turnOrchestrator owns foreground turn execution while Controller keeps the
@@ -48,7 +52,105 @@ func (o *turnOrchestrator) runComposedSyntheticTurn(ctx context.Context, text st
 	return c.runner.Run(agent.WithMemoryCompilerSkip(ctx), c.ComposeSynthetic(text))
 }
 
-func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchestratedTurn) error {
+// runSubagentSkillGoalLoop executes a slash-invoked runAs=subagent skill as a
+// real isolated child turn, then lets an active goal continue just as an inline
+// skill turn did before.
+func (o *turnOrchestrator) runSubagentSkillGoalLoop(ctx context.Context, sk skill.Skill, task, raw, display string, runner skill.SubagentRunner, planMode bool) error {
+	return o.runSubagentSkillTurnsGoalLoop(ctx, []skill.Skill{sk}, task, raw, display, runner, planMode)
+}
+
+func (o *turnOrchestrator) runSubagentSkillTurnsGoalLoop(ctx context.Context, skills []skill.Skill, task, raw, display string, runner skill.SubagentRunner, planMode bool) error {
+	if err := o.runSubagentSkillTurns(ctx, skills, task, raw, display, runner, planMode); err != nil {
+		if ctx.Err() != nil {
+			o.c.stopGoal(GoalStatusStopped)
+		}
+		return err
+	}
+	return o.continueGoal(ctx)
+}
+
+// runSubagentSkillTurns records the composed user task and distilled child
+// answers only. Child reasoning and tool chatter stay out of the
+// provider-visible parent context while their UI events nest under synthetic
+// top-level run_skill cards.
+func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []skill.Skill, task, raw, display string, runner skill.SubagentRunner, planMode bool) (err error) {
+	c := o.c
+	c.maybeSessionStart(ctx)
+	parentSession := c.parentSessionID()
+	images := c.inputImages(raw)
+	ctx = agent.WithParentSession(ctx, parentSession)
+	ctx = jobs.WithSession(ctx, parentSession)
+	ctx = agent.WithUserImages(ctx, images)
+	ctx = agent.WithResponseLanguagePreference(ctx, c.responseLanguage)
+	ctx = agent.WithReasoningLanguagePreference(ctx, c.reasoningLanguage)
+
+	input := c.compose(task, raw, true)
+	startMessages := c.messageCount()
+	defer c.snapshotActivityIfChanged(startMessages)
+	defer c.recordDisplayForNewUser(startMessages, display)
+	c.beginCheckpoint(input)
+	if c.guardianSess != nil {
+		c.guardianSess.ResetTurn()
+	}
+	if c.hooks.Enabled() {
+		c.mu.Lock()
+		c.turn++
+		turn := c.turn
+		c.mu.Unlock()
+		if block, _ := c.hooks.PromptSubmit(ctx, input, turn); block {
+			return nil
+		}
+		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
+	}
+
+	c.markInFlightTurn(startMessages, true)
+	inFlight := true
+	defer func() {
+		if inFlight {
+			c.clearInFlightTurn()
+		}
+	}()
+	c.sink.Emit(event.Event{Kind: event.TurnStarted})
+	if c.executor == nil {
+		return fmt.Errorf("subagent slash invocation requires an active session")
+	}
+	c.executor.Session().Add(provider.Message{Role: provider.RoleUser, Content: input, Images: images})
+
+	for _, sk := range skills {
+		callID := fmt.Sprintf("slash-skill-%d", c.slashSkillSeq.Add(1))
+		args, _ := json.Marshal(map[string]string{"name": sk.Name, "arguments": task})
+		toolEvent := event.Tool{
+			ID:       callID,
+			Name:     "run_skill",
+			Args:     string(args),
+			ReadOnly: sk.ReadOnly,
+		}
+		if c.skillProfile != nil {
+			toolEvent.Profile = c.skillProfile(sk)
+		}
+		c.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: toolEvent})
+		runCtx := agent.WithToolCallContext(ctx, callID, c.sink, c, planMode)
+		runCtx = agent.WithSubagentDepth(runCtx, 0)
+		answer, err := runner(runCtx, sk, input, skill.SubagentRunOptions{HostInitiated: true})
+		if err != nil {
+			toolEvent.Err = err.Error()
+			c.sink.Emit(event.Event{Kind: event.ToolResult, Tool: toolEvent})
+			return err
+		}
+		answer = tool.GuardSubagentHostDecisionText(answer)
+		toolEvent.Output = answer
+		c.sink.Emit(event.Event{Kind: event.ToolResult, Tool: toolEvent})
+		c.executor.Session().Add(provider.Message{Role: provider.RoleAssistant, Content: answer})
+		c.sink.Emit(event.Event{Kind: event.Text, Text: answer})
+		c.sink.Emit(event.Event{Kind: event.Message, Text: answer})
+	}
+
+	c.clearInFlightTurn()
+	inFlight = false
+	return nil
+}
+
+func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchestratedTurn) (err error) {
 	c := o.c
 	c.maybeSessionStart(ctx)
 	if !turn.synthetic {
@@ -96,7 +198,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		if block, _ := c.hooks.PromptSubmit(ctx, input, turn); block {
 			return nil // the hook's notify callback already surfaced the reason
 		}
-		defer func() { c.hooks.Stop(context.Background(), lastAssistantText(c.History()), turn) }()
+		defer func() { c.hooks.StopResult(context.Background(), lastAssistantText(c.History()), turn, err) }()
 	}
 	c.markInFlightTurn(startMessages, !turn.synthetic && !IsSyntheticUserMessage(turn.raw))
 	autoResearchTaskID := c.goals.currentAutoResearchTaskID()
@@ -106,7 +208,11 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	if !turn.synthetic {
 		modelInput = c.withCapabilityRoute(input, turn.raw)
 	}
-	err := c.runner.Run(ctx, modelInput)
+	if scopeID, task, ok := c.goals.deliveryScope(); ok {
+		ctx = agent.WithDeliveryExecutionScope(ctx, agent.DeliveryExecutionScope{ID: scopeID, TaskText: task})
+	}
+	err = c.runner.Run(ctx, modelInput)
+	c.persistGoalDeliveryCheckpoint()
 	if err == nil {
 		c.recordAutoResearchEvidenceFromAssistant(autoResearchTaskID, lastAssistantText(c.History()))
 		c.recordAutoResearchTurnProgress(autoResearchTaskID, autoResearchAcceptedBefore)
@@ -147,6 +253,14 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		return err
 	}
 	if !allow {
+		// When plan mode is already off, the user explicitly exited plan mode
+		// while the approval was pending. Suppress auto-plan for the next turn
+		// so it does not immediately re-enter the mode the user just left.
+		c.mu.Lock()
+		if !c.planMode {
+			c.suppressAutoPlan = true
+		}
+		c.mu.Unlock()
 		return nil // keep planning; plan mode stays on
 	}
 	c.SetPlanMode(false)
@@ -178,6 +292,11 @@ func (o *turnOrchestrator) runGoalLoopWithRawDisplay(ctx context.Context, input,
 	if err := o.runTurnWithRawDisplay(ctx, input, raw, display); err != nil {
 		if ctx.Err() != nil {
 			o.c.stopGoal(GoalStatusStopped)
+		} else {
+			var readiness *agent.FinalReadinessError
+			if errors.As(err, &readiness) {
+				o.c.stopGoal(GoalStatusBlocked)
+			}
 		}
 		return err
 	}
@@ -188,6 +307,11 @@ func (o *turnOrchestrator) runEditedGoalLoopWithRawDisplay(ctx context.Context, 
 	if err := o.runEditedTurnWithRawDisplay(ctx, input, raw, display, original); err != nil {
 		if ctx.Err() != nil {
 			o.c.stopGoal(GoalStatusStopped)
+		} else {
+			var readiness *agent.FinalReadinessError
+			if errors.As(err, &readiness) {
+				o.c.stopGoal(GoalStatusBlocked)
+			}
 		}
 		return err
 	}

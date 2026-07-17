@@ -104,7 +104,12 @@ Hooks 让 Reasonix 在会话、用户输入、工具调用、模型返回、压�
 
 `match` 是锚定正则：`"file"` 不会匹配 `read_file`，需要写成 `".*file"`。正则非法时该 hook 不会触发。
 
-`command` 会通过平台 shell 执行：macOS/Linux 使用 `sh -c`，Windows 使用 `cmd /c`。stdin 是 Reasonix 写入的一行 JSON，见下面的 payload 表。
+`command` 默认通过平台 shell 执行：macOS/Linux 使用 `sh -c`，Windows 使用
+`cmd /c`。如果 Windows hook 自己显式写了裸命令 `sh -c` 或 `bash -c`，Reasonix
+会查找 Git for Windows 自带的 Bash 并直接使用它；带目录的显式解释器路径保持不变。
+找不到 Git Bash 时会返回可操作的依赖提示。Hook stdout/stderr 中的 Windows 旧代码页
+文本会转换为 UTF-8，避免中文错误信息显示成乱码。stdin 是 Reasonix 写入的一行 JSON，
+见下面的 payload 表。
 
 ## 配置里的事件 key
 
@@ -251,7 +256,7 @@ if (/\brm\s+-rf\b/.test(command) || /\bgit\s+push\b/.test(command)) {
 ## 排障
 
 - 保存后当前会话没有变化：Hooks 在会话构建时加载。重启桌面端后才会重新读取配置；`/new` 只开启新对话，不会重新加载 hooks。
-- 项目 hooks 不执行：确认当前是项目工作区，并在“设置 -> Hooks -> 项目”点击“信任此工作区”。CLI 中也可以运行 `/hooks trust`。
+- 项目 hooks 不执行：确认当前是项目工作区，并在“设置 -> Hooks -> 项目”点击“信任此工作区”。CLI 中也可以运行 `/hooks trust`。也可用只读诊断：`reasonix doctor capabilities` 或桌面端 **设置 → 诊断**（见 [能力诊断](./CAPABILITY_DIAGNOSTICS.zh-CN.md)），关注 `hook.untrusted_project` / `hook.invalid_matcher`。
 - `match` 没生效：它只对 `PreToolUse` 和 `PostToolUse` 生效，并且是锚定正则。
 - JSON 报 unknown hook event：事件 key 必须完全等于上表的大小写。
 - hook 输出太长：每路 stdout/stderr 最多捕获 256KB，超出会截断并显示截断提示。

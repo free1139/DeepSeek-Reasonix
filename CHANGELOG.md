@@ -6,12 +6,39 @@ branch.
 
 ## Unreleased
 
+### Added
+
+- Added Claude Code-style searchable CLI pickers for models, providers, and
+  sessions, with arrow, Vim, and `Ctrl+P` / `Ctrl+N` navigation.
+- Added `-p` / `--print`, `text`, `json`, and `stream-json` output modes for
+  one-shot use and automation.
+- Added session-scoped `--allowed-tools`, repeatable `--add-dir`, Claude-compatible
+  permission modes, flexible `--resume [QUERY]`, and the `--copy` resume escape
+  hatch.
+- Added `/status` details for the active model, effort, cache, Git state,
+  background jobs, work profile, and provider balance where available.
+
 ### Changed
 
-- Agent runtime defaults now leave both executor and dedicated planner tool-call
-  rounds unlimited (`max_steps = 0`, `planner_max_steps = 0`). Step limits now
-  come from the user/global config only; project `reasonix.toml` does not
-  override them.
+- `Shift+Tab` now cycles CLI safe modes from Ask to Auto to Plan, while YOLO
+  remains an independent `Ctrl+Y` toggle.
+- Model, provider, resume, and approval menus now use consistent row selection;
+  slash completion, help, aliases, and dispatch share one command registry.
+- Runtime rebuilds after model, effort, or work-mode changes now preserve the
+  conversation, session permission overrides, additional directories, and
+  session lease ownership.
+- Agent execution now monitors host-observed Todo progress automatically. A
+  stalled current item receives a recovery nudge after 8 tool-call rounds with
+  no new completion, unique read, command, or mutation, and pauses with saved
+  work after 16. Exact repeats do not renew the progress lease; real work does.
+  Two-level task lists keep the single in_progress contract: the active
+  sub-step is the only current item while its phase stays pending, and the
+  phase becomes in_progress to sign off only after all of its sub-steps are
+  completed. A level-1 sub-step with no phase header above it is rejected.
+  Executor and planner rounds now use automatic progress management. Retired
+  `[agent].max_steps` and `planner_max_steps` keys remain parseable for upgrades,
+  but are ignored and removed by a one-time migration so stale hidden limits
+  cannot truncate new behavior. One-off CLI and unattended bot limits remain.
 
 ## [1.0.0] — 2026-06-03
 

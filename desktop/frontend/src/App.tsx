@@ -37,18 +37,22 @@ import {
 import { useToast } from "./lib/toast";
 import { useWailsResizeFix } from "./lib/useWailsResizeFix";
 import { asArray } from "./lib/array";
-import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, useI18n, useT, type Translator } from "./lib/i18n";
-import { localizedBackendNoticeText, useController, type Item, type LiveStream } from "./lib/useController";
-import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered } from "./lib/bridge";
+import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, t, useI18n, useT, type Translator } from "./lib/i18n";
+import { localizedNoticeText, useController, type Item, type LiveStream } from "./lib/useController";
+import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered, openExternal } from "./lib/bridge";
 import { generativeMusic, isGenerativeMusicEnabled } from "./lib/generative-music";
 import { clearAttentionChimeKeys, playAttentionChime, playSuccessChime, shouldPlayAttentionChimeForEvent } from "./lib/sound";
-import { Transcript } from "./components/Transcript";
+import { NoticeCard, Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
+import { TranscriptSelectionMenu } from "./components/TranscriptSelectionMenu";
 import { TodoPanel } from "./components/TodoPanel";
-import { ApprovalModal, approvalToolLabel } from "./components/ApprovalModal";
+import { ApprovalModal } from "./components/ApprovalModal";
 import { AskCard } from "./components/AskCard";
 import { UndoRewindBanner } from "./components/UndoRewindBanner";
 import { ClearContextCard } from "./components/ClearContextCard";
+
+/** Footer decision surface kinds. Priority: tool/plan approval > ask > clear context. */
+type DecisionSurfaceKind = "tool_approval" | "plan_approval" | "ask" | "clear_context";
 import { StatusBar } from "./components/StatusBar";
 import { CommandPalette, type PaletteItem } from "./components/CommandPalette";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -60,9 +64,11 @@ import { OnboardingOverlay } from "./components/OnboardingOverlay";
 import { AppChrome } from "./components/AppChrome";
 import { ShortcutsCheatsheet } from "./components/ShortcutsCheatsheet";
 import { ProjectTree } from "./components/ProjectTree";
+import { WorktreeBadge } from "./components/WorktreeBadge";
 import { HeartbeatPanel } from "./custom/features/heartbeat/HeartbeatPanel";
 import "./custom/features/heartbeat/heartbeat.css";
 import { CopyButton } from "./components/CopyButton";
+import { ExternalOpener } from "./components/ExternalOpener";
 import { parseTodos } from "./lib/tools";
 import {
   dismissedTodoKeyForScope,
@@ -89,6 +95,8 @@ import {
   type TokenMode,
   type ToolApprovalMode,
 } from "./lib/types";
+import type { InvocationMetadataMap, StructuredInvocationSubmit } from "./lib/invocationDisplay";
+import { formatSelectionReference, type SelectedTextInsertRequest } from "./lib/selectedTextContext";
 import {
   composerProfileFromMeta,
   composerProfileFromTab,
@@ -114,6 +122,8 @@ import {
   type RestorableToolApprovalMode,
 } from "./lib/toolApprovalMode";
 import {
+  CREATION_RIGHT_DOCK_MIN_RENDER_WIDTH,
+  CREATION_RIGHT_DOCK_TREE_MIN_WIDTH,
   CREATION_SIDEBAR_MIN_WIDTH,
   RIGHT_DOCK_MAX_WIDTH,
   RIGHT_DOCK_MIN_RENDER_WIDTH,
@@ -124,10 +134,14 @@ import {
   type RightDockMode,
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
+  applyLayoutStyleDefaults,
+  clampCreationRightDockTreeWidth,
   clampCreationSidebarWidth,
   clampRightDockPreviewWidth,
   clampRightDockTreeWidth,
   clampSidebarWidth,
+  defaultCreationRightDockTreeWidth,
+  defaultCreationSidebarWidth,
   defaultRightDockTreeWidth,
   defaultSidebarWidth,
   saveRightDockPreviewWidth,
@@ -159,6 +173,7 @@ import { createRafResizeUpdater } from "./lib/resizeDrag";
 import { useGlobalShortcut } from "./lib/keyboardShortcuts";
 import { topicShortcutIndexFromEvent, useTopicShortcuts, type TopicShortcutEntry } from "./lib/topicShortcuts";
 import { composerDraftKeyForTab } from "./lib/composerDraftKey";
+import { continueDelivery } from "./lib/deliveryContinue";
 import logoWordmark from "./assets/logo-wordmark.svg";
 
 function noticePreviewMockEnabled(): boolean {
@@ -167,19 +182,28 @@ function noticePreviewMockEnabled(): boolean {
 }
 
 function noticePreviewItems(): Item[] {
-  const notice = (index: number, level: "info" | "warn", text: string, detail: string): Item => ({
+  const notice = (index: number, level: "info" | "warn", text: string, detail: string, code?: string): Item => ({
     kind: "notice",
     id: `notice-preview-${index}`,
     level,
-    text: localizedBackendNoticeText(text),
+    text: localizedNoticeText(text, code),
     detail,
   });
   return [
-    notice(0, "info", "Task status needs one more check; asking the assistant to finish or explain what is blocking it.", "final-answer readiness blocked: latest successful todo_write still has incomplete items: UI spinner in_progress, settings persistence pending"),
-    notice(1, "info", "No visible answer was produced; asking the assistant to respond again.", "empty final answer blocked: qwen3.7-plus returned no visible answer text (finish=stop, reasoning=2314 chars); retrying"),
-    notice(2, "info", "The assistant answered before taking action; asking it to use the required tools.", "executor handoff: assistant produced a proposal before running required repository commands; nudged to execute"),
-    notice(3, "info", "Tool round limit reached; asking the assistant to summarize progress.", "tool budget reached after 128 tool calls; requesting a progress summary before continuing"),
-    notice(4, "info", "The assistant is stuck retrying a blocked action; asking it to change approach.", "loop guard: repeated command failure matched the same stderr signature across 3 attempts"),
+    {
+      kind: "notice",
+      id: "notice-preview-delivery",
+      level: "info",
+      variant: "delivery",
+      title: t("notice.deliveryIncompleteTitle"),
+      text: t("notice.deliveryIncompleteBody"),
+      detail: "final-answer readiness failed 3 times: missing verification, review_report, and complete_step receipts",
+      action: "continue_delivery",
+    },
+    notice(1, "info", "No visible answer was produced; asking the assistant to respond again.", "empty final answer blocked: qwen3.7-plus returned no visible answer text (finish=stop, reasoning=2314 chars); retrying", "empty_final"),
+    notice(2, "info", "The assistant answered before taking action; asking it to use the required tools.", "executor handoff: assistant produced a proposal before running required repository commands; nudged to execute", "executor_handoff"),
+    notice(3, "info", "Tool round limit reached; asking the assistant to summarize progress.", "tool budget reached after 128 tool calls; requesting a progress summary before continuing", "tool_budget"),
+    notice(4, "info", "The assistant is stuck retrying a blocked action; asking it to change approach.", "loop guard: repeated command failure matched the same stderr signature across 3 attempts", "loop_guard"),
     notice(5, "info", "Context is getting large; preserving cache until cleanup is needed.", "context window 82% full; deferred cleanup to preserve reusable prompt cache"),
     notice(6, "info", "Context cleanup skipped for now.", "cleanup skipped: recent turn included unresolved user approval state"),
     notice(7, "info", "Automatic context cleanup paused because the context window is too small.", "configured compact threshold exceeds current model context window; auto cleanup paused for this model"),
@@ -205,7 +229,7 @@ function noticePreviewItems(): Item[] {
   ];
 }
 
-function NoticePreviewPanel({ detailsLabel }: { detailsLabel: string }) {
+function NoticePreviewPanel() {
   return (
     <div
       style={{
@@ -218,20 +242,7 @@ function NoticePreviewPanel({ detailsLabel }: { detailsLabel: string }) {
       <div style={{ maxWidth: 920, margin: "0 auto" }}>
         {noticePreviewItems().map((item) => {
           if (item.kind !== "notice") return null;
-          return (
-            <div key={item.id} className={`notice-line notice-line--${item.level}`} data-entrance="true">
-              <span className="notice-line__icon">{item.level === "warn" ? "⚠ " : "ℹ "}</span>
-              <div className="notice-line__text">
-                {item.text}
-                {item.detail ? (
-                  <details className="notice-line__details">
-                    <summary>{detailsLabel}</summary>
-                    <div>{item.detail}</div>
-                  </details>
-                ) : null}
-              </div>
-            </div>
-          );
+          return <NoticeCard key={item.id} item={item} onAction={item.action ? () => undefined : undefined} />;
         })}
       </div>
     </div>
@@ -364,6 +375,7 @@ type SidebarImConnection = {
 type DesktopNavigationInput =
   | { kind: "topic"; scope: string; workspaceRoot: string; topicId: string; sessionPath?: string }
   | { kind: "blank"; scope: string; workspaceRoot: string }
+  | { kind: "delivery-worktree"; workspaceRoot: string }
   | { kind: "sidebar-im"; connection: SidebarImConnection }
   | { kind: "resume-session"; session: SessionMeta };
 type PendingDesktopNavigationRequest = PendingNavigationRequest<DesktopNavigationInput>;
@@ -988,6 +1000,7 @@ export default function App() {
     state,
     activeTabId,
     sendToTab,
+    recoverDeliveryToTab,
     runShellForTab,
     steerForTab,
     notice,
@@ -1001,6 +1014,7 @@ export default function App() {
     setToolApprovalModeForTab: setControllerToolApprovalModeForTab,
     setGoal: setControllerGoal,
     setGoalForTab: setControllerGoalForTab,
+    resumeGoalForTab: resumeControllerGoalForTab,
     clearGoal: clearControllerGoal,
     clearSession,
     listSessions,
@@ -1022,6 +1036,7 @@ export default function App() {
     setTokenMode,
     switchTab,
     openProjectTab,
+    createDeliveryWorktree,
     openGlobalTab,
     closeTab,
     reorderTabs,
@@ -1034,6 +1049,8 @@ export default function App() {
   const { locale, setPref: setLocalePref } = useI18n();
   const t = useT();
   const [composerProfilesByTab, setComposerProfilesByTab] = useState<Record<string, ComposerProfile>>({});
+  const runtimeTransitionTabsRef = useRef<Set<string>>(new Set());
+  const [runtimeTransitionsByTab, setRuntimeTransitionsByTab] = useState<Record<string, true>>({});
   const yoloRestoreToolApprovalModesRef = useRef<Record<string, RestorableToolApprovalMode>>({});
   const userPlanModeByTabRef = useRef<UserPlanModeIntents>({});
   const [tabMetas, setTabMetas] = useState<TabMeta[]>([]);
@@ -1051,6 +1068,7 @@ export default function App() {
   const settingsFocus = useOverlayStore((s) => s.settingsFocus);
   const setSettingsFocus = useOverlayStore((s) => s.setSettingsFocus);
   const [desktopLayoutStyle, setDesktopLayoutStyle] = useState<DesktopLayoutStyle>("workbench");
+  const [safeMode, setSafeMode] = useState(false);
   const singleSurfaceLayout = desktopLayoutStyle === "workbench" || desktopLayoutStyle === "creation";
   const [startupUpdateChecksEnabled, setStartupUpdateChecksEnabled] = useState<boolean | null>(null);
   const [histView, setHistView] = useState<HistoryViewState | null>(null);
@@ -1149,6 +1167,8 @@ export default function App() {
   const [projectRevision, setProjectRevision] = useState(0);
   const [activeTopicTurns, setActiveTopicTurns] = useState<number | undefined>(undefined);
   const [composerInsertRequestsByTab, setComposerInsertRequestsByTab] = useState<Record<string, ComposerInsertRequest>>({});
+  const [selectedTextRequestsByTab, setSelectedTextRequestsByTab] = useState<Record<string, SelectedTextInsertRequest>>({});
+  const selectedTextRequestIdRef = useRef(0);
   const [planRevisionInsertRequest, setPlanRevisionInsertRequest] = useState<{
     tabId: string;
     approvalId: string;
@@ -1173,6 +1193,8 @@ export default function App() {
   const [workspaceTogglePressed, setWorkspaceTogglePressed] = useState(false);
   const [clearContextPending, setClearContextPending] = useState(false);
   const topicRenameSkipCommitRef = useRef(false);
+  const prevDecisionSurfaceRef = useRef<DecisionSurfaceKind | null>(null);
+  const decisionSurfaceRef = useRef<DecisionSurfaceKind | null>(null);
   const topicRenameCommitHandledRef = useRef(false);
   const appRef = useRef<HTMLDivElement>(null);
   const layoutRef = useRef<HTMLDivElement>(null);
@@ -1292,7 +1314,9 @@ export default function App() {
       const nextTheme = normalizeThemePreference(settings.desktopTheme);
       const nextStyle = normalizeThemeStyleForTheme(settings.desktopThemeStyle, nextTheme);
       applyTheme(nextTheme, nextStyle, { persist: false });
-      setDesktopLayoutStyle(normalizeDesktopLayoutStyle(settings.desktopLayoutStyle));
+      const nextLayoutStyle = normalizeDesktopLayoutStyle(settings.desktopLayoutStyle);
+      setDesktopLayoutStyle(nextLayoutStyle);
+      applyLayoutStyleDefaults(nextLayoutStyle);
       setLocalePref(normalizeLangPref(settings.desktopLanguage));
       setStartupUpdateChecksEnabled(settings.checkUpdates !== false);
       setStatusBarStyle(settings.statusBarStyle === "text" ? "text" : "icon");
@@ -1317,6 +1341,7 @@ export default function App() {
       ]);
       if (cancelled) return;
       applyDesktopPreferences(settings);
+      setSafeMode(settings.safeMode === true);
       hydrateDisplayMode(settings.displayMode);
       setSidebarImConnections(sidebarImConnectionsFromBot(settings.bot, t, runtimeStatus));
       setImTopicSources(sidebarImTopicSourcesFromBot(settings.bot, t));
@@ -1353,15 +1378,33 @@ export default function App() {
   }, []);
 
   const [pendingPlanRevisionsByTab, setPendingPlanRevisionsByTab] = useState<Record<string, string>>({});
+  const [invocationMetadataByTab, setInvocationMetadataByTab] = useState<Record<string, InvocationMetadataMap>>({});
   const pendingPlanRevisionSendingTabsRef = useRef(new Set<string>());
   const [footerHeight, setFooterHeight] = useState(0);
   const footerHeightRef = useRef(0);
   const footerRef = useRef<HTMLElement>(null);
   const activeTabIdRef = useRef(activeTabId);
-  const commitThenSendRef = useRef<(tabId: string, displayText: string, submitText?: string) => Promise<void>>(async () => {});
+  const commitThenSendRef = useRef<(tabId: string, displayText: string, submitText?: string, structured?: StructuredInvocationSubmit) => Promise<void>>(async () => {});
+  const handleInvocationMetadataChange = useCallback((metadata: InvocationMetadataMap) => {
+    const sourceTabId = activeTabIdRef.current;
+    if (!sourceTabId) return;
+    setInvocationMetadataByTab((current) => {
+      const previous = current[sourceTabId] ?? {};
+      const names = Object.keys(metadata);
+      if (names.length === Object.keys(previous).length && names.every((name) => (
+        previous[name]?.kind === metadata[name]?.kind && previous[name]?.color === metadata[name]?.color
+      ))) return current;
+      return { ...current, [sourceTabId]: metadata };
+    });
+  }, []);
   const rightDockDetailActive = rightDockMode !== "context" && workspacePreviewActive;
   const preferredWorkspacePanelWidth = rightDockDetailActive ? rightDockPreviewWidth : rightDockTreeWidth;
-  const workspacePanelMinWidth = rightDockDetailActive ? RIGHT_DOCK_PREVIEW_MIN_WIDTH : RIGHT_DOCK_TREE_MIN_WIDTH;
+  const rightDockTreeMinWidth = desktopLayoutStyle === "creation" ? CREATION_RIGHT_DOCK_TREE_MIN_WIDTH : RIGHT_DOCK_TREE_MIN_WIDTH;
+  const rightDockTreeWidthClamp = desktopLayoutStyle === "creation" ? clampCreationRightDockTreeWidth : clampRightDockTreeWidth;
+  const rightDockMinRenderWidth = desktopLayoutStyle === "creation" && !rightDockDetailActive
+    ? CREATION_RIGHT_DOCK_MIN_RENDER_WIDTH
+    : RIGHT_DOCK_MIN_RENDER_WIDTH;
+  const workspacePanelMinWidth = rightDockDetailActive ? RIGHT_DOCK_PREVIEW_MIN_WIDTH : rightDockTreeMinWidth;
   const chatReservedWidth = workspacePanelOpen && !workspacePanelMaximized ? CHAT_COMFORT_MIN_WIDTH : CHAT_MIN_WIDTH;
   const workspacePanelAvailableWidth = availableWorkspacePanelWidth({
     viewportWidth,
@@ -1382,7 +1425,7 @@ export default function App() {
   const storedWorkspacePanelRenderWidth = workspacePanelMaximized ? preferredWorkspacePanelWidth : resolvedWorkspacePanelWidth;
   const workspacePanelRenderWidth = liveWorkspacePanelRenderWidth ?? storedWorkspacePanelRenderWidth;
   const workspacePanelRenderable =
-    workspacePanelOpen && (workspacePanelMaximized || workspacePanelRenderWidth >= RIGHT_DOCK_MIN_RENDER_WIDTH);
+    workspacePanelOpen && (workspacePanelMaximized || workspacePanelRenderWidth >= rightDockMinRenderWidth);
   const workspacePanelGridOpen = workspacePanelRenderable && !workspacePanelMaximized;
   const resolveLiveWorkspacePanelRenderWidth = useCallback(
     (preferredWidth: number, nextSidebarWidth = sidebarWidth) =>
@@ -1410,6 +1453,14 @@ export default function App() {
       ? planRevisionInsertRequest.request
       : null;
   const composerInsertRequest = activeTabId ? composerInsertRequestsByTab[activeTabId] ?? null : null;
+  const selectedTextRequest = activeTabId ? selectedTextRequestsByTab[activeTabId] ?? null : null;
+  const prefillSubagentCommand = useCallback((command: string) => {
+    if (!activeTabId) return;
+    setComposerInsertRequestsByTab((current) => ({
+      ...current,
+      [activeTabId]: { id: Date.now(), text: command, mode: "prefix" },
+    }));
+  }, [activeTabId]);
   const composerSessionKey = useMemo(() => {
     return composerDraftKeyForTab(activeTab, activeTabId);
   }, [activeTab, activeTabId]);
@@ -1468,7 +1519,40 @@ export default function App() {
   const collaborationMode = displayedComposerProfileCollaborationMode(composerProfile);
   const toolApprovalMode = composerProfile.toolApprovalMode;
   const tokenMode: TokenMode = composerProfile.tokenMode;
-  const controllerReady = state.meta?.ready === true && !state.backendActivationPending;
+  const runtimeTransitioning = Boolean(activeTabId && runtimeTransitionsByTab[activeTabId]);
+  const controllerReady = state.meta?.ready === true && !state.backendActivationPending && !runtimeTransitioning;
+  // Single footer decision surface. Composer stays mounted underneath and is
+  // only visually/a11y-hidden so per-session draft caches survive.
+  const decisionSurface = useMemo((): DecisionSurfaceKind | null => {
+    if (state.approval) {
+      return state.approval.tool === "exit_plan_mode" ? "plan_approval" : "tool_approval";
+    }
+    if (state.ask) return "ask";
+    if (clearContextPending) return "clear_context";
+    return null;
+  }, [clearContextPending, state.approval, state.ask]);
+  decisionSurfaceRef.current = decisionSurface;
+  useEffect(() => {
+    // Close composer menus/popovers when a decision takes over the footer.
+    if (decisionSurface) {
+      closeTransientOverlays();
+      prevDecisionSurfaceRef.current = decisionSurface;
+      return;
+    }
+    // Restore composer focus on the next frame only if the tab did not switch
+    // and no new decision arrived (remote resolution / rapid consecutive prompts).
+    const hadDecision = prevDecisionSurfaceRef.current != null;
+    prevDecisionSurfaceRef.current = null;
+    if (!hadDecision) return;
+    const tabAtRelease = activeTabId;
+    const frame = requestAnimationFrame(() => {
+      if (decisionSurfaceRef.current != null) return;
+      if (activeTabIdRef.current !== tabAtRelease) return;
+      const input = document.getElementById("composer-input") as HTMLTextAreaElement | null;
+      input?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeTabId, closeTransientOverlays, decisionSurface]);
   const patchActiveComposerProfile = useCallback(
     (patch: Partial<Omit<ComposerProfile, "pending">>, pendingFields: ComposerProfileField[]) => {
       if (!activeTabId) return;
@@ -1549,16 +1633,17 @@ export default function App() {
     [activeTabId, patchActiveComposerProfile, syncModeToController],
   );
   const applyCollaborationMode = useCallback(
-    (m: CollaborationMode): Promise<void> => {
+    async (m: CollaborationMode): Promise<void> => {
       userPlanModeByTabRef.current = updateUserPlanModeIntent(userPlanModeByTabRef.current, activeTabId, m === "plan");
       if (m === "goal") {
         patchActiveComposerProfile({ collaborationMode: "normal", goalDraftMode: true, goal: "" }, ["collaborationMode", "goal"]);
         return setControllerCollaborationMode("normal");
       }
       patchActiveComposerProfile({ collaborationMode: m, goalDraftMode: false, goal: "" }, ["collaborationMode", "goal"]);
-      return setControllerCollaborationMode(m);
+      if (goal.trim()) await clearControllerGoal();
+      await setControllerCollaborationMode(m);
     },
-    [activeTabId, patchActiveComposerProfile, setControllerCollaborationMode],
+    [activeTabId, clearControllerGoal, goal, patchActiveComposerProfile, setControllerCollaborationMode],
   );
   const applyToolApprovalMode = useCallback(
     (m: ToolApprovalMode) => {
@@ -1587,7 +1672,7 @@ export default function App() {
     applyToolApprovalMode(next.mode);
   }, [activeTabId, applyToolApprovalMode, toolApprovalMode]);
   const applyGoal = useCallback(
-    (nextGoal: string) => {
+    async (nextGoal: string): Promise<void> => {
       userPlanModeByTabRef.current = updateUserPlanModeIntent(userPlanModeByTabRef.current, activeTabId, false);
       const trimmed = nextGoal.trim();
       patchActiveComposerProfile({
@@ -1595,16 +1680,36 @@ export default function App() {
         goalDraftMode: false,
         goal: trimmed,
       }, ["collaborationMode", "goal"]);
-      void (trimmed ? setControllerGoal(trimmed) : clearControllerGoal());
+      await (trimmed ? setControllerGoal(trimmed) : clearControllerGoal());
     },
     [activeTabId, clearControllerGoal, patchActiveComposerProfile, setControllerGoal],
   );
   const applyTokenMode = useCallback(
-    (m: TokenMode) => {
-      patchActiveComposerProfile({ tokenMode: m }, ["tokenMode"]);
-      void setTokenMode(m);
+    async (m: TokenMode): Promise<void> => {
+      const tabId = activeTabId;
+      if (!tabId || runtimeTransitionTabsRef.current.has(tabId) || m === composerProfile.tokenMode) return;
+      const previous = composerProfile.tokenMode;
+      runtimeTransitionTabsRef.current.add(tabId);
+      setRuntimeTransitionsByTab((current) => ({ ...current, [tabId]: true }));
+      setComposerProfilesByTab((current) => patchComposerProfile(current, tabId, composerProfile, { tokenMode: m }, ["tokenMode"]));
+      const switched = await setTokenMode(m);
+      if (!switched) {
+        setComposerProfilesByTab((current) => {
+          const profile = current[tabId] ?? composerProfile;
+          const pending = { ...profile.pending };
+          delete pending.tokenMode;
+          return { ...current, [tabId]: { ...profile, tokenMode: previous, pending } };
+        });
+      }
+      runtimeTransitionTabsRef.current.delete(tabId);
+      setRuntimeTransitionsByTab((current) => {
+        if (!current[tabId]) return current;
+        const next = { ...current };
+        delete next[tabId];
+        return next;
+      });
     },
-    [patchActiveComposerProfile, setTokenMode],
+    [activeTabId, composerProfile, setTokenMode],
   );
   // Shift+Tab toggles only the collaboration axis; Ctrl/Cmd+Y toggles YOLO on the
   // tool-permission axis while preserving the Ask/Auto base mode.
@@ -1640,8 +1745,9 @@ export default function App() {
   // successful top-level todo_write result; failed or still-running attempts do
   // not advance the canonical panel state. Incomplete lists are always shown so
   // a stale local dismissal cannot hide work that still blocks final readiness;
-  // completed lists collapse automatically and can then be dismissed. The
-  // dismissal key is still based on stable todo content/state so history reloads
+  // every new list starts collapsed while its header keeps showing live progress
+  // and the current task; completed lists can then be dismissed. The dismissal
+  // key is still based on stable todo content/state so history reloads
   // do not resurrect the same finished list under a different event id. The
   // batch key ignores status changes so progress within the same task list does
   // not look like a brand-new task batch. Dismissal and open state are scoped to
@@ -1789,7 +1895,7 @@ export default function App() {
   // (/skill, /hooks, /mcp) — goes straight to Submit, which the controller
   // resolves (a turn, or a listing Notice).
   const handleSend = useCallback(
-    async (displayText: string, submitText = displayText, requestedTabId = activeTabId) => {
+    async (displayText: string, submitText = displayText, requestedTabId = activeTabId, structured?: StructuredInvocationSubmit) => {
       const sourceTabId = requestedTabId || activeTabId;
       if (!sourceTabId) throw new Error(t("composer.workspaceStarting"));
       const trimmed = displayText.trim();
@@ -1832,10 +1938,10 @@ export default function App() {
               goal: displayGoal,
             }, ["collaborationMode", "goal"]);
           } else {
-            applyGoal(displayGoal);
+            await applyGoal(displayGoal);
           }
         } else if (["clear", "off", "stop", "done"].includes(displayGoal.toLowerCase())) {
-          applyGoal("");
+          await applyGoal("");
         }
         if (!controllerReady) return;
         await commitThenSendRef.current(sourceTabId, trimmed, submitText.trim());
@@ -1843,7 +1949,7 @@ export default function App() {
       }
       if (collaborationMode === "goal" && !goal.trim()) {
         if (!controllerReady) return;
-        applyGoal(trimmed);
+        await applyGoal(trimmed);
         await commitThenSendRef.current(sourceTabId, trimmed, `/goal ${submitText.trim()}`);
         return;
       }
@@ -1885,7 +1991,7 @@ export default function App() {
       await setControllerCollaborationModeForTab(sourceTabId, controllerComposerProfileCollaborationMode(composerProfile));
       await setControllerToolApprovalModeForTab(sourceTabId, toolApprovalMode);
       if (goal.trim()) await setControllerGoalForTab(sourceTabId, goal);
-      await commitThenSendRef.current(sourceTabId, trimmed, submitText.trim());
+      await commitThenSendRef.current(sourceTabId, trimmed, submitText.trim(), structured);
     },
     [activeTabId, applyGoal, closeTransientOverlays, collaborationMode, composerProfile, controllerReady, goal, notice, runShellForTab,
       setControllerCollaborationModeForTab, setControllerGoalForTab, setControllerToolApprovalModeForTab, switchModel, t, toolApprovalMode, showToast],
@@ -2049,6 +2155,26 @@ export default function App() {
     saveSidebarWidth(SIDEBAR_MIN_WIDTH);
   }, [desktopLayoutStyle, sidebarWidth]);
 
+  useEffect(() => {
+    if (desktopLayoutStyle === "creation") {
+      if (rightDockTreeWidth >= CREATION_RIGHT_DOCK_TREE_MIN_WIDTH) return;
+      setRightDockTreeWidth(CREATION_RIGHT_DOCK_TREE_MIN_WIDTH);
+      saveRightDockTreeWidth(CREATION_RIGHT_DOCK_TREE_MIN_WIDTH);
+      return;
+    }
+    if (rightDockTreeWidth >= RIGHT_DOCK_TREE_MIN_WIDTH) return;
+    setRightDockTreeWidth(RIGHT_DOCK_TREE_MIN_WIDTH);
+    saveRightDockTreeWidth(RIGHT_DOCK_TREE_MIN_WIDTH);
+  }, [desktopLayoutStyle, rightDockTreeWidth]);
+
+  // Creation no longer exposes the overview tab. If a previous session left
+  // rightDockMode on "context", coerce it to files so 文件 stays selected.
+  useEffect(() => {
+    if (desktopLayoutStyle !== "creation") return;
+    if (rightDockMode !== "context") return;
+    setRightDockMode("files");
+  }, [desktopLayoutStyle, rightDockMode, setRightDockMode]);
+
   const setExpandedSidebarWidth = useCallback((width: number) => {
     closeTransientOverlays();
     const next = sidebarWidthClamp(width);
@@ -2130,11 +2256,11 @@ export default function App() {
         saveRightDockPreviewWidth(next);
         return;
       }
-      const next = clampRightDockTreeWidth(width);
+      const next = rightDockTreeWidthClamp(width);
       setRightDockTreeWidth(next);
       saveRightDockTreeWidth(next);
     },
-    [closeTransientOverlays, rightDockDetailActive],
+    [closeTransientOverlays, rightDockDetailActive, rightDockTreeWidthClamp],
   );
 
   const ensureWorkspacePanelWidth = useCallback(
@@ -2171,7 +2297,7 @@ export default function App() {
         if (rightDockDetailActive) {
           nextDockWidth = clampRightDockPreviewWidth(nextDockWidth);
         } else {
-          nextDockWidth = clampRightDockTreeWidth(nextDockWidth);
+          nextDockWidth = rightDockTreeWidthClamp(nextDockWidth);
         }
         liveResize.schedule(resolveLiveWorkspacePanelRenderWidth(nextDockWidth));
       };
@@ -2192,7 +2318,7 @@ export default function App() {
       window.addEventListener("pointerup", onDone);
       window.addEventListener("pointercancel", onDone);
     },
-    [closeTransientOverlays, resolveLiveWorkspacePanelRenderWidth, rightDockDetailActive, setSavedWorkspacePanelWidth, workspacePanelOpen, workspacePanelRenderWidth],
+    [closeTransientOverlays, resolveLiveWorkspacePanelRenderWidth, rightDockDetailActive, rightDockTreeWidthClamp, setSavedWorkspacePanelWidth, workspacePanelOpen, workspacePanelRenderWidth],
   );
 
   const resizeWorkspacePanelWithKeyboard = useCallback(
@@ -2202,13 +2328,13 @@ export default function App() {
         setSavedWorkspacePanelWidth(workspacePanelRenderWidth + (event.key === "ArrowLeft" ? 16 : -16));
       } else if (event.key === "Home") {
         event.preventDefault();
-        setSavedWorkspacePanelWidth(rightDockDetailActive ? RIGHT_DOCK_PREVIEW_MIN_WIDTH : RIGHT_DOCK_TREE_MIN_WIDTH);
+        setSavedWorkspacePanelWidth(rightDockDetailActive ? RIGHT_DOCK_PREVIEW_MIN_WIDTH : rightDockTreeMinWidth);
       } else if (event.key === "End") {
         event.preventDefault();
         setSavedWorkspacePanelWidth(rightDockDetailActive ? RIGHT_DOCK_MAX_WIDTH : RIGHT_DOCK_TREE_MAX_WIDTH);
       }
     },
-    [rightDockDetailActive, setSavedWorkspacePanelWidth, workspacePanelRenderWidth],
+    [rightDockDetailActive, rightDockTreeMinWidth, setSavedWorkspacePanelWidth, workspacePanelRenderWidth],
   );
 
   const openWorkspacePanel = useCallback(
@@ -2252,8 +2378,14 @@ export default function App() {
       closeWorkspacePanel();
       return;
     }
+    // Creation hides the overview tab; never reopen into the invisible "context"
+    // mode or neither 文件/改动 will show an active selection.
+    if (desktopLayoutStyle === "creation") {
+      openWorkspacePanel(rightDockMode === "changed" ? "changed" : "files");
+      return;
+    }
     openWorkspacePanel("context");
-  }, [closeWorkspacePanel, openWorkspacePanel, pulseWorkspaceToggle, workspacePanelRenderable]);
+  }, [closeWorkspacePanel, desktopLayoutStyle, openWorkspacePanel, pulseWorkspaceToggle, rightDockMode, workspacePanelRenderable]);
 
   const openRightDockMode = useCallback(
     (mode: RightDockMode) => {
@@ -2305,6 +2437,35 @@ export default function App() {
         [activeTabId]: { id: Date.now(), text },
       }));
     }
+  }, [activeTabId, state.approval, workspaceInsertTarget]);
+
+  const addSelectedTextToComposer = useCallback((text: string) => {
+    const selected = text.trim();
+    if (!activeTabId || !selected) return;
+    selectedTextRequestIdRef.current += 1;
+    setSelectedTextRequestsByTab((current) => ({
+      ...current,
+      [activeTabId]: { id: selectedTextRequestIdRef.current, text: selected },
+    }));
+  }, [activeTabId]);
+
+  const addWorkspaceCodeToComposer = useCallback((path: string, code: string) => {
+    if (!activeTabId || !code.trim()) return;
+    if (workspaceInsertTarget === "planRevision" && state.approval?.tool === "exit_plan_mode") {
+      // The plan-revision input is plain text and only consumes request.text,
+      // so hand it the fenced rendering instead of a structured reference.
+      setPlanRevisionInsertRequest({
+        tabId: activeTabId,
+        approvalId: state.approval.id,
+        request: { id: Date.now(), text: formatSelectionReference(path, code) },
+      });
+      return;
+    }
+    selectedTextRequestIdRef.current += 1;
+    setSelectedTextRequestsByTab((current) => ({
+      ...current,
+      [activeTabId]: { id: selectedTextRequestIdRef.current, text: code, path },
+    }));
   }, [activeTabId, state.approval, workspaceInsertTarget]);
 
   // Coalesce tab-bar switches through the same last-click-wins scheduler that
@@ -2455,7 +2616,7 @@ export default function App() {
   }, [state.items]);
 
   // send wrapper: commits any pending optimistic rewind before sending.
-  const commitThenSend = useCallback(async (sourceTabId: string, displayText: string, submitText?: string) => {
+  const commitThenSend = useCallback(async (sourceTabId: string, displayText: string, submitText?: string, structured?: StructuredInvocationSubmit) => {
     const sourceTab = tabMetas.find((tab) => tab.id === sourceTabId);
     if (!sourceTab) throw new Error(t("composer.workspaceStarting"));
     if (sourceTab.readOnly) throw new Error(t("composer.readOnlyChannel"));
@@ -2483,7 +2644,7 @@ export default function App() {
         setProjectRevision((v) => v + 1);
       }
     }
-    await sendToTab(sourceTabId, displayText, submitText);
+    await sendToTab(sourceTabId, displayText, submitText, undefined, structured);
   }, [rewindForTab, sendToTab, setRewindCommittingForTab, setRewindStateForTab, t, tabMetas]);
 
   const handleTranscriptPrompt = useCallback((text: string) => {
@@ -2492,6 +2653,17 @@ export default function App() {
       console.warn("Failed to submit transcript prompt", err);
     });
   }, [activeTabId, commitThenSend, controllerReady]);
+
+  const handleDeliveryContinue = useCallback(async () => {
+    await continueDelivery({
+      tabId: activeTabIdRef.current,
+      ready: controllerReady,
+      goal: state.meta?.goal,
+      activeTabId: () => activeTabIdRef.current,
+      resumeGoal: resumeControllerGoalForTab,
+      send: (tabId) => recoverDeliveryToTab(tabId, t("notice.deliveryIncompleteContinuePrompt")),
+    });
+  }, [controllerReady, recoverDeliveryToTab, resumeControllerGoalForTab, state.meta?.goal, t]);
   commitThenSendRef.current = commitThenSend;
 
   const handleMessageAction = useCallback((turn: number, scope: string) => {
@@ -2687,6 +2859,25 @@ export default function App() {
         return;
       }
 
+      if (request.kind === "delivery-worktree") {
+        const result = await createDeliveryWorktree(request.workspaceRoot);
+        if (!latest()) return;
+        seedActiveTabMeta(result.tab);
+        setProjectRevision((value) => value + 1);
+        await refreshLatestTabMetas();
+        if (!latest()) return;
+        showToast(
+          result.sourceDirty
+            ? t("projectTree.worktreeCreatedDirty", { branch: result.branch })
+            : t("projectTree.worktreeCreated", { branch: result.branch }),
+          result.sourceDirty ? "warn" : "info",
+          { durationMs: result.sourceDirty ? 7000 : 3500 },
+        );
+        setTabRevealSignal((signal) => signal + 1);
+        setTranscriptRevealSignal((signal) => signal + 1);
+        return;
+      }
+
       if (request.kind === "sidebar-im") {
         const { connection } = request;
         const target = sidebarImSessionTarget(connection);
@@ -2746,6 +2937,11 @@ export default function App() {
         void refreshLatestTabMetas();
         return;
       }
+      if (request.kind === "delivery-worktree") {
+        console.warn("isolated Delivery workspace creation failed", err);
+        showToast(err instanceof Error ? err.message : String(err), "error", { durationMs: 6000 });
+        return;
+      }
       if (request.kind === "sidebar-im") {
         console.warn("bot sidebar open failed", err);
         showToast(t("sidebar.imOpenFailed", { name: request.connection.title }));
@@ -2763,7 +2959,7 @@ export default function App() {
         showToast(err?.message || String(err));
       }
     }
-  }, [activateTopic, ensureBlankSurface, ensureBlankTab, openChannelSession, openGlobalTab, openProjectTab, openTopicSession, refreshHistoryView, resumeSession, seedActiveTabMeta, showToast, singleSurfaceLayout, t]);
+  }, [activateTopic, createDeliveryWorktree, ensureBlankSurface, ensureBlankTab, openChannelSession, openGlobalTab, openProjectTab, openTopicSession, refreshHistoryView, resumeSession, seedActiveTabMeta, showToast, singleSurfaceLayout, t]);
 
   const enqueueNavigation = useCallback((input: DesktopNavigationInput): Promise<void> => enqueueNavigationRequest(
     { seqRef: navigationSeqRef, runningRef: navigationRunningRef, pendingRef: navigationPendingRef },
@@ -3049,7 +3245,9 @@ export default function App() {
   const guidanceQueueMockItems = isGuidanceMockScenario(browserMockScenario) ? GUIDANCE_QUEUE_MOCK_ITEMS : undefined;
   const workspacePanelResetWidth = rightDockDetailActive
     ? RIGHT_DOCK_PREVIEW_DEFAULT_WIDTH
-    : defaultRightDockTreeWidth();
+    : desktopLayoutStyle === "creation"
+      ? defaultCreationRightDockTreeWidth()
+      : defaultRightDockTreeWidth();
   const workspacePanelResizeMinWidth = workspacePanelAriaMinWidth(workspacePanelMinWidth, workspacePanelRenderWidth);
   const workspacePanelMaxWidth = rightDockDetailActive ? RIGHT_DOCK_MAX_WIDTH : RIGHT_DOCK_TREE_MAX_WIDTH;
   const sidebarCreation = desktopLayoutStyle === "creation";
@@ -3101,6 +3299,7 @@ export default function App() {
         browserPreviewChrome ? "app--browser-preview" : "",
         sidebarWorkbench ? "app--workbench" : "",
         sidebarCreation ? "app--creation" : "",
+        !sidebarWorkbench && !sidebarCreation ? "app--classic" : "",
       ].filter(Boolean).join(" ")}
     >
       <div
@@ -3250,6 +3449,7 @@ export default function App() {
               onOpenTopic={handleOpenTopic}
               onOpenProjectHistory={openProjectHistory}
               onCreateTopic={(scope, workspaceRoot) => openBlankSession(scope, scope === "project" ? workspaceRoot : "")}
+              onCreateDeliveryWorktree={(workspaceRoot) => enqueueNavigation({ kind: "delivery-worktree", workspaceRoot })}
               onTopicsChanged={refreshProjectsAndTabs}
               onRenameTopic={renameTopic}
               refreshSignal={projectRevision}
@@ -3390,7 +3590,7 @@ export default function App() {
           aria-valuenow={sidebarRenderWidth}
           onPointerDown={startSidebarResize}
           onKeyDown={resizeSidebarWithKeyboard}
-          onDoubleClick={() => setExpandedSidebarWidth(defaultSidebarWidth())}
+          onDoubleClick={() => setExpandedSidebarWidth(desktopLayoutStyle === "creation" ? defaultCreationSidebarWidth() : defaultSidebarWidth())}
         />
         {sidebarCreation && (
           <button
@@ -3481,6 +3681,7 @@ export default function App() {
               {topicbarSubtitleVisible && (
                 <div className="topicbar__subtitle" title={topicbarSubtitleTitle}>
                   {topicbarWorkspaceLabel && <span>{topicbarWorkspaceLabel}</span>}
+                  {activeTab?.isolatedWorktree && <WorktreeBadge size={11} />}
                   {topicbarImSourcePlatform && (
                     <span className={`topicbar__source-chip topicbar__source-chip--${topicbarImSourcePlatform}`}>
                       {topicbarImSourceLabel}
@@ -3556,18 +3757,23 @@ export default function App() {
               </div>
               </>
               )}
-              <Tooltip label={t("workspace.changedTab")}>
-                <button
-                  className="topicbar__action-btn topicbar__action-btn--label"
-                  type="button"
-                  aria-label={t("workspace.changedTab")}
-                  aria-pressed={workspacePanelRenderable && rightDockMode === "changed"}
-                  onClick={() => openRightDockMode("changed")}
-                >
-                  <GitBranch size={14} />
-                  <span>{t("workspace.changedTab")}</span>
-                </button>
-              </Tooltip>
+              {!sidebarCreation && (
+                <Tooltip label={t("workspace.changedTab")}>
+                  <button
+                    className="topicbar__action-btn topicbar__action-btn--label"
+                    type="button"
+                    aria-label={t("workspace.changedTab")}
+                    aria-pressed={workspacePanelRenderable && rightDockMode === "changed"}
+                    onClick={() => openRightDockMode("changed")}
+                  >
+                    <GitBranch size={14} />
+                    <span>{t("workspace.changedTab")}</span>
+                  </button>
+                </Tooltip>
+              )}
+              {!sidebarImDetailConnection && activeTab?.scope === "project" && (
+                <ExternalOpener tabId={activeTab.id} dismissSignal={transientOverlayDismissSignal} />
+              )}
               <Tooltip label={t("shortcuts.cheatsheetTitle")}>
                 <button
                   className="topicbar__action-btn topicbar__action-btn--icon topicbar__action-btn--utility"
@@ -3584,13 +3790,17 @@ export default function App() {
               </Tooltip>
               <Tooltip label={t("topicBar.command")}>
                 <button
-                  className="topicbar__action-btn topicbar__action-btn--label topicbar__action-btn--accent"
+                  className={
+                    sidebarCreation
+                      ? "topicbar__action-btn topicbar__action-btn--icon topicbar__action-btn--utility"
+                      : "topicbar__action-btn topicbar__action-btn--label topicbar__action-btn--accent"
+                  }
                   type="button"
                   aria-label={t("topicBar.command")}
                   onClick={() => void openPalette()}
                 >
                   <Command size={14} />
-                  <span>{t("topicBar.command")}</span>
+                  {!sidebarCreation && <span>{t("topicBar.command")}</span>}
                 </button>
               </Tooltip>
               {sidebarCreation && (
@@ -3617,8 +3827,17 @@ export default function App() {
           {state.meta?.startupErr && (
             <div className="banner banner--error">{t("topbar.startupError", { msg: state.meta.startupErr })}</div>
           )}
+          {safeMode && (
+            <div className="banner banner--warning">{t("guard.safeMode")}</div>
+          )}
 
-          <UpdateBanner enabled={startupUpdateChecksEnabled === true} />
+          <UpdateBanner
+            enabled={startupUpdateChecksEnabled === true}
+            onShowReleaseNotes={(latest) => {
+              const version = latest.replace(/^(?:desktop-)?v/, "");
+              void openExternal(`https://reasonix.io/changelog/v${version}/`);
+            }}
+          />
 
           <main className="main">
             {sidebarImDetailConnection ? (
@@ -3630,7 +3849,7 @@ export default function App() {
                 onOpenSession={() => void openSidebarImConnectionSession(sidebarImDetailConnection)}
               />
             ) : noticePreviewMockEnabled() ? (
-              <NoticePreviewPanel detailsLabel={t("notice.details")} />
+              <NoticePreviewPanel />
             ) : (
               <Transcript
                 items={displayItems}
@@ -3638,6 +3857,7 @@ export default function App() {
                 tabId={activeTabId}
                 footerHeight={footerHeight}
                 onPrompt={handleTranscriptPrompt}
+                onDeliveryContinue={() => void handleDeliveryContinue()}
                 onEditPrompt={handleEditPrompt}
                 onRewind={handleMessageAction}
                 checkpoints={state.checkpoints}
@@ -3655,6 +3875,7 @@ export default function App() {
                 olderHistoryCount={state.historyStartTurn}
                 loadingOlderHistory={state.historyOlderLoading}
                 onLoadOlderHistory={() => activeTabId && loadOlderHistory(activeTabId)}
+                invocationMetadata={activeTabId ? invocationMetadataByTab[activeTabId] : undefined}
               />
             )}
           </main>
@@ -3687,7 +3908,8 @@ export default function App() {
                 }}
               />
             )}
-            {state.approval && (
+            {decisionSurface === "tool_approval" || decisionSurface === "plan_approval"
+              ? state.approval && (
               <ApprovalModal
                 key={`${activeTabId ?? ""}:${state.approval.id}`}
                 approval={state.approval}
@@ -3718,8 +3940,9 @@ export default function App() {
                 }}
                 toolApprovalMode={toolApprovalMode}
               />
-            )}
-            {state.ask && (
+              )
+            : decisionSurface === "ask"
+              ? state.ask && (
               <AskCard
                 key={`${activeTabId ?? ""}:${state.ask.id}`}
                 ask={state.ask}
@@ -3729,15 +3952,23 @@ export default function App() {
                   cancel();
                 }}
               />
-            )}
-            {clearContextPending && (
+              )
+            : decisionSurface === "clear_context" ? (
               <ClearContextCard
                 onCancel={cancelClearContext}
                 onConfirm={() => {
                   void confirmClearContext();
                 }}
               />
-            )}
+            ) : null}
+            {/* Composer stays mounted under a decision so per-session draft
+                caches (text, attachments, paste blocks, guidance) survive. */}
+            <div
+              className={decisionSurface ? "composer-decision-host composer-decision-host--hidden" : "composer-decision-host"}
+              hidden={Boolean(decisionSurface) || undefined}
+              inert={decisionSurface ? true : undefined}
+              aria-hidden={decisionSurface ? true : undefined}
+            >
             <Composer
               running={state.running || rewindCommitting}
               collaborationMode={collaborationMode}
@@ -3750,6 +3981,7 @@ export default function App() {
               tabId={activeTabId}
               effort={state.effort}
               onSend={handleSend}
+              onInvocationMetadataChange={handleInvocationMetadataChange}
               onSteer={handleSteer}
               onCancel={cancel}
               onCycleMode={cycleMode}
@@ -3762,16 +3994,19 @@ export default function App() {
               onSetEffort={setEffort}
               onSetTokenMode={applyTokenMode}
               insertRequest={composerInsertRequest}
+              selectedTextRequest={selectedTextRequest}
               readOnly={Boolean(activeTab?.readOnly)}
-              disabled={rewindCommitting || state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
+              disabled={runtimeTransitioning || rewindCommitting || state.messageAction != null || Boolean(decisionSurface)}
               submitDisabled={!controllerReady}
-              decisionPending={rewindCommitting || state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
+              decisionPending={rewindCommitting || state.messageAction != null || Boolean(decisionSurface)}
               ready={controllerReady}
               turnStartAt={state.turnStartAt}
+              turnWaitAccumMs={state.turnWaitAccumMs}
+              promptWaitStartedAt={state.promptWaitStartedAt}
               turnTokens={state.turnTokens}
+              turnArgChars={state.turnArgChars}
               retry={state.retry}
-              pendingApprovalLabel={state.approval ? approvalToolLabel(state.approval.tool, t) : null}
-              pendingAsk={state.ask != null}
+              suspendedByDecision={Boolean(decisionSurface)}
               transientDismissSignal={transientOverlayDismissSignal}
               sessionKey={composerSessionKey}
               workspaceScopeKey={workspaceScopeKey}
@@ -3786,6 +4021,7 @@ export default function App() {
               cacheMissTokens={state.usage?.cacheMissTokens}
               balance={state.balance}
             />
+            </div>
             <StatusBar
               context={state.context}
               usage={state.usage}
@@ -3884,6 +4120,7 @@ export default function App() {
                   balance={state.balance}
                   sessionGen={state.sessionGen}
                   refreshKey={dockRefreshKey}
+                  usageSeq={state.usageSeq}
                 />
               ) : (
                 <WorkspacePanel
@@ -3900,11 +4137,13 @@ export default function App() {
                   }}
                   onPreviewModeChange={handleWorkspacePreviewModeChange}
                   onAddToChat={addWorkspaceTextToComposer}
+                  onAddCodeToChat={addWorkspaceCodeToComposer}
                   onRequestPanelWidth={ensureWorkspacePanelWidth}
                   onFileTreeRefresh={refreshComposerFileRefs}
                   refreshKey={dockRefreshKey}
                   initialViewMode={rightDockMode === "changed" ? "changed" : "files"}
                   showViewTabs={false}
+                  creationMode={sidebarCreation}
                 />
               )}
             </div>
@@ -3939,6 +4178,7 @@ export default function App() {
             initialFocus={settingsFocus ?? undefined}
             agentRunning={state.running}
             desktopPlatform={desktopPlatform}
+            onUseSubagent={prefillSubagentCommand}
             onClose={() => {
               setSettingsFocus(null);
               setSettingsTarget(null);
@@ -3983,6 +4223,11 @@ export default function App() {
       <HeartbeatPanel open={heartbeatOpen} onClose={() => setHeartbeatOpen(false)} onOpenTopic={(scope, workspaceRoot, topicId) => {
         void handleOpenTopic(scope, workspaceRoot, topicId);
       }} />
+      <TranscriptSelectionMenu
+        enabled={Boolean(activeTabId && !activeTab?.readOnly && !decisionSurface && !sidebarImDetailConnection && !hydratePlaceholderActive)}
+        resetKey={activeTabId ?? ""}
+        onAddToChat={addSelectedTextToComposer}
+      />
       {windowsFramelessChrome && <WindowsWindowControls />}
     </div>
     </ShellExpandProvider>

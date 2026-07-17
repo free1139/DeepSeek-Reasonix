@@ -12,6 +12,7 @@
 ## 目录
 
 - [配置](#配置)
+- [CLI 命令参考](./CLI.zh-CN.md)
 - [环境变量](#环境变量)
 - [Serve Web 前端](#serve-web-前端)
 - [配置路径](./CONFIG_PATHS.zh-CN.md)
@@ -21,6 +22,7 @@
 - [桌面端 Hooks](./DESKTOP_HOOKS.zh-CN.md)
 - [快捷键](#快捷键)
 - [权限与沙盒](#权限与沙盒)
+- [能力诊断](#能力诊断)
 - [插件（MCP）](#插件mcp)
 - [斜杠命令](#斜杠命令)
 - [@ 引用](#-引用)
@@ -50,12 +52,9 @@ default_model = "deepseek-flash"   # 执行器；设 [agent].planner_model 可�
 # cursor_shape = "underline"       # block|underline|bar；CLI/TUI 输入光标
 
 [agent]
-max_steps = 0                    # 仅用户/全局；执行器工具调用轮数；0 表示不限
-planner_max_steps = 0            # 仅用户/全局；规划器只读工具调用轮数；0 表示不限
 reasoning_language = "auto"      # 可见思考过程语言：auto|zh|en
-# plan_mode_allowed_tools = ["custom_reader"]   # 仅声明额外只读自定义工具；
-#                                                # 不能解锁被计划模式阻断的工具或 unsafe bash
-# plan_mode_read_only_commands = ["gh issue view", "gh pr diff"]   # 计划模式额外只读 shell 前缀
+# plan_mode_allowed_tools = ["mcp__legacy__reader"]   # 旧 MCP 只读信任别名；不改变 Plan 可用性
+# plan_mode_read_only_commands = ["gh issue view"]   # 仅兼容旧配置；Plan bash 现由 Permissions 决定
 # planner_model = "deepseek-pro"      # 可选的低频规划器
 # subagent_model = "deepseek-pro"     # runAs=subagent skill 的默认模型
 # subagent_models = { review = "deepseek-pro", security_review = "deepseek-pro" }
@@ -95,7 +94,7 @@ allow = ["Bash(go test:*)"]                  # 从不询问
 [sandbox]
 # workspace_root = ""          # 文件写工具被限制在此目录；留空 = 当前目录
 # allow_write    = ["/tmp"]    # write_file/edit_file/multi_edit/move_file 额外可写的目录
-# forbid_read    = ["${HOME}/.ssh"]   # agent 不可读取或列出的目录
+# forbid_read    = ["${HOME}/.ssh"]   # agent 不可读取或列出的路径
 
 [serve]
 auth_mode = "none"             # none|token|password；绑定到非 localhost 前请先开启认证
@@ -112,19 +111,14 @@ tool_timeout_seconds = { "generate_video" = 1800 }   # 可选：raw MCP tool 名
 
 完整 schema 与每个字段的契约见 [`SPEC.md` §5](./SPEC.md#5-configuration-toml)。
 
-`[agent].plan_mode_allowed_tools` 用于把 Reasonix 无法自动分类的自定义/外部工具声明为额外只读工具。
-对 MCP/plugin 工具，像 `mcp__github__issue_read` 这样的具体模型可见名也会把该工具提升为
-planner / read-only research 可用的可信只读工具。优先使用 MCP 只读信任的一次性确认；需要预置已审过工具时，
-再在 plugin 上写 `trusted_read_only_tools`，`plan_mode_allowed_tools` 保留为兼容逃生阀。它不再解锁 `bash`、`task`、
-写文件工具、安装器、记忆变更工具等计划模式已知阻断项，也不会绕过 bash 在计划模式下的安全检查。
+旧字段 `[agent].plan_mode_allowed_tools` 仍会被解析并重新渲染。具体的
+`mcp__<server>__<tool>` 条目继续充当本地只读信任别名，但推荐把已审计的 raw MCP reader
+名称写到对应 server 的 `trusted_read_only_tools`。这个字段不会放行或阻断主 Plan 工作流中的调用。
 
-当计划阶段需要运行 Reasonix 尚不能自动分类、但你确认只读的 shell 查询命令时，使用
-`[agent].plan_mode_read_only_commands`，例如 `gh issue view`、`gh pr diff` 或内部只读查询 CLI。
-这里声明的是具体命令前缀，不是工具名：`["gh issue view"]` 会允许 `gh issue view 4572`，
-但 `bash`、`sh` 等 shell 解释器前缀会被忽略。shell 操作符、重定向、命令替换、后台进程、
-以及内置命令里的写能力参数在计划模式下仍会被阻断。交互式计划模式第一次需要某个未知查询前缀时，
-Reasonix 也可以提示你确认是否信任它为只读；选择持久信任会写入同一个
-`[agent].plan_mode_read_only_commands` 配置。Auto/YOLO 审批不会替用户回答这个信任提示。
+`[agent].plan_mode_read_only_commands` 也继续参与配置 round-trip，但主 Plan 工作流不再维护独立的
+bash allowlist 或信任提示。Plan 与常规模式使用相同的 Permissions 规则做 bash 分类和审批；Sandbox
+仍是文件系统、进程和网络的强制边界。独立 planner 和显式只读 subagent runner 继续使用自己的严格
+只读工具 registry 与前台命令分类器。
 
 ### 环境变量
 
@@ -187,6 +181,22 @@ Web UI 提供聊天、工具审批、会话历史、rewind/fork/summarize、模�
 Goal、由 `todo_write` 工具驱动的实时 Todo 面板，以及已配置 provider 的余额显示。临时启动可用
 `--model`、`--max-steps` 或 `--resume`；不传 `--model` 时，`serve` 使用用户全局
 `default_model`。
+
+## 通过 ACP 接入编辑器
+
+`reasonix acp` 向 ACP 编辑器客户端公开三条彼此独立的会话轴：
+
+- `modes`：`normal`、`plan`、`goal`。选择 Goal 后，下一条用户输入会成为活动目标，
+  并启动 Reasonix 现有的 Goal 持续推进循环。
+- `work_mode`：`economy`、`balanced`、`delivery`。切换时会原子重建 Controller，
+  同时保留历史、协作方式和工具权限。`reasonix acp --profile ...` 仍可设置启动默认值。
+- `tool_approval`：`ask`、`auto`、`yolo`。切换权限不会重建 Controller，也不会改变
+  协作方式或工作模式。
+
+模型和推理强度仍是独立的 ACP 配置项。Reasonix 会按 ACP 会话持久化这三条轴；旧会话元数据
+缺少新字段时，工作模式继承 ACP 进程的启动 profile（未传 `--profile` 时为均衡），权限和
+协作方式使用“询问 + 常规”。为兼容旧版混合 mode 列表，`session/set_mode` 仍接受
+`default`（常规 + 询问）和 `auto`（常规 + Yolo），新客户端应使用拆分后的独立选择器。
 
 ## 自定义 OpenAI-compatible provider
 
@@ -268,7 +278,8 @@ Thinking 覆盖选项：
 ## 快捷键
 
 这里按使用端来写，因为用户通常是先知道“我现在在桌面端/CLI”，再找对应按键。
-核心模式规则很小：`Shift+Tab` 只管 Plan，`Ctrl/Cmd+Y` 只管 YOLO，粘贴继续走系统粘贴快捷键。
+桌面端仍用 `Shift+Tab` 切换 Plan；CLI 则用它在 Ask、Auto、Plan 之间循环。
+`Ctrl/Cmd+Y` 只管 YOLO，粘贴继续走系统粘贴快捷键。
 
 `[ui].shortcut_layout` 仍被接受以兼容旧配置，但下面的快捷键行为已经跨布局统一。
 
@@ -302,7 +313,7 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 | --- | --- | --- |
 | `Enter` | 发送当前消息 | IME 组合输入确认不会被截获。 |
 | `Shift+Enter` | 插入换行 | 输入框保持焦点。 |
-| `Shift+Tab` | 切换 Plan 开/关 | Plan 是只读规划，不会循环 Ask/Auto/YOLO。 |
+| `Shift+Tab` | 切换 Plan 开/关 | Plan 只改变“先规划”的工作流；内置 writer 仍走当前 Ask/Auto/YOLO 与 Sandbox，MCP writer/destructive 目标在整个规划阶段保持硬阻断。 |
 | `Cmd+Y` / `Ctrl+Y` | 切换 YOLO 开/关 | 关闭 YOLO 时会尽量恢复之前的 Ask/Auto 基底。 |
 | macOS `Cmd+V`，Windows/Linux `Ctrl+V` | 粘贴剪贴板内容 | 剪贴板图片会作为附件加入；图片也可以拖进输入框。 |
 | 输入边界处的普通 `Up` / `Down` | 回放更旧或更新的已提交提示词 | 带修饰键的方向键和原生文本导航仍交给 textarea。 |
@@ -346,12 +357,12 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 
 | 按键或命令 | 作用 | 说明 |
 | --- | --- | --- |
-| `Shift+Tab` | 切换 Plan 开/关 | Plan 是只读规划，不会循环 Ask/Auto/YOLO。 |
+| `Shift+Tab` | 按 Ask → Auto → Plan → Ask 循环 | YOLO 不进入这个输入模式循环；底部状态栏会显示当前模式。 |
 | `Ctrl+Y` | 切换 YOLO 开/关 | 关闭 YOLO 时会尽量恢复之前的 Ask/Auto 基底。终端若能转发 Command/Super，也可能识别 `Cmd+Y`，但稳定可用的是 `Ctrl+Y`。 |
 | `--yolo`、`--dangerously-skip-permissions` | 启动时进入 YOLO | 和 `Ctrl+Y` 是同一个运行时模式。 |
+| `/work-mode [economy|balanced|delivery]` | 查看或切换当前会话的工作模式 | `/profile` 是兼容别名。切换会原子重建运行时，保留对话和审批姿态；有工作正在进行时会拒绝切换。 |
 | `Ctrl+O` | 切换详细 reasoning 显示 | 也可通过 `/verbose` 使用。 |
 | `Ctrl+B` | 展开或收起较长 shell 输出 | TUI 默认不启用鼠标报告，因此可和终端原生文本选择共存。 |
-| Ask / Auto | 没有键盘循环 | Ask 是默认交互基底；Auto 不通过 `Shift+Tab` 进入，需要由暴露工具审批姿态的客户端或 API 直接设置。 |
 | `/goal <目标>`、`/goal --research <目标>`、`/goal --simple <目标>`、`/goal status`、`/goal clear` | 启动、查看或清除 Goal | Goal 不进入任何快捷键循环；明显长周期目标会自动启用 AutoResearch。普通输入命中强 AutoResearch 信号时也会自动升级为 Goal。 |
 | `/migrate`、`/migrate --from <旧目录>` | 重试旧数据迁移，或从指定 v0.x 来源导入 sessions | Windows v0.52 自定义安装/数据目录用 `--from`；该形式只导入 sessions。详见[配置路径](./CONFIG_PATHS.zh-CN.md)。 |
 
@@ -359,11 +370,11 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 
 | 上下文 | 按键 | 作用 |
 | --- | --- | --- |
-| 斜杠或 `@` 补全 | `Up` / `Down`、`Tab` / `Enter`、`Esc` | 移动、接受或关闭补全菜单。 |
+| 斜杠或 `@` 补全 | `Up` / `Down`、`Ctrl+P` / `Ctrl+N`、`Tab` / `Enter`、`Esc` | 移动、接受或关闭补全菜单。 |
 | 工具审批提示 | `y`/`1`、`a`/`2`、`p`/`3`、`n`/`4`、`Enter`、`Esc`、`Ctrl+C` | 允许一次、本会话允许、持久允许、拒绝、默认允许一次、拒绝，或取消当前 turn。 |
 | Ask 问题卡 | `Up`/`Down` 或 `j`/`k`、`Left`/`Right` 或 `h`/`l`、`Space`、`Enter`、`1`-`9`、`Esc`、`Ctrl+C` | 导航答案/问题标签、切换多选、提交/激活、选择编号选项、关闭，或取消当前 turn。 |
 | Rewind 选择器 | `Up`/`Down` 或 `j`/`k`、`Enter`、`b`、`c`、`d`、`f`、`s`、`u`、`Esc` | 选择 turn，应用 both/conversation/code/fork/summarize 动作，或返回/关闭。 |
-| Resume 选择器 | `Up`/`Down` 或 `j`/`k`、`Enter`、`Esc` | 选择已保存 session 或关闭选择器。 |
+| 模型、provider 或 Resume 选择器 | `Up`/`Down` 或 `Ctrl+P`/`Ctrl+N`；搜索词为空时可用 `j`/`k`；输入文字过滤；`Enter`；`Esc` | 搜索、选择或关闭选择器；开始搜索后 `j`/`k` 会作为查询字符输入；`/provider` 会继续打开该 provider 的模型列表。 |
 | MCP 导入选择器 | `Up`/`Down` 或 `j`/`k`、`Space`、`Enter`、`Esc` / `Ctrl+C` | 移动、勾选服务器、导入勾选服务器，或取消。 |
 | MCP 管理器 | `Up`/`Down` 或 `j`/`k`、`Enter`、`Left`/`Right` 或 `h`/`l`、`r`、数字键、`q` / `Ctrl+C` | 导航服务器列表/详情、刷新、选择动作，或关闭。 |
 | `/clear` 确认 | 方向键或 `j`/`k` / `Tab`、`Enter`、`y`、`n`、`Esc` / `Ctrl+C` | 在 Clear/Cancel 间切换、确认清空，或取消。 |
@@ -374,8 +385,8 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 | --- | --- |
 | Ask | writer 兜底审批时询问。 |
 | Auto | 自动放行兜底审批；显式 `ask` / `deny` 规则仍生效。 |
-| YOLO | 跳过普通工具审批；`deny`、用户 `ask` 问题、计划批准提示、MCP 只读信任提示仍会等待。 |
-| Plan | 下一轮保持只读规划，直到计划被批准或关闭 Plan。 |
+| YOLO | 跳过普通工具审批；`deny`、用户 `ask` 问题和计划批准提示仍会等待。 |
+| Plan | 要求模型先规划——这是 plan-first 工作流，不是全部工具只读。内置 writer 仍遵守当前 Ask/Auto/YOLO 与 Sandbox；已安装 MCP writer、destructive 目标与未信任 reader 在整个规划阶段硬阻断（审批不能放行，退出 Plan 后恢复）；`complete_step` 等显式阶段工具需等到计划批准后。 |
 | Goal | 持续追一个已保存目标，直到完成、阻塞或清除。 |
 
 ## 权限与沙盒
@@ -387,46 +398,62 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 其中 Bash 默认按具体命令记，也可按安全推导出的命令前缀记（如 `Bash(go test:*)`）；文件编辑类工具的本会话授权按编辑能力记，持久授权则写入 `Edit(<path>)` 文件路径规则；
 `reasonix run` 保持自主运行但仍然遵守 `deny`。
 
+Ask 不是只读模式：writer 获得批准后仍会执行。Permissions 决定放行或询问，Sandbox 才是强制能力边界。
+
 权限是**策略**（哪些调用放行/询问），**沙盒**是**强制**：文件写工具
 （`write_file` / `edit_file` / `multi_edit` / `move_file`）拒绝 `[sandbox] workspace_root`
 之外的任何路径（默认当前目录，编辑不出项目），并解析符号链接与 `..`，使链接无法
-打洞越界。`forbid_read` 可选地隐藏敏感目录，使 agent 的读文件、列目录和搜索工具不能读取或列出它们；
+打洞越界。`forbid_read` 可选地隐藏敏感文件或目录，使 agent 的读文件、列目录和搜索工具不能读取或列出它们；
 建议使用绝对路径或 `${HOME}` / `${VAR}`，不要写 `~`，因为配置只做环境变量展开。
-`bash` 本身默认进 OS 沙盒（`[sandbox] bash`：macOS 使用 Seatbelt，Linux 使用 bubblewrap，
-原生 Windows 使用 native helper）：命令只能写这些 root（外加平台按命令提供的临时/缓存 root），
+`bash` 本身默认进 OS 沙盒（`[sandbox] bash`：macOS 使用 Seatbelt，Linux 使用 bubblewrap）：
+命令只能写这些 root（外加平台按命令提供的临时/缓存 root），
 OS 沙盒生效时也不能读取配置的 `forbid_read` roots，`[sandbox] network` 为真时才能联网。
-原生 Windows helper 使用 Reasonix 内置的 Windows sandbox backend：
-只读命令使用 AppContainer，可写命令使用 low-integrity token；它会临时授予
-workspace、每次命令专用 temp root 和目标可执行文件的访问权，对 `forbid_read`
-（文件和目录皆可）临时添加 deny ACE，修改前记录被触碰目录的 DACL，命令结束后尽力恢复。
-作用于同一 workspace 的并发命令会被串行化，避免各自的 ACL 修改互相破坏；被强杀命令
-残留的 low-integrity 标签或 `forbid_read` deny ACE 会由下一次运行清理。由于可写命令跑在
-low-integrity token 下，除配置的 root 外它仍能写入 Windows 对任何 low-integrity 进程开放的
-少数位置（例如 `%USERPROFILE%\AppData\LocalLow`），但 workspace 边界与 `forbid_read`
-拒绝依然有效。只读 AppContainer 命令在关闭网络时不给 network capability；可写 Windows 命令遇到
-`[sandbox] network = false` 时会 fail closed。
+Reasonix 始终会从工具子进程环境中移除已保存的 provider 与 bot 凭据变量，并自动把
+全局凭据 `.env` 加入运行时禁读边界；项目 `.env` 仍保持现有的 workspace 范围行为。
+**Windows 说明：**Reasonix 不在 Windows 上提供 OS 级 Bash 沙箱，生效模式固定为
+`off`。旧配置即使写了 `bash = "enforce"` 也会解析为 `off`，`reasonix doctor`
+会提示该设置被忽略，桌面设置中的选择器也为只读。Bash 命令会在不受 OS 沙箱限制的
+环境中运行；专用文件工具仍会在进程内执行 `workspace_root`、`allow_write` 和
+`forbid_read` 边界。已保存的凭据变量仍不会进入子进程环境，但获得批准的无沙箱 shell
+以当前用户身份运行，不能作为保护其他用户可读文件的安全边界。
 
-**Windows 现状说明：**稳定版目前在 Windows 上把 Bash 沙箱的生效模式强制为
-`off`——即使显式写了 `bash = "enforce"` 也会解析为 `off`（`reasonix doctor`
-会提示该设置被忽略）——因为原生 Windows 后端仍会破坏常见的 Git Bash/MSYS2、
-Docker 和 git 工作流。上面的 Windows 沙盒描述保留为后端修复后重新启用时的设计基准。
+没有可用 OS 沙盒时，`bash = "enforce"` 会拒绝 bash 执行，不会无沙盒运行。
+Windows 上兼容的值始终为 `off`。
 
-没有可用 OS 沙盒时，`bash = "enforce"` 会拒绝 bash 执行，不会无沙盒运行
-（越界询问与可选的 Windows elevated 加固见
-[`SPEC.md` §9](./SPEC.md#9-roadmap-not-in-current-scope)）。
+反馈编码质量问题时，可运行 `reasonix doctor quality <branch-id-or-path>`（加
+`--json` 输出结构化结果）。命令会读取指定 session，但只输出不含内容的计数与
+Profile 分类：模型家族、运行模式、协作/审批模式、消息和工具调用数、验证与已持久化的
+compaction 摘要数，以及可用时的桌面端 token/cache telemetry。结果不会包含对话正文、
+路径、session 标识、工具参数与输出、服务端点或自定义模型名，适合粘贴到公开 Issue
+或 Discussion。它不同于 `reasonix doctor session`：后者生成的支持 zip 含完整未脱敏
+会话，只能在可信支持渠道分享。
 
-Windows 沙盒排障：沙盒会把 Reasonix 可执行文件自身以隐藏 helper 方式重新拉起，
-CLI 与桌面端都内置了这个 helper 入口——若某个构建缺少入口而又请求 enforce，
-bash 会以明确报错拒绝执行，而不是返回空输出。同一 workspace 上排队等待另一条
-沙盒命令时会打印一行“waiting for another sandboxed command”提示，并在可识别时
-标出持锁命令及其 PID。前台命令排队 1 分钟后即失败并给出同样的持锁信息（被挡住
-的回合应尽快报错，而不是挂住）；后台任务最多等 10 分钟，`WINDOWS_SANDBOX_LOCK_MS`
-可同时覆盖两者。应先停止提示中点名的命令；调大等待上限只会让后续命令等更久。
-如果只有 Git-for-Windows/MSYS2 bash
-下的沙盒命令失败，可试 `[tools.shell] prefer = "powershell"`——MSYS 运行时在
-low-integrity token 下较脆弱。运行 `reasonix doctor` 可查看解析到的 shell、沙盒
-可用性，以及项目 `reasonix.toml` 是否固定了 `[sandbox]`（项目文件优先级高于
-Settings/用户配置；沙盒配置变更需 reload session config 或新开会话才生效）。
+## 能力诊断
+
+当 skill、斜杠命令、Hook、插件包、MCP 或 `AGENTS.md` 缺失、被覆盖、未信任或启动失败时，用统一只读诊断。完整参数、JSON schema 与 issue code 见
+**[能力诊断](./CAPABILITY_DIAGNOSTICS.zh-CN.md)**。
+
+```bash
+# 静态（默认）：无网络、不启动 MCP 子进程
+reasonix doctor capabilities
+
+# 机器可读（stdout 仅为合法 JSON）
+reasonix doctor capabilities --json
+
+# 指定工作区
+reasonix doctor capabilities --root /path/to/project
+
+# Live MCP 探测——仅在你明确允许启动第三方服务器时使用
+reasonix doctor capabilities --live --timeout 5s
+```
+
+| 入口 | 用法 |
+| --- | --- |
+| CLI | 见上方 `reasonix doctor capabilities` |
+| 桌面端 | **设置 → 诊断** — 刷新、复制脱敏 JSON、可选「包含当前会话运行状态」（只读活动标签 Host，**不**启动 MCP） |
+| Agent | `/reasonix-guide`（内置 inline Skill）或自然语言描述症状；优先静态 doctor JSON，再问是否 `--live` |
+
+退出码：`0` 允许 warning/info；`1` 表示存在 `error`（或 live 启动失败）；`2` 为参数错误。与 `reasonix doctor`（provider/沙箱）以及 `reasonix plugin doctor <name>`（单个插件包）相互独立。
 
 ## 插件（MCP）
 
@@ -434,24 +461,45 @@ Reasonix 是一个 MCP 客户端。`[[plugins]]` 的 `type` 选择传输：`stdi
 程（`command`/`args`/`env`）；`http`（Streamable HTTP）连接远程 `url`，可带静态
 `headers`（`${VAR}` / `${VAR:-default}` 从环境展开，密钥不入文件）。工具以
 `mcp__<server>__<tool>` 暴露给模型，与 Claude Code 一致；声明 MCP `readOnlyHint: true`
-的工具会参与并行调度并命中权限层的只读默认放行，但 planner / read-only research 会先确认第三方
-自报只读。交互式会话里，第一次需要时允许即可；选择持久允许会把 raw MCP tool name 记住。
-这个信任提示属于用户决策，Auto/YOLO 工具审批不会代答；选择本会话允许或持久允许后，同一个 MCP
-工具不会在本会话里重复弹。
-高级用户也可以在 plugin 上预置审过的第三方读工具：
+的工具会参与并行调度并命中普通权限层的只读默认放行。这个标注来自第三方 server，主 Plan 只把它
+当作普通权限分类；它不会让工具进入独立 planner 或只读研究 subagent。已审计的 reader 应写入本地
+`trusted_read_only_tools`。没有 `readOnlyHint` 的工具仍按写工具处理。计划期间，内置 writer 仍走
+Permissions/Sandbox；已安装 MCP 与代理解析后的 MCP writer、destructive 目标和未信任
+reader 在任何审批前硬阻断，退出 Plan 后才恢复正常审批流程。
+
+MCP `destructiveHint: true` 的约束更严格。即使工具同时声明 `readOnlyHint`、当前是 Auto/YOLO，
+或已经存在 allow 规则，每次调用都需要全新的人工审批——Guardian、`auto_review`、自动/YOLO
+与会话授权都不能代替用户批准破坏性调用。
+
+`approvals_reviewer = "auto_review"` 只把真正需要审查的调用——`prompt` 模式、`writes`
+命中的写调用、以及全局策略本会 Ask 的 `auto` 调用——交给当前会话的 Guardian；成功给出的
+allow/deny 结论立即最终生效。reviewer 缺失、超时、失败或未给出结论时，调用降级为一次
+全新的人工审批：自动/YOLO、计划批准窗口与会话授权都不能代答。非交互运行和子代理在所有
+需要 reviewer 的场景下直接拒绝。
+
+server 和 raw tool 的审批策略只存在于本地，不会改变发给模型的 schema：
 
 ```toml
 [[plugins]]
 name = "github"
 command = "github-mcp"
+default_tools_approval_mode = "writes" # auto|prompt|writes|approve
+tools = { "delete_repository" = { approval_mode = "prompt" } }
+approvals_reviewer = "auto_review"     # user|auto_review
 trusted_read_only_tools = ["issue_read", "pull_request_read"]
 ```
 
-桌面端 MCP 面板保留为高级管理入口：展开已配置的服务器并打开工具列表；只有在想提前批准工具时，
-才使用 **预先信任只读** 或单个工具旁的 **预先信任**。用 **取消信任** 可以移除已记住的读工具。
-桌面端会把 raw MCP tool name 写入拥有该服务器的配置源：项目 `.mcp.json` 里的服务器会更新到
-`mcpServers.<server>.trusted_read_only_tools`，普通 Reasonix plugin 会写入用户级 Reasonix config。
-只信任无副作用的读取工具；create/update/delete 这类写工具应保持未信任。
+`auto` 交给全局 Ask/Auto/YOLO；`prompt` 每次调用都审查；`writes` 只审查写工具；`approve`
+放行普通调用。显式 deny 永远优先，`destructiveHint` 永远强制一次新审查，`tools` 中的 raw tool
+配置覆盖 server 默认值。`trusted_read_only_tools` 继续作为兼容字段和本地信任声明，用于已审计、
+但没有可靠 annotation 的 reader。
+
+两条边界值得注意：`writes` 信任 server 自己的只读分类，把写工具谎报成 `readOnlyHint`
+的 server 会绕过这层审查——对不可信的 server 请用 `prompt`。启用 Guardian 且未配置
+`approvals_reviewer` 时，`prompt`/`writes` 的审查保留 legacy 路由：Guardian 预审通过即可放行、
+不再弹人工提示；要求每次都由人决定时请显式配置 `approvals_reviewer = "user"`。项目
+`.mcp.json` 会把这些字段并入会话，所以像审代码一样审查别人仓库里的 `approve`/`writes`
+策略——显式 deny 规则和 `destructiveHint` 审查仍然生效。
 
 服务器的 **prompts** 会暴露成 `/mcp__<server>__<prompt>` 斜杠命令（命令后空格分隔参
 数）；**resources** 通过在消息里写 `@<server>:<uri>` 拉入；`/mcp` 列出已连接服务器及
@@ -475,6 +523,9 @@ headers = { Authorization = "Bearer ${STRIPE_KEY}" }
 
 启用的 MCP 服务器会在会话开始后于后台自动连接，因此工具上线期间聊天仍可正常使用。
 用 `/mcp` 或桌面端 MCP 面板可刷新状态、重连服务器、查看失败原因，或在当前会话内禁用某个服务器。
+若要跨 skills / hooks / 插件包 / MCP 做只读健康检查（不改配置），见
+[能力诊断](./CAPABILITY_DIAGNOSTICS.zh-CN.md)
+（`reasonix doctor capabilities` 或 **设置 → 诊断**）。
 
 **已有 Claude Code 的 `.mcp.json`？** 直接放到项目根目录，Reasonix 会原样读取——其
 `mcpServers` 规范（`command`/`args`/`env`、`type`/`url`/`headers`、`${VAR}` 展开）
@@ -495,13 +546,45 @@ headers = { Authorization = "Bearer ${STRIPE_KEY}" }
 
 ## 斜杠命令
 
-交互式 `reasonix` 会话里，内置命令（`/compact`、`/new`、`/clear`、`/rewind`、`/tree`、`/branch`、`/switch`、`/todo`、`/model`、`/mcp`、`/skills`、`/hooks`、`/memory`、`/memory-v5`、`/goal`、`/output-style`、`/sandbox`、`/language`、`/auto-plan`、`/reasoning-language`、`/help`）在本地执行——`/help` 可列出全部。
+交互式 `reasonix` 会话里，内置命令（`/compact`、`/new`、`/clear`、`/rewind`、`/tree`、`/branch`、`/switch`、`/todo`、`/model`、`/work-mode`、`/mcp`、`/skills`、`/hooks`、`/memory`、`/memory-v5`、`/goal`、`/output-style`、`/sandbox`、`/language`、`/auto-plan`、`/reasoning-language`、`/help`）在本地执行——`/help` 可列出全部。
+内置 **Skill**（如 `/init`、`/explore`、`/test`、`/reasonix-guide`）也会出现在斜杠菜单，
+并可通过 `run_skill` 调用（正文按需加载；只有索引行进入缓存稳定前缀）。配置或能力排障时
+用 `/reasonix-guide`，它会引导运行 `reasonix doctor capabilities`（见
+[能力诊断](./CAPABILITY_DIAGNOSTICS.zh-CN.md)）。
 `/new` 会开启新会话，同时保存之前的 transcript 供历史记录和恢复使用；`/clear` 会二次确认，确认后丢弃当前上下文且不保存。
 `/tree` 查看已保存的对话分支，`/branch [name]` 从当前对话末端分支，`/branch <turn> [name]`
 从较早的 checkpoint 轮次分支，`/switch <id|name>` 切换到另一个分支。**自定义命令**
 是放在 `.reasonix/commands/`（项目）或 `~/.reasonix/commands/`（用户）下的 Markdown 文件——
 `review.md` 即 `/review`，子目录构成命名空间（`git/commit.md` → `/git:commit`）。文件正文
 是 prompt 模板，调用即作为一轮对话发出。
+
+### 子智能体 Profile
+
+子智能体 profile 是带有 `runAs: subagent` 和 `invocation: manual` 的手动 Skill。
+它与桌面设置页共用项目级/全局 Skill 目录，因此任一端创建的 profile 在会话刷新后都会被
+另一端发现。交互式聊天里使用 `/<name> <任务>` 调用；Reasonix 会启动隔离子智能体，
+父会话只保留任务和最终答案。
+
+Headless CLI 提供显式管理和运行命令，同时不改变普通 `reasonix run` 的任务语义：
+
+```bash
+reasonix subagent list
+reasonix subagent create reviewer --description "审查改动" --prompt-file reviewer.md --tools read_file,grep,bash
+reasonix subagent edit reviewer --effort high --model deepseek-pro
+reasonix subagent try reviewer "审查当前 diff"   # 始终只读
+reasonix subagent run reviewer "审查并修复当前 diff"
+reasonix subagent delete reviewer --yes
+```
+
+workspace 可用时，`create` 默认写入项目级目录，否则默认写入全局目录；可用
+`--scope project|global` 明确选择。`edit` 只修改显式传入的字段，`--model=`、`--tools=`
+这类空值会清除对应配置。Profile 编辑器会拒绝
+custom path 或包含更多手写结构的 Skill，避免丢失 frontmatter、references 或 scripts；
+这些文件仍应通过 Skills 工作流管理。内置 profile 没有可编辑文件，因此 `edit` 对它们只接受
+`--model` 和 `--effort`，并写入与桌面设置页相同的按名称覆盖配置。
+
+完整 CLI 参数、Skill 文件格式、模型优先级、安全行为和排障说明见
+[子智能体 Profile](./SUBAGENT_PROFILES.zh-CN.md)。
 
 `/memory` 会同时列出记忆文档（`REASONIX.md` / `AGENTS.md`）和已保存的 auto-memory 条目。
 在 agent 回合中，只读的 `history` 和 `memory` 工具可以按需检索历史 session 决策、
@@ -597,9 +680,10 @@ project memory、tool schema 或 cache-stable system prompt。公开发布、破
 
 ## 双模型协同
 
-`reasonix setup` 刻意保持首次体验极简：选 provider → 输入 key（所选 provider 的所有
-SKU 都会启用）。若要让两个模型协同（执行器 + 规划器，各自独立、缓存稳定的
-session），向导后手动在 `reasonix.toml` 加一行即可：
+`reasonix setup` 现在统一管理 provider、模型列表、凭据、连接测试和默认模型；所有修改
+会暂存到“保存并退出”，并同步维护桌面端 provider access。完整用法见
+[CLI 命令参考](./CLI.zh-CN.md#配置供应商)。若要让两个模型协同（执行器 + 规划器，
+各自独立、缓存稳定的 session），向导后手动在 `reasonix.toml` 加一行即可：
 
 ```toml
 [agent]
@@ -608,10 +692,16 @@ planner_model = "deepseek-pro"   # 作为低频规划器
 
 Planner 会看到已加载的 `REASONIX.md` / `AGENTS.md` 记忆，并拿到一小组只读研究工具，
 因此可以先检查相关文件再把计划交给执行器。写入类和流程类工具仍只给执行器使用。
-`max_steps` 限制执行器；`planner_max_steps` 只限制规划器，两者都可设为 `0` 表示不限。
+Reasonix 会自动管理正常执行：活跃 Todo 连续 8 个工具调用轮次没有新的完成项、唯一读取、
+命令或修改时，宿主会要求执行器重新评估；连续 16 个无进展轮次后暂停并保存工作，可在
+下一轮用户消息中继续。完全重复的操作不算进展，新的宿主可观测工作会自动续期。两级任务
+列表保持同一"唯一当前项"契约：唯一的 `in_progress` 是活跃的 level-1 子步骤，其 level-0
+阶段保持 `pending`；子步骤按顺序推进并签核，全部完成后阶段本身转为 `in_progress` 做
+最后签核。
 
-轮数上限请放在用户级配置。项目 `./reasonix.toml` 不会覆盖 `max_steps` 或
-`planner_max_steps`。
+升级时仍可解析已有的 `[agent].max_steps` 和 `planner_max_steps`，但其值会被忽略，并在一次性
+迁移提示后从配置中移除，避免隐藏的旧上限截断自动进度管理或子 Agent 的继承任务。确实需要
+为单次运行设置预算时使用 CLI `--max-steps`；无人值守 Bot 仍保留 `[bot].max_steps`。
 
 Subagent skills 默认继承执行器模型。设置 `subagent_model` 可让它们统一走另一个已配置
 模型；设置 `subagent_models` 则只覆盖 `review`、`security_review` 等指定 skill。
@@ -622,17 +712,66 @@ Subagent 默认允许再委派一层：根会话是 depth 0，第一层 subagent
 `agent.max_subagent_depth = 1` 可恢复旧的单层边界。这主要用于 Superpowers 这类
 workflow skill 派发 reviewer subagent 的场景，同时避免无限递归和后台 fanout。
 
-当计划阶段需要隔离上下文做更深的调研时，用 `read_only_task`，而不是放开可写的
-`task`。如果这类调研更适合复用已有 skill，用 `read_only_skill`。两者都会启动
+当计划阶段需要**明确隔离为只读**的深度调研时，用 `read_only_task`；如果更适合复用已有 skill，
+用 `read_only_skill`。两者都会启动
 ephemeral 只读 subagent，只暴露只读研究工具和安全前台 bash，只返回最终答案，不创建
-可续接的 subagent transcript。只读嵌套委派会在 `max_subagent_depth` 内可用，但
-可写的 `task` / `run_skill` 仍不可用。在 token economy 模式下，只用
+可续接的 subagent transcript。只读嵌套委派会在 `max_subagent_depth` 内可用，其内部仍不提供
+可写的 `task` / `run_skill`。在 token economy 模式下，只用
 `connect_tool_source(source="read_only_skill")` 连接这条窄入口；完整的 `skills`
-source 仍会启用可写 skill 工具，plan mode 下继续阻断。
+source 也可在 Plan 中加载，后续 writer 调用仍通过 Permissions/Sandbox。
+
+所有严格只读子会话都经过同一对共享构造入口——批处理子会话用
+`RunReadOnlySubAgentWithSession`，交互式双模型 planner 用 `NewReadOnlyAgent`——
+两者都会把子会话标记为永久只读并做最终 registry 过滤：移除 writer、destructive MCP
+目标、外部自报但未信任的 reader、没有正向信任背书的 MCP reader（分类必须有 receipt
+存储支撑，server hint 不算），以及一切会改变 host capability 的工具；会启动 host 的
+目标同样被移除，唯一例外是 receipt 匹配的受信 reader 仍可按需启动。严格只读入口一览：
+
+| 入口 | 用途 |
+| --- | --- |
+| `read_only_task` | 主会话派生的隔离只读调研子会话 |
+| `parallel_tasks`（只读） | 并发只读调研子会话 |
+| `read_only_skill` | 以既有 skill 驱动的同等隔离 |
+| `reasonix review`（CLI） | 只读评审 diff 或分支 |
+| 桌面端 preview/review 子代理 | 桌面端只读分析面 |
+| 双模型 planner | 独立 planner 的只读 registry |
+
+在严格只读子会话内：`use_capability` 在 Commit/permission/hook/执行前会对解析出的
+真实目标再次校验；未连接的受信 MCP reader 只有在 receipt、identity 与缓存 capability
+指纹全部匹配时才能按需启动一次（子会话不能创建、升级或重新验证 trust）；
+initialize/tools-list 之后发现 live 指纹漂移则零执行，并提示交回父会话重新验证。
+`auto_review` 在这里不能提升权限；需要本地人工审批的 reader 直接 fail-closed。
+这一层比主 Plan 更严格：Plan 在整个规划阶段硬阻断 MCP writer/destructive 目标——
+审批也不能放行，退出 Plan 后才恢复——内置 writer 仍走 Permissions/Sandbox，
+而严格只读子会话根本不暴露 writer。
+
+启动会话时可以用 `--profile economy|balanced|delivery` 选择运行模式，例如
+`reasonix run --profile delivery "修复并验证这个 bug"`。Economy（轻量）初始只带 9 个工具：
+直接读/bash/编辑/写入、后台 shell 生命周期控制、`ask` 和 `connect_tool_source`；专用搜索/文件/
+workflow 工具、session history、memory 写入、slash command、Skills、MCP、LSP、网络、安装与
+subagent 都在任务需要时才连接。
+Balanced（均衡）是提供完整工具面的默认档；Delivery（交付优先）
+保留完整工具面，额外增加稳定能力代理 `use_capability`（按需 inspect/call MCP，包括
+`auto_start=false`，且不改变主工具 Schema），并增加“明确验收标准、修复根因、运行验证、复审最终
+diff”的稳定交付合约。该合约由宿主运行时强制执行：没有具体 `todo_write` 验收清单时会阻止变更和验证
+命令；发生变更后，必须复查结果、在最后一次变更之后运行验证，并用带证据的 `complete_step` 签收后才能
+结束；Skill/MCP 的 require/prefer 路由会被门禁；中/高风险改动强制结构化 review；`task`/`run_skill`
+等元工具本身不算 mutation。纯只读分析不会被迫产生写入。
+
+交互式 TUI 会话内可用 `/work-mode` 查看当前模式，或用
+`/work-mode economy|balanced|delivery` 热切换；`/profile` 是兼容别名。切换会原子重建
+Controller，同时保留 history、session 路径、Lease 和 Ask/Auto/Yolo 审批姿态；当前 turn、审批/询问、
+后台任务或另一场运行时切换尚未结束时会拒绝切换。构建失败时旧 Controller 继续可用。该命令只修改当前
+会话，不持久化新的全局默认值。跨 Profile 切换会产生一次新的 provider 缓存前缀。均衡与交付优先模式下，
+system contract 和工具 Schema 在后续轮次保持稳定；轻量模式下，每次成功调用 `connect_tool_source`
+都会在下一次请求加入对应工具 Schema，形成一次新前缀，之后在工具面再次变化前保持稳定。
+
+桌面端标签页提供相同三档并持久化轻量或交付优先
+模式；旧的空值/`full` 继续解释为均衡模式。
 
 交互式前端中，计划模式默认手动开启。设置 `agent.auto_plan = "on"` 后，看起来复杂
-的任务会自动进入 plan mode：Reasonix 先只读生成计划，待用户批准后才
-编辑文件或执行有副作用的命令。`auto_plan_classifier` 可以指定便宜的 provider，例如
+的任务会自动进入 plan mode：Reasonix 先生成计划，待用户批准后工作流才切换到实施；规划期间的
+工具调用仍遵守当前 Permissions 与 Sandbox。`auto_plan_classifier` 可以指定便宜的 provider，例如
 `deepseek-flash`；它只在边界输入上调用，分类失败会回退到启发式规则。也可以用
 在 `reasonix` 会话里用 `/auto-plan off|on` 修改用户级设置，或在 shell/脚本里用
 `reasonix config auto-plan off|on`。Auto-plan 只认用户级设置；项目
@@ -642,7 +781,7 @@ source 仍会启用可写 skill 工具，plan mode 下继续阻断。
 或 `reasonix config memory-v5 off|observe|compact|on|status`，并且只认用户级设置。只有明确想为
 reasoning-language 写项目级覆盖时，才给 shell 命令加 `--local`。
 
-桌面端“协作方式”菜单里的计划模式、目标模式和省 token 模式的使用方法与注意事项，
+桌面端“协作方式”菜单里的计划模式、目标模式和“轻量 / 均衡 / 交付优先”三档运行模式的使用方法与注意事项，
 见 [`COLLABORATION_MODES.zh-CN.md`](./COLLABORATION_MODES.zh-CN.md)。
 
 桌面端“工具权限”里的询问、自动和 Yolo 模式的区别与使用场景，

@@ -8,6 +8,7 @@
 // @ts-ignore `wails generate module` creates this locally; fresh checkouts keep
 // typecheck green by falling back to a disabled drift check below.
 import type * as GeneratedApp from "../../wailsjs/go/main/App";
+import type { InvocationRequest } from "./invocationDisplay";
 
 import { addBreadcrumb } from "./breadcrumbs";
 import { t } from "./i18n";
@@ -26,21 +27,28 @@ import type {
   BotRuntimeStatusView,
   BotSettingsView,
   CapabilitiesView,
+  CapabilityDiagnosticsReport,
   CheckpointMeta,
   CommandInfo,
   ContextInfo,
   ContextPanelInfo,
   DirEntry,
   DesktopStartupSettingsView,
+  DeliveryWorktreeAvailability,
+  DeliveryWorktreeOpenResult,
   DroppedItem,
   EffortInfo,
   FilePreview,
+  ExternalOpenersView,
   HistoryMessage,
   HistoryPage,
   HookConfigView,
   HooksSettingsView,
   JobView,
   MCPServerInput,
+  MCPTrustInspectionView,
+  MCPCatalogRefreshView,
+  MCPToolView,
   MemorySuggestion,
   MemorySuggestionsView,
   MemoryView,
@@ -66,6 +74,7 @@ import type {
   SkillSuggestion,
   SkillView,
   SlashArgsResult,
+  SubagentProfileInput,
   TabMeta,
   TopicMeta,
   ToolApprovalMode,
@@ -137,6 +146,8 @@ export interface AppBindings {
   SubmitToTab(tabID: string, input: string): Promise<void>;
   SubmitDisplay(display: string, input: string): Promise<void>;
   SubmitDisplayToTab(tabID: string, display: string, input: string): Promise<void>;
+  SubmitDeliveryRecoveryToTab(tabID: string, display: string, input: string): Promise<void>;
+  SubmitInvocationsToTab(tabID: string, display: string, input: string, invocations: InvocationRequest[]): Promise<void>;
   SubmitEditedDisplayToTab(tabID: string, display: string, input: string, original: string): Promise<void>;
   RunShell(command: string): Promise<void>;
   RunShellForTab(tabID: string, command: string): Promise<void>;
@@ -151,14 +162,18 @@ export interface AppBindings {
   ReplayPendingPrompts(): Promise<void>;
   SetPlanMode(on: boolean): Promise<void>;
   SetMode(mode: string): Promise<void>;
-  SetModeForTab(tabID: string, mode: string): Promise<void>;
+  // Resolves with the pending approval prompt ids the switch auto-allowed
+  // (drained); prompts not listed are still pending backend-side (#6432).
+  SetModeForTab(tabID: string, mode: string): Promise<string[] | void>;
   SetAutoApproveTools(on: boolean): Promise<void>;
   SetCollaborationMode(mode: string): Promise<void>;
   SetCollaborationModeForTab(tabID: string, mode: string): Promise<void>;
   SetToolApprovalMode(mode: string): Promise<void>;
-  SetToolApprovalModeForTab(tabID: string, mode: string): Promise<void>;
+  // Same drained-prompt-id contract as SetModeForTab.
+  SetToolApprovalModeForTab(tabID: string, mode: string): Promise<string[] | void>;
   SetGoal(goal: string): Promise<void>;
   SetGoalForTab(tabID: string, goal: string): Promise<void>;
+  ResumeGoalForTab(tabID: string): Promise<boolean>;
   ClearGoal(): Promise<void>;
   ClearGoalForTab(tabID: string): Promise<void>;
   Compact(): Promise<void>;
@@ -220,7 +235,11 @@ export interface AppBindings {
   Commands(): Promise<CommandInfo[]>;
   Capabilities(): Promise<CapabilitiesView>;
   MCPServers(): Promise<ServerView[]>;
+  InspectMCPTrust(name: string): Promise<MCPTrustInspectionView>;
+  SetMCPTrust(name: string, decision: "session" | "workspace" | "revoke"): Promise<void>;
+  RefreshMCPCatalog(): Promise<MCPCatalogRefreshView>;
   SkillsSettings(): Promise<SkillsSettingsView>;
+  CapabilityDiagnostics(includeSessionRuntime: boolean): Promise<CapabilityDiagnosticsReport>;
   Plugins(): Promise<PluginView[]>;
   PlanPluginInstall(source: string, options: PluginInstallOptions): Promise<string>;
   InstallPlugin(source: string, options: PluginInstallOptions): Promise<string>;
@@ -233,9 +252,6 @@ export interface AppBindings {
   RemoveMCPServer(name: string): Promise<void>;
   ReconnectMCPServer(name: string): Promise<void>;
   ClearMCPServerAuthentication(name: string): Promise<void>;
-  TrustMCPServerTool(name: string, toolName: string): Promise<void>;
-  TrustMCPServerTools(name: string, toolNames: string[]): Promise<void>;
-  UntrustMCPServerTool(name: string, toolName: string): Promise<void>;
   PickSkillFolder(): Promise<string>;
   PickPluginFolder(): Promise<string>;
   AddSkillPath(path: string): Promise<void>;
@@ -243,6 +259,14 @@ export interface AppBindings {
   RefreshSkills(): Promise<void>;
   ReloadCommands(): Promise<void>;
   SetSkillEnabled(name: string, enabled: boolean): Promise<void>;
+  AvailableSubagentTools(): Promise<MCPToolView[]>;
+  CreateSubagentProfile(input: SubagentProfileInput): Promise<string>;
+  UpdateSubagentProfile(name: string, scope: string, input: SubagentProfileInput): Promise<void>;
+  DeleteSubagentProfile(name: string, scope: string): Promise<void>;
+  SetSubagentProfileModel(name: string, ref: string): Promise<void>;
+  SetSubagentProfileEffort(name: string, level: string): Promise<void>;
+  TrySubagentProfile(input: SubagentProfileInput, task: string): Promise<string>;
+  CancelTrySubagentProfile(): Promise<void>;
   SetMCPServerEnabled(name: string, enabled: boolean): Promise<void>;
   SetMCPServerTier(name: string, tier: string): Promise<void>;
   SlashArgs(input: string): Promise<SlashArgsResult>;
@@ -259,6 +283,10 @@ export interface AppBindings {
   WorkspaceGitCommitDetail(tabID: string, hash: string, path: string): Promise<GitCommitDetailView>;
   OpenWorkspacePath(rel: string): Promise<void>;
   OpenWorkspacePathForTab(tabID: string, rel: string): Promise<void>;
+  ExternalOpeners(): Promise<ExternalOpenersView>;
+  SetPreferredExternalOpener(id: string): Promise<void>;
+  OpenWorkspaceInExternalOpener(id: string): Promise<void>;
+  OpenWorkspaceInExternalOpenerForTab(tabID: string, id: string): Promise<void>;
   RevealWorkspacePath(rel: string): Promise<void>;
   RevealWorkspacePathForTab(tabID: string, rel: string): Promise<void>;
   RevealPath(path: string): Promise<void>;
@@ -370,6 +398,8 @@ export interface AppBindings {
   ReportCrash(kind: string, detail: string): Promise<void>;
   ListTabs(): Promise<TabMeta[]>;
   OpenProjectTab(workspaceRoot: string, topicID: string): Promise<TabMeta>;
+  DeliveryWorktreeAvailability(workspaceRoot: string): Promise<DeliveryWorktreeAvailability>;
+  CreateDeliveryWorktree(workspaceRoot: string): Promise<DeliveryWorktreeOpenResult>;
   OpenGlobalTab(topicID: string): Promise<TabMeta>;
   OpenTopicSession(scope: string, workspaceRoot: string, topicID: string, sessionPath: string): Promise<TabMeta>;
   EnsureBlankTab(scope: string, workspaceRoot: string): Promise<TabMeta>;
@@ -641,12 +671,12 @@ function bridgeBreadcrumb(method: string): string {
   if (/^(SaveProvider|AddOfficialProviderAccess|AddProviderPresetAccess|ResetProviderPresetAccess|RemoveProviderAccess|DeleteProvider|SaveProviderKey|SetProviderKey|ClearProviderKey|FetchProviderModels|ConnectKey)/.test(method))
     return `provider ${method}`;
   if (/^(CheckUpdate|DownloadUpdate|InstallUpdate|ApplyUpdate|OpenDownloadPage)/.test(method)) return `update ${method}`;
-  if (/^(AddMCPServer|UpdateMCPServer|RemoveMCPServer|ReconnectMCPServer|ClearMCPServerAuthentication|TrustMCPServerTool|TrustMCPServerTools|UntrustMCPServerTool|SetMCPServer)/.test(method))
+  if (/^(AddMCPServer|UpdateMCPServer|RemoveMCPServer|ReconnectMCPServer|ClearMCPServerAuthentication|SetMCPServer)/.test(method))
     return `mcp ${method}`;
-  if (/^(AddSkillPath|RemoveSkillPath|RefreshSkills|SetSkillEnabled|AcceptSkillSuggestion)/.test(method))
+  if (/^(AddSkillPath|RemoveSkillPath|RefreshSkills|SetSkillEnabled|AcceptSkillSuggestion|AvailableSubagentTools|CreateSubagentProfile|UpdateSubagentProfile|DeleteSubagentProfile|SetSubagentProfileModel|SetSubagentProfileEffort|TrySubagentProfile|CancelTrySubagentProfile)/.test(method))
     return `skill ${method}`;
   if (/^(MinimiseMainWindow|ToggleMaximiseMainWindow|IsMainWindowMaximised|CloseMainWindow)$/.test(method)) return `window ${method}`;
-  if (/^(OpenProjectTab|OpenGlobalTab|OpenTopicSession|EnsureBlankTab|ActivateTopic|EnsureBlankSurface|SetActiveTab|CloseTab|ReorderTabs|CreateTopic|RenameTopic|DeleteTopic|TrashTopic|RenameProject|RemoveWorkspace|SwitchWorkspace|PickWorkspace)/.test(method))
+  if (/^(OpenProjectTab|OpenGlobalTab|OpenTopicSession|EnsureBlankTab|ActivateTopic|EnsureBlankSurface|SetActiveTab|CloseTab|ReorderTabs|CreateTopic|RenameTopic|DeleteTopic|TrashTopic|RenameProject|RemoveWorkspace|SwitchWorkspace|PickWorkspace|DeliveryWorktreeAvailability|CreateDeliveryWorktree)/.test(method))
     return `nav ${method}`;
   return "";
 }
@@ -916,6 +946,11 @@ function cloneMockProviderTemplate(id: string, key: string): ProviderView | unde
 const mockPreviewImageDataURL =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='120' viewBox='0 0 160 120'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23f97316'/%3E%3Cstop offset='1' stop-color='%232563eb'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='160' height='120' rx='14' fill='url(%23g)'/%3E%3Ccircle cx='44' cy='38' r='16' fill='%23fff7ed' opacity='.9'/%3E%3Cpath d='M18 96 62 58l24 22 18-16 38 32z' fill='%23ffffff' opacity='.9'/%3E%3C/svg%3E";
 
+function mockExternalOpenerIconDataURL(color: string, label: string): string {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="${color}"/><text x="32" y="40" text-anchor="middle" font-family="system-ui" font-size="25" font-weight="700" fill="white">${label}</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
 function makeMockApp(): AppBindings {
   const scenario = mockScenario();
   const freshMock = scenario === "fresh";
@@ -927,6 +962,10 @@ function makeMockApp(): AppBindings {
   let cancelled = false;
   let pendingAskPreview = false;
   let pendingApprovalPreview = false;
+  // Mirrors the last emitted approval preview so mode switches can mirror the
+  // backend drain contract: only non-fresh tools auto-allow; plan/sandbox
+  // escape prompts stay pending and visible.
+  let pendingApprovalPreviewPrompt: { id: string; tool: string } | undefined;
   const globalWorkspaceRoot = "~/Library/Application Support/reasonix/global-workspace";
   let cwd = freshMock ? globalWorkspaceRoot : "~/projects/joyquant-db"; // mutable so PickWorkspace is visible in dev
   let workspaces = freshMock ? [] : ["~/projects/joyquant-db", "~/projects/joyquant-sys", "~/projects/reasonix", "~/projects/blade"];
@@ -983,9 +1022,19 @@ function makeMockApp(): AppBindings {
     { name: "figma", transport: "http", status: "failed", configured: true, autoStart: true, tier: "background", url: "https://mcp.figma.com/mcp", authStatus: "required", authUrl: "https://mcp.figma.com/mcp", tools: 0, prompts: 0, resources: 0, error: "connect: 401 unauthorized" },
   ];
   const capSkills: SkillView[] = [
-    { name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "builtin", runAs: "subagent", enabled: true },
-    { name: "review", description: "Review the staged diff", scope: "project", runAs: "inline", enabled: false },
-    { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "builtin", runAs: "inline", enabled: true },
+    {
+      name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "builtin", runAs: "subagent", enabled: true,
+      allowedTools: ["read_file", "ls", "glob", "grep", "code_index"], invocation: "/explore", invocationMode: "auto",
+      configuredModel: "deepseek/deepseek-v4-pro", configuredEffort: "high",
+    },
+    { name: "research", description: "Combine web_fetch + code reading in an isolated subagent", scope: "builtin", runAs: "subagent", enabled: true, allowedTools: ["read_file", "ls", "glob", "grep", "code_index", "web_fetch"], invocation: "/research", invocationMode: "auto" },
+    { name: "review", description: "Review the staged diff", scope: "project", runAs: "inline", enabled: false, invocation: "/review" },
+    { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "builtin", runAs: "inline", enabled: true, invocation: "/init" },
+    {
+      name: "my-formatter", description: "Formats code the way I like it", scope: "global", runAs: "subagent", enabled: true,
+      model: "deepseek-pro", effort: "high", allowedTools: ["read_file", "edit_file"], color: "amber", invocation: "/my-formatter", invocationMode: "manual",
+      body: "You are a code formatting assistant. Reformat the given file to match project style without changing behavior.",
+    },
   ];
   let capSkillRoots: SkillRootView[] = [
     { dir: "~/projects/reasonix/.reasonix/skills", scope: "project", priority: 1, status: "missing", configured: false, removable: true, skills: 0 },
@@ -1255,7 +1304,7 @@ function makeMockApp(): AppBindings {
     displayMode: "compact",
     statusBarStyle: "text",
     statusBarItems: [...DEFAULT_STATUS_BAR_ITEMS],
-    defaultToolApprovalMode: "ask",
+    defaultToolApprovalMode: "auto",
     checkUpdates: true,
     telemetry: true,
     metrics: true,
@@ -1578,6 +1627,7 @@ function makeMockApp(): AppBindings {
         }
         if (tab.topicId === "topic_sys_coord") {
           pendingApprovalPreview = true;
+          pendingApprovalPreviewPrompt = { id: "mock-sys-confirm", tool: "bash" };
           emit({ kind: "reasoning", text: "我已经准备好执行同步脚本，但这个操作会影响本地 workspace，需要用户确认。" });
           await delay(160);
           emit({
@@ -1607,6 +1657,21 @@ function makeMockApp(): AppBindings {
   const emitMockTurnDone = () => {
     setMockTabRunning(currentMockTurnTabId(), false);
     emit({ kind: "turn_done" });
+  };
+  // Fresh user decisions never auto-allow on a posture switch (mirrors the
+  // backend's requiresFreshApprovalTool set).
+  const mockFreshApprovalTools = new Set(["exit_plan_mode", "sandbox_escape", "memory_remember", "memory_forget", "managed_config_write"]);
+  // Mirrors the backend drain contract for the mode-switch bindings: returns
+  // the prompt ids the new posture auto-allowed; fresh prompts stay pending.
+  const drainMockApprovalPreviews = (toolApprovalMode: string): string[] => {
+    if (toolApprovalMode !== "auto" && toolApprovalMode !== "yolo") return [];
+    const prompt = pendingApprovalPreviewPrompt;
+    if (!pendingApprovalPreview || !prompt || mockFreshApprovalTools.has(prompt.tool)) return [];
+    pendingApprovalPreview = false;
+    pendingApprovalPreviewPrompt = undefined;
+    emit({ kind: "message", text: `approval preview auto-allowed (${toolApprovalMode})` });
+    emitMockTurnDone();
+    return [prompt.id];
   };
   let mockTabs: TabMeta[] = noticePreviewMock ? [
     {
@@ -1712,6 +1777,7 @@ function makeMockApp(): AppBindings {
     window.setTimeout(() => {
       if (pendingApprovalPreview) return;
       pendingApprovalPreview = true;
+      pendingApprovalPreviewPrompt = { id: "mock-sandbox-escape-preview", tool: "sandbox_escape" };
       emitMockTurnStarted();
       emit({ kind: "reasoning", text: t("mock.sandboxEscapeReasoning") });
       emit({
@@ -1809,6 +1875,7 @@ function makeMockApp(): AppBindings {
       }
       if (trimmedInput === "/approve-preview" || trimmedInput === "approve preview" || trimmedInput === "approve预览") {
         pendingApprovalPreview = true;
+        pendingApprovalPreviewPrompt = { id: "mock-approval-preview", tool: "bash" };
         await delay(250);
         if (cancelled) return;
         emit({
@@ -1828,6 +1895,7 @@ function makeMockApp(): AppBindings {
         trimmedInput === "sandbox escape预览"
       ) {
         pendingApprovalPreview = true;
+        pendingApprovalPreviewPrompt = { id: "mock-sandbox-escape-preview", tool: "sandbox_escape" };
         await delay(250);
         if (cancelled) return;
         emit({
@@ -1847,6 +1915,7 @@ function makeMockApp(): AppBindings {
         trimmedInput === "plan approve预览"
       ) {
         pendingApprovalPreview = true;
+        pendingApprovalPreviewPrompt = { id: "mock-plan-approval-preview", tool: "exit_plan_mode" };
         await delay(250);
         if (cancelled) return;
         emit({
@@ -2081,6 +2150,12 @@ function makeMockApp(): AppBindings {
         async SubmitDisplayToTab(_tabID, display, input) {
           await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
         },
+        async SubmitDeliveryRecoveryToTab(_tabID, display, input) {
+          await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
+        },
+        async SubmitInvocationsToTab(_tabID, display, input, _invocations) {
+          await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
+        },
         async SubmitEditedDisplayToTab(_tabID, display, input, _original) {
           await withMockTabScope(_tabID, () => this.SubmitDisplay(display, input));
         },
@@ -2119,6 +2194,7 @@ function makeMockApp(): AppBindings {
         async Approve(_id, allow, session, persist) {
           if (!pendingApprovalPreview) return;
           pendingApprovalPreview = false;
+          pendingApprovalPreviewPrompt = undefined;
           const suffix = persist ? "grant saved" : session ? "grant active this session" : "allowed once";
           emit({
             kind: "message",
@@ -2156,16 +2232,18 @@ function makeMockApp(): AppBindings {
         },
         async SetModeForTab(tabID, mode) {
           const nextMode = normalizeMode(mode);
-          mockTabs = mockTabs.map((tab) =>
-            tab.id === tabID
-              ? {
-                  ...tab,
-                  mode: nextMode,
-                  collaborationMode: normalizeCollaborationMode(undefined, tab.goal, nextMode),
-                  toolApprovalMode: mockToolApprovalModeAfterModeChange(tab.toolApprovalMode, nextMode),
-                }
-              : tab,
-          );
+          let nextToolApprovalMode: ToolApprovalMode | "" = "";
+          mockTabs = mockTabs.map((tab) => {
+            if (tab.id !== tabID) return tab;
+            nextToolApprovalMode = mockToolApprovalModeAfterModeChange(tab.toolApprovalMode, nextMode);
+            return {
+              ...tab,
+              mode: nextMode,
+              collaborationMode: normalizeCollaborationMode(undefined, tab.goal, nextMode),
+              toolApprovalMode: nextToolApprovalMode,
+            };
+          });
+          return drainMockApprovalPreviews(nextToolApprovalMode);
         },
         async SetCollaborationMode(mode) {
           const active = mockTabs.find((tab) => tab.active);
@@ -2201,6 +2279,7 @@ function makeMockApp(): AppBindings {
                 }
               : tab,
           );
+          return drainMockApprovalPreviews(next);
         },
         async SetGoal(goal) {
           const active = mockTabs.find((tab) => tab.active);
@@ -2219,6 +2298,15 @@ function makeMockApp(): AppBindings {
                 }
               : tab,
           );
+        },
+        async ResumeGoalForTab(tabID) {
+          let resumed = false;
+          mockTabs = mockTabs.map((tab) => {
+            if (tab.id !== tabID || !tab.goal || tab.goalStatus === "complete") return tab;
+            resumed = true;
+            return { ...tab, goalStatus: "running", collaborationMode: "goal" };
+          });
+          return resumed;
         },
         async ClearGoal() {
           await this.SetGoal("");
@@ -2552,17 +2640,32 @@ function makeMockApp(): AppBindings {
           console.info("mock AutoResearchRecordEvidence");
         },
     async Commands() {
-      return [
-        { name: "new", description: "start new session; save transcript", kind: "builtin" as const },
-        { name: "clear", description: "discard current context", kind: "builtin" as const },
-        { name: "compact", description: "Summarize older history to free up context", kind: "builtin" as const },
-        { name: "model", description: "Switch model", kind: "builtin" as const },
-        { name: "effort", description: "Set reasoning effort", kind: "builtin" as const },
-        { name: "skill", description: "List skills", kind: "builtin" as const },
-        { name: "plugins", description: "Manage plugin packages", kind: "builtin" as const },
-        { name: "explore", description: "Investigate the codebase in an isolated subagent", kind: "skill" as const },
-        { name: "review", description: "Review the staged diff", hint: "[focus]", kind: "custom" as const },
+      const commands: CommandInfo[] = [
+        { name: "new", description: "start new session; save transcript", kind: "builtin" as const, group: "actions" },
+        { name: "clear", description: "discard current context", kind: "builtin" as const, group: "actions" },
+        { name: "compact", description: "Summarize older history to free up context", kind: "builtin" as const, group: "actions" },
+        { name: "model", description: "Switch model", kind: "builtin" as const, group: "actions" },
+        { name: "effort", description: "Set reasoning effort", kind: "builtin" as const, group: "actions" },
+        { name: "skill", description: "List skills", kind: "builtin" as const, group: "skills" },
+        { name: "mcp", description: "Manage MCP servers", kind: "builtin" as const, group: "integrations" },
+        { name: "plugins", description: "Manage plugin packages", kind: "builtin" as const, group: "integrations" },
+        { name: "review", description: "Review the staged diff", hint: "[focus]", kind: "custom" as const, group: "skills" },
       ];
+      const seen = new Set(commands.map((command) => command.name));
+      for (const skill of capSkills) {
+        if (skill.enabled === false) continue;
+        const name = (skill.invocation || `/${skill.name}`).replace(/^\/+/, "");
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        commands.push({
+          name,
+          description: skill.description,
+          kind: skill.runAs === "subagent" ? "subagent" : "skill",
+          group: skill.runAs === "subagent" ? "subagents" : "skills",
+          color: skill.color,
+        });
+      }
+      return commands;
     },
     async Capabilities() {
       return {
@@ -2575,11 +2678,117 @@ function makeMockApp(): AppBindings {
     async MCPServers() {
       return capServers.map((s) => ({ ...s }));
     },
+    async InspectMCPTrust(name: string) {
+      const server = capServers.find((s) => s.name === name);
+      if (!server) throw new Error(`MCP server ${name} not found`);
+      return {
+        name, trustState: server.trustState || "untrusted",
+        trustSource: server.trustSource, trustScope: server.trustScope,
+        isolationState: server.isolationState || (server.transport === "stdio" ? "enforced" : "not_applicable"),
+        isolationReason: server.isolationReason,
+        identityChanged: server.identityChanged, changedTools: [...(server.changedTools || [])],
+        readers: (server.toolList || []).filter((tool) => tool.readOnlyHint).map((tool) => tool.name),
+        writers: (server.toolList || []).filter((tool) => !tool.readOnlyHint && !tool.destructiveHint).map((tool) => tool.name),
+        destructive: (server.toolList || []).filter((tool) => tool.destructiveHint).map((tool) => tool.name),
+      };
+    },
+    async SetMCPTrust(name: string, decision: "session" | "workspace" | "revoke") {
+      capServers = capServers.map((server) => server.name === name ? {
+        ...server,
+        trustState: decision === "revoke" ? "untrusted" : decision,
+        trustSource: decision === "revoke" ? undefined : "user",
+        trustScope: decision === "revoke" ? undefined : decision,
+        identityChanged: false,
+        changedTools: [],
+      } : server);
+    },
+    async RefreshMCPCatalog() {
+      return { source: "bundled", sequence: 0, offline: false, stale: false };
+    },
     async SkillsSettings() {
       return {
         skills: capSkills.map((s) => ({ ...s })),
         skillRoots: capSkillRoots.map((s) => ({ ...s })),
       };
+    },
+    async CapabilityDiagnostics(includeSessionRuntime: boolean) {
+      const report: CapabilityDiagnosticsReport = {
+        schema_version: 1,
+        root: "<workspace>",
+        live: false,
+        summary: {
+          errors: 0,
+          warnings: 1,
+          infos: includeSessionRuntime ? 1 : 0,
+          instructions: 1,
+          skills: capSkills.length,
+          commands: 0,
+          hooks: 0,
+          plugins: capPlugins.length,
+          mcp_servers: capServers.length,
+        },
+        instructions: { docs: [{ path: "<workspace>/AGENTS.md", scope: "project", order: 1 }] },
+        skills: {
+          roots: [{ path: "<workspace>/.reasonix/skills", scope: "project", status: "ok" }],
+          entries: capSkills.map((s) => ({
+            name: s.name,
+            description: s.description,
+            scope: s.scope,
+            path: "(mock)",
+            status: "winner",
+            run_as: s.runAs,
+          })),
+          winners: capSkills.length,
+          shadowed: 0,
+        },
+        commands: { roots: [], entries: [], winners: 0, shadowed: 0 },
+        hooks: { trusted_project: true, project_defines_hooks: false, sources: [], entries: [] },
+        plugins: {
+          packages: capPlugins.map((p) => ({
+            name: p.name,
+            enabled: p.enabled,
+            root: p.root || "<external>/plugin",
+            skills: p.skills ?? 0,
+            commands: 0,
+            hooks: p.hooks ?? 0,
+            mcp_servers: p.mcpServers ?? 0,
+            status: p.enabled ? "ok" : "disabled",
+          })),
+        },
+        mcp: {
+          servers: capServers.map((s) => ({
+            name: s.name,
+            transport: s.transport || "stdio",
+            start_intent: s.startIntent === "off" ? "off" : "automatic",
+            source: "toml",
+            runtime_status: includeSessionRuntime ? s.status || "connected" : undefined,
+            tool_count: s.tools,
+            env_keys: s.envKeys ?? [],
+            header_keys: s.headerKeys ?? [],
+          })),
+        },
+        issues: [
+          {
+            severity: "warning",
+            code: "skill.missing_description",
+            subsystem: "skills",
+            name: "example",
+            message: "mock warning for browser harness",
+            remediation: "Add a description frontmatter field",
+            settings_tab: "skills",
+          },
+          ...(includeSessionRuntime
+            ? [{
+                severity: "info" as const,
+                code: "mcp.runtime_unavailable",
+                subsystem: "mcp",
+                message: "browser mock has no live Host; runtime fields are synthetic",
+                settings_tab: "mcp",
+              }]
+            : []),
+        ],
+      };
+      return JSON.parse(JSON.stringify(report)) as CapabilityDiagnosticsReport;
     },
     async Plugins() {
       return capPlugins.map((p) => ({ ...p }));
@@ -2651,6 +2860,9 @@ function makeMockApp(): AppBindings {
         tools,
         prompts: 0,
         resources: 0,
+        trustState: "untrusted",
+        isolationState: input.transport === "stdio" ? "enforced" : "not_applicable",
+        changedTools: [],
         toolList: Array.from({ length: tools }, (_, i) => ({
           name: `${input.name}_tool_${i + 1}`,
           description: `Mock tool ${i + 1} exposed by ${input.name}.`,
@@ -2710,33 +2922,6 @@ function makeMockApp(): AppBindings {
           : s,
       );
     },
-    async TrustMCPServerTool(name: string, toolName: string) {
-      const normalizedTool = toolName.trim();
-      if (!normalizedTool) return;
-      capServers = capServers.map((s) => {
-        if (s.name !== name) return s;
-        const trusted = Array.from(new Set([...(s.trustedReadOnlyTools ?? []), normalizedTool]));
-        return { ...s, trustedReadOnlyTools: trusted };
-      });
-    },
-    async TrustMCPServerTools(name: string, toolNames: string[]) {
-      const normalizedTools = toolNames.map((tool) => tool.trim()).filter(Boolean);
-      if (normalizedTools.length === 0) return;
-      capServers = capServers.map((s) => {
-        if (s.name !== name) return s;
-        const trusted = Array.from(new Set([...(s.trustedReadOnlyTools ?? []), ...normalizedTools]));
-        return { ...s, trustedReadOnlyTools: trusted };
-      });
-    },
-    async UntrustMCPServerTool(name: string, toolName: string) {
-      const normalizedTool = toolName.trim();
-      if (!normalizedTool) return;
-      capServers = capServers.map((s) => {
-        if (s.name !== name) return s;
-        const trusted = (s.trustedReadOnlyTools ?? []).filter((tool) => tool !== normalizedTool);
-        return { ...s, trustedReadOnlyTools: trusted };
-      });
-    },
     async PickSkillFolder() {
       return "~/my-skills";
     },
@@ -2773,6 +2958,60 @@ function makeMockApp(): AppBindings {
     async SetSkillEnabled(name: string, enabled: boolean) {
       const skill = capSkills.find((s) => s.name === name);
       if (skill) skill.enabled = enabled;
+    },
+    async AvailableSubagentTools() {
+      return [
+        { name: "read_file", description: "Read a file's contents", readOnlyHint: true },
+        { name: "ls", description: "List a directory", readOnlyHint: true },
+        { name: "glob", description: "Find files by name pattern", readOnlyHint: true },
+        { name: "grep", description: "Search file contents", readOnlyHint: true },
+        { name: "code_index", description: "Look up symbol definitions and file outlines", readOnlyHint: true },
+        { name: "edit_file", description: "Edit an existing file" },
+        { name: "write_file", description: "Write a new file" },
+        { name: "bash", description: "Run a shell command" },
+        { name: "web_fetch", description: "Fetch a URL" },
+      ];
+    },
+    async CreateSubagentProfile(input: SubagentProfileInput) {
+      const name = input.name.trim();
+      const builtinNames = ["init", "explore", "research", "install-capability", "review", "security-review", "test"];
+      if (builtinNames.includes(name)) throw new Error(`"${name}" is a built-in subagent name and cannot be reused`);
+      if (capSkills.some((s) => s.name === name)) throw new Error(`"${name}" already exists`);
+      capSkills.push({
+        name, description: input.description, scope: input.scope === "project" ? "project" : "global",
+        runAs: "subagent", enabled: true, model: input.model, effort: input.effort,
+        allowedTools: input.allowedTools, color: input.color, invocation: `/${name}`, invocationMode: "manual",
+      });
+      return `~/.reasonix/skills/${name}/SKILL.md`;
+    },
+    async UpdateSubagentProfile(name: string, scope: string, input: SubagentProfileInput) {
+      const skill = capSkills.find((s) => s.name === name && s.scope === scope);
+      if (!skill) throw new Error(`"${name}" resolves at a different scope — refusing to update`);
+      skill.description = input.description;
+      skill.color = input.color;
+      skill.model = input.model;
+      skill.effort = input.effort;
+      skill.allowedTools = input.allowedTools;
+    },
+    async DeleteSubagentProfile(name: string, scope: string) {
+      const idx = capSkills.findIndex((s) => s.name === name && s.scope === scope);
+      if (idx < 0) throw new Error(`"${name}" resolves at a different scope — refusing to delete`);
+      capSkills.splice(idx, 1);
+    },
+    async SetSubagentProfileModel(name: string, ref: string) {
+      const skill = capSkills.find((s) => s.name === name);
+      if (skill) skill.configuredModel = ref || undefined;
+    },
+    async SetSubagentProfileEffort(name: string, level: string) {
+      const skill = capSkills.find((s) => s.name === name);
+      if (skill) skill.configuredEffort = level || undefined;
+    },
+    async CancelTrySubagentProfile() {},
+    async TrySubagentProfile(input: SubagentProfileInput, task: string) {
+      if (!task.trim()) throw new Error("task is required");
+      if (!input.systemPrompt.trim()) throw new Error("system prompt is required");
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return `[mock run of "${input.name || "draft"}"]\n\nTask: ${task}\n\n(This is a dev-mode mock response — the real backend runs an isolated subagent loop against your configured model.)`;
     },
     async SetMCPServerEnabled(name: string, enabled: boolean) {
       capServers = capServers.map((s) =>
@@ -2918,6 +3157,22 @@ function makeMockApp(): AppBindings {
     },
     async OpenWorkspacePathForTab(_tabID: string, rel: string) {
       await this.OpenWorkspacePath(rel);
+    },
+    async ExternalOpeners() {
+      return {
+        openers: [
+          { id: "vscode", name: "VS Code", kind: "editor", iconDataUrl: mockExternalOpenerIconDataURL("#1684d6", "V") },
+          { id: "cursor", name: "Cursor", kind: "editor", iconDataUrl: mockExternalOpenerIconDataURL("#25262a", "C") },
+          { id: "finder", name: "Finder", kind: "file-manager", iconDataUrl: mockExternalOpenerIconDataURL("#36aaf4", "F") },
+          { id: "ghostty", name: "Ghostty", kind: "terminal", iconDataUrl: mockExternalOpenerIconDataURL("#264db6", ">") },
+        ],
+        preferred: "vscode",
+      } as ExternalOpenersView;
+    },
+    async SetPreferredExternalOpener(_id: string) {},
+    async OpenWorkspaceInExternalOpener(_id: string) {},
+    async OpenWorkspaceInExternalOpenerForTab(_tabID: string, id: string) {
+      await this.OpenWorkspaceInExternalOpener(id);
     },
     async RevealWorkspacePath(rel: string) {
       console.info("mock RevealWorkspacePath", rel);
@@ -3511,7 +3766,7 @@ function makeMockApp(): AppBindings {
     },
     async OpenDownloadPage() {
       if (typeof window !== "undefined") {
-        window.open("https://reasonix.io/#start", "_blank", "noopener");
+        window.open("https://reasonix.io/?download=desktop#start", "_blank", "noopener");
       }
     },
     // Dev seam: drives the overlay flow in the browser until ConnectKey sets the
@@ -3565,6 +3820,29 @@ function makeMockApp(): AppBindings {
       };
       mockTabs = [...mockTabs.map((item) => ({ ...item, active: false })), tab];
       return { ...tab };
+    },
+    async DeliveryWorktreeAvailability(workspaceRoot: string) {
+      return workspaceRoot
+        ? { available: true, repoRoot: workspaceRoot, branch: "main", sourceDirty: false }
+        : { available: false, reason: "project folder is required" };
+    },
+    async CreateDeliveryWorktree(workspaceRoot: string) {
+      if (!workspaceRoot) throw new Error("project folder is required");
+      const suffix = Date.now().toString(36);
+      const isolatedRoot = `/mock/reasonix-worktrees/${suffix}/${workspaceRoot.split("/").filter(Boolean).pop() ?? "project"}`;
+      const topicID = `topic_worktree_${suffix}`;
+      const tab = await this.OpenProjectTab(isolatedRoot, topicID);
+      tab.isolatedWorktree = true;
+      tab.gitBranch = `reasonix/delivery-${suffix}`;
+      mockTabs = mockTabs.map((candidate) => candidate.id === tab.id ? { ...tab } : candidate);
+      return {
+        workspaceRoot: isolatedRoot,
+        worktreeRoot: isolatedRoot,
+        sourceRoot: workspaceRoot,
+        branch: tab.gitBranch,
+        sourceDirty: false,
+        tab,
+      };
     },
     async OpenGlobalTab(_topicID: string) {
       const existing = mockTabs.find((tab) => tab.scope === "global" && tab.topicId === _topicID);

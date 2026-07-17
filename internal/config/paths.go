@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"unicode/utf8"
+
+	"reasonix/internal/command"
 )
 
 var (
@@ -15,6 +17,13 @@ var (
 	osUserHomeDir   = os.UserHomeDir
 	osUserConfigDir = func() string {
 		dir, err := os.UserConfigDir()
+		if err != nil {
+			return ""
+		}
+		return dir
+	}
+	osUserCacheDir = func() string {
+		dir, err := os.UserCacheDir()
 		if err != nil {
 			return ""
 		}
@@ -162,8 +171,8 @@ func userCacheDir() string {
 	if dir := cleanEnvDir("REASONIX_HOME"); dir != "" {
 		return filepath.Join(dir, "cache")
 	}
-	dir, err := os.UserCacheDir()
-	if err != nil {
+	dir := osUserCacheDir()
+	if dir == "" {
 		return ""
 	}
 	return filepath.Join(dir, "reasonix")
@@ -302,6 +311,47 @@ func appendUniquePath(paths []string, path string) []string {
 // Windows, with a %USERPROFILE%/AppData/Roaming fallback when %APPDATA% is
 // unavailable.
 func ReasonixHomeDir() string { return reasonixHomeDir() }
+
+// WorkspaceLeaseDir stores cross-process Delivery writer locks outside user
+// workspaces. It intentionally follows the cache root rather than project or
+// session state: taking a lease must never dirty the repository it protects.
+func WorkspaceLeaseDir() string {
+	// Deliberately ignore REASONIX_HOME/REASONIX_CACHE_HOME here. Two app
+	// instances with different state profiles can still open the same user
+	// workspace, so their safety lock must converge on one OS-user cache root.
+	dir := osUserCacheDir()
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	return filepath.Join(dir, "reasonix", "workspace-leases")
+}
+
+// DeliveryWorktreeDir is durable storage for user-visible isolated Delivery
+// workspaces. Explicit state/home overrides remain authoritative. Windows uses
+// LocalAppData by default so large Git worktrees do not roam with the user's
+// profile; other platforms keep using Reasonix state storage.
+func DeliveryWorktreeDir() string {
+	if dir := cleanEnvDir("REASONIX_STATE_HOME"); dir != "" {
+		return filepath.Join(dir, "worktrees")
+	}
+	if dir := cleanEnvDir("REASONIX_HOME"); dir != "" {
+		return filepath.Join(dir, "worktrees")
+	}
+	if runtimeGOOS == "windows" {
+		if dir := osUserCacheDir(); dir != "" {
+			return filepath.Join(dir, "reasonix", "worktrees")
+		}
+		if home, err := osUserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, "AppData", "Local", "reasonix", "worktrees")
+		}
+		return ""
+	}
+	dir := userSupportDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "worktrees")
+}
 
 // UserCredentialsPath is the reasonix-owned global .env file under Reasonix
 // home. It is the single source for provider credentials saved by Reasonix, so
@@ -468,40 +518,57 @@ func CommandDirs() []string {
 // dirs under root instead of the current working directory. Global dirs are
 // unchanged — they are always user-scoped.
 func CommandDirsForRoot(root string) []string {
+	roots := CommandRootsForRoot(root)
+	dirs := make([]string, 0, len(roots))
+	for _, spec := range roots {
+		dirs = append(dirs, spec.Path)
+	}
+	return dirs
+}
+
+// CommandRootsForRoot is the ownership-aware form of CommandDirsForRoot.
+// Plugin roots retain their package name so the loader can expose stable,
+// package-qualified command names and hidden short-name compatibility aliases.
+func CommandRootsForRoot(root string) []command.Root {
 	root = resolveRoot(root)
-	var dirs []string
-	add := func(dir string) {
-		if dir == "" {
+	var roots []command.Root
+	add := func(spec command.Root) {
+		if spec.Path == "" {
 			return
 		}
-		for _, existing := range dirs {
-			if samePath(existing, dir) {
+		for _, existing := range roots {
+			if samePath(existing.Path, spec.Path) && existing.Plugin == spec.Plugin {
 				return
 			}
 		}
-		dirs = append(dirs, dir)
+		roots = append(roots, spec)
+	}
+	// Enabled plugin packages contribute command dirs before user/project dirs,
+	// so explicit commands still win exact canonical-name clashes.
+	for _, spec := range pluginPackageCommandRoots() {
+		add(spec)
 	}
 	if dir := legacyOSSupportDir(); dir != "" {
-		add(filepath.Join(dir, "commands"))
+		add(command.Root{Path: filepath.Join(dir, "commands")})
 	}
 	for _, legacy := range legacyXDGConfigPaths() {
-		add(filepath.Join(filepath.Dir(legacy), "commands"))
+		add(command.Root{Path: filepath.Join(filepath.Dir(legacy), "commands")})
 	}
 	if home, err := osUserHomeDir(); err == nil {
 		for _, dir := range conventionSubdirsAsc(home, "commands") {
-			add(dir)
+			add(command.Root{Path: dir})
 		}
 	}
 	if dir := userConfigDir(); dir != "" {
-		add(filepath.Join(dir, "commands"))
+		add(command.Root{Path: filepath.Join(dir, "commands")})
 	}
 	if dir := userSupportDir(); dir != "" && !samePath(dir, userConfigDir()) {
-		add(filepath.Join(dir, "commands"))
+		add(command.Root{Path: filepath.Join(dir, "commands")})
 	}
 	for _, dir := range conventionSubdirsAsc(root, "commands") {
-		add(dir)
+		add(command.Root{Path: dir})
 	}
-	return dirs
+	return roots
 }
 
 // SourcePath returns the highest-priority config file that exists, or "" if none.

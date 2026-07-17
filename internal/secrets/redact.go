@@ -4,6 +4,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"reasonix/internal/provider"
@@ -20,8 +21,15 @@ var (
 	// The optional auth-scheme group keeps schemes like "Basic"/"Digest" out of
 	// the value capture, so the credential after the scheme word is what gets
 	// masked (an uncaptured scheme would itself be swallowed as the value,
-	// leaving the real credential in the clear right behind it).
-	keyValuePattern     = regexp.MustCompile(`(?i)\b([A-Z0-9_.-]*(?:API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_.-]*|[A-Z0-9_.-]+[_-]PWD[A-Z0-9_.-]*|AUTHORIZATION)\b(\s*[:=]\s*)((?:Bearer|Basic|Digest|Negotiate|NTLM|Token|Bot|ApiKey)\s+)?(['"]?)([^'"\s,;]+)(['"]?)`)
+	// leaving the real credential in the clear right behind it). The separator
+	// group tolerates quotes around the key and before the value so JSON bodies
+	// ("access_token":"...") match, not just env/header text.
+	keyValuePattern = regexp.MustCompile(`(?i)\b([A-Z0-9_.-]*(?:API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD)[A-Z0-9_.-]*|[A-Z0-9_.-]+[_-]PWD[A-Z0-9_.-]*|AUTHORIZATION)\b(['"]?\s*[:=]\s*['"]?)((?:Bearer|Basic|Digest|Negotiate|NTLM|Token|Bot|ApiKey)\s+)?(['"]?)([^'"\s,;]+)(['"]?)`)
+	// cookieHeaderPattern captures Cookie/Set-Cookie header values so every
+	// name=value pair gets its value masked; attribute flags without a value
+	// (HttpOnly, Secure) pass through untouched.
+	cookieHeaderPattern = regexp.MustCompile(`(?i)\b((?:set-)?cookie)(\s*[:=]\s*)([^=;\s]+=[^;\s]*(?:;\s*[^=;\s]+(?:=[^;\s]*)?)*)`)
+	cookiePairPattern   = regexp.MustCompile(`([^=;\s]+)=([^;\s]*)`)
 	bearerTokenPattern  = regexp.MustCompile(`(?i)\bBearer\s+([A-Za-z0-9._~+/=-]{16,})`)
 	openAIKeyPattern    = regexp.MustCompile(`\b((?:sk|rk)-(?:proj-)?[A-Za-z0-9_-]{12,})\b`)
 	githubTokenPattern  = regexp.MustCompile(`\b(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b`)
@@ -40,6 +48,10 @@ var (
 	redactToolOutputEnabled      atomic.Bool
 	filterSubprocessEnvEnabled   atomic.Bool
 	protectSensitiveFilesEnabled atomic.Bool
+	credentialEnvKeys            = struct {
+		sync.RWMutex
+		keys map[string]struct{}
+	}{keys: map[string]struct{}{}}
 )
 
 func init() {
@@ -74,6 +86,32 @@ func SetProtectSensitiveFiles(enabled bool) { protectSensitiveFilesEnabled.Store
 // denylist is active.
 func ProtectSensitiveFiles() bool { return protectSensitiveFilesEnabled.Load() }
 
+// RegisterCredentialEnvKeys permanently marks names whose values came from
+// Reasonix's credential store. Registration is a process-lifetime union so two
+// concurrent workspaces with different custom providers cannot make each
+// other's saved keys visible to tools. Explicit per-tool/plugin env config may
+// still add a value back after ProcessEnv has produced the safe base env.
+func RegisterCredentialEnvKeys(keys []string) {
+	credentialEnvKeys.Lock()
+	defer credentialEnvKeys.Unlock()
+	for _, key := range keys {
+		if key = credentialEnvKey(key); key != "" {
+			credentialEnvKeys.keys[key] = struct{}{}
+		}
+	}
+}
+
+func credentialEnvKey(key string) string {
+	return strings.ToUpper(strings.TrimSpace(key))
+}
+
+func registeredCredentialEnvKey(key string) bool {
+	credentialEnvKeys.RLock()
+	defer credentialEnvKeys.RUnlock()
+	_, ok := credentialEnvKeys.keys[credentialEnvKey(key)]
+	return ok
+}
+
 // EnvKeySensitive reports whether an environment variable name is likely to
 // carry credentials. It intentionally keys off the name, not the value, so child
 // processes do not inherit saved provider secrets when filtering is enabled.
@@ -90,7 +128,7 @@ func FilterEnv(env []string) []string {
 	out := env[:0]
 	for _, item := range env {
 		key, _, ok := strings.Cut(item, "=")
-		if !ok || EnvKeySensitive(key) {
+		if !ok || EnvKeySensitive(key) || registeredCredentialEnvKey(key) {
 			continue
 		}
 		out = append(out, item)
@@ -98,12 +136,25 @@ func FilterEnv(env []string) []string {
 	return out
 }
 
-// ProcessEnv returns the environment for shell/tool subprocesses: the current
-// process environment as-is by default, with credential-like assignments
-// removed when the user opted into [secrets] filter_subprocess_env.
+func filterRegisteredCredentialEnv(env []string) []string {
+	out := env[:0]
+	for _, item := range env {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok || registeredCredentialEnvKey(key) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// ProcessEnv returns the environment for shell/tool subprocesses. Values loaded
+// from Reasonix's credential store are always removed. Other credential-like
+// inherited variables are removed only when the user opted into [secrets]
+// filter_subprocess_env, preserving existing gh/git/npm workflows by default.
 func ProcessEnv() []string {
 	if !filterSubprocessEnvEnabled.Load() {
-		return os.Environ()
+		return filterRegisteredCredentialEnv(os.Environ())
 	}
 	return FilterEnv(os.Environ())
 }
@@ -143,6 +194,13 @@ func Redact(s string) string {
 			return key + sep + scheme + quote + redactedValue + endQuote
 		}
 		return key + sep + scheme + quote + mask(value) + endQuote
+	})
+	s = cookieHeaderPattern.ReplaceAllStringFunc(s, func(match string) string {
+		parts := cookieHeaderPattern.FindStringSubmatch(match)
+		if len(parts) != 4 {
+			return redactedValue
+		}
+		return parts[1] + parts[2] + cookiePairPattern.ReplaceAllString(parts[3], "$1="+redactedValue)
 	})
 	s = bearerTokenPattern.ReplaceAllStringFunc(s, func(match string) string {
 		token := strings.TrimSpace(strings.TrimPrefix(match, "Bearer"))

@@ -27,6 +27,33 @@ func TestToWireRetryingJSON(t *testing.T) {
 	}
 }
 
+func TestToWireNoticeCarriesCode(t *testing.T) {
+	w := ToWire(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeFinalReadiness, Text: "readiness copy"})
+	b, err := json.Marshal(w)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"code":"final_readiness"`) {
+		t.Fatalf("notice JSON = %s, want a stable code field", b)
+	}
+
+	w = ToWire(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "codeless notice"})
+	if b, err = json.Marshal(w); err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), `"code"`) {
+		t.Fatalf("codeless notice JSON = %s, must omit the code field", b)
+	}
+
+	w = ToWire(event.Event{Kind: event.Text, Code: "stray"})
+	if b, err = json.Marshal(w); err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), `"code"`) {
+		t.Fatalf("non-notice JSON = %s, must not carry a code", b)
+	}
+}
+
 func TestKindNamesComplete(t *testing.T) {
 	for k := event.Kind(0); k < event.KindCount; k++ {
 		if ToWire(event.Event{Kind: k}).Kind == "" {
@@ -49,6 +76,7 @@ func TestDesktopWireEventTypeCoversSharedPayloadFields(t *testing.T) {
 	ts := readDesktopTypes(t)
 	for _, want := range []string{
 		"detail?: string;",
+		`outcome?: "final_readiness";`,
 		"retryAttempt?: number;",
 		"retryMax?: number;",
 		"memoryCitations?: MemoryCitation[];",
@@ -81,6 +109,33 @@ func TestToWireNoticeDetail(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("notice JSON = %s, want it to contain %s", string(b), want)
 		}
+	}
+}
+
+func TestToWireTurnOutcomeIsOptionalAndMachineReadable(t *testing.T) {
+	readiness := ToWire(event.Event{
+		Kind:      event.TurnDone,
+		Err:       errors.New("final-answer readiness failed 3 times: missing verification"),
+		Outcome:   event.TurnOutcomeFinalReadiness,
+		Readiness: &event.FinalReadiness{Attempts: 3, Missing: []string{"verification", "review"}},
+	})
+	if readiness.Outcome != event.TurnOutcomeFinalReadiness || readiness.Err == "" || readiness.Readiness == nil || readiness.Readiness.Attempts != 3 {
+		t.Fatalf("readiness wire event = %+v", readiness)
+	}
+	b, err := json.Marshal(readiness)
+	if err != nil {
+		t.Fatalf("marshal readiness: %v", err)
+	}
+	if !strings.Contains(string(b), `"outcome":"final_readiness"`) || !strings.Contains(string(b), `"missing":["verification","review"]`) {
+		t.Fatalf("readiness JSON = %s, want structured outcome", b)
+	}
+
+	ordinary, err := json.Marshal(ToWire(event.Event{Kind: event.TurnDone, Err: errors.New("provider failed")}))
+	if err != nil {
+		t.Fatalf("marshal ordinary error: %v", err)
+	}
+	if strings.Contains(string(ordinary), `"outcome"`) {
+		t.Fatalf("ordinary error JSON must omit outcome: %s", ordinary)
 	}
 }
 
@@ -166,7 +221,7 @@ func TestToWireToolPayloadJSON(t *testing.T) {
 	w := ToWire(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
 		ID: "call-1", Name: "task", Args: `{"prompt":"x"}`, Output: "ignored",
 		Err: "blocked", ReadOnly: true, Truncated: true, DurationMs: 522,
-		Partial: true, ParentID: "parent-1",
+		Partial: true, Refreshed: true, ParentID: "parent-1",
 		FileDiff: event.FileDiff{Diff: "@@ -1 +1 @@\n-old\n+new\n", Added: 1, Removed: 1},
 		Profile:  &event.Profile{Model: "deepseek-pro", Effort: "max"},
 	}})
@@ -178,7 +233,7 @@ func TestToWireToolPayloadJSON(t *testing.T) {
 	for _, want := range []string{
 		`"kind":"tool_dispatch"`, `"id":"call-1"`, `"name":"task"`,
 		`"args":"{\"prompt\":\"x\"}"`, `"output":"ignored"`, `"err":"blocked"`,
-		`"readOnly":true`, `"truncated":true`, `"durationMs":522`, `"partial":true`,
+		`"readOnly":true`, `"truncated":true`, `"durationMs":522`, `"partial":true`, `"refreshed":true`,
 		`"parentId":"parent-1"`, `"diff":"@@ -1 +1 @@\n-old\n+new\n"`,
 		`"added":1`, `"removed":1`, `"profile":{"model":"deepseek-pro","effort":"max"}`,
 	} {
@@ -232,6 +287,27 @@ func TestToWireInteractionAndLifecyclePayloads(t *testing.T) {
 			name: "approval",
 			in:   event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{ID: "a1", Tool: "bash", Subject: "rm"}},
 			want: []string{`"kind":"approval_request"`, `"approval":{"id":"a1","tool":"bash","subject":"rm"}`},
+		},
+		{
+			name: "fresh approval",
+			in:   event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{ID: "a2", Tool: "mcp__srv__wipe", Subject: "srv/wipe", Fresh: true}},
+			want: []string{`"kind":"approval_request"`, `"tool":"mcp__srv__wipe"`, `"fresh":true`},
+		},
+		{
+			name: "MCP trust approval payload",
+			in: event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{
+				ID: "a3", Tool: "mcp__srv__write", Subject: "srv/write",
+				MCPTrust: &event.MCPTrust{
+					Server: "srv", TrustState: "workspace", TrustSource: "user", TrustScope: "workspace",
+					IsolationState: "unavailable_unconfined", IsolationReason: "sandbox backend unavailable",
+					ChangedTools: []string{"write"}, ToolChanges: []event.MCPToolChange{{Name: "write", Kind: "schema_changed"}},
+					Readers: []string{"search"}, Writers: []string{"write"}, Destructive: []string{},
+				},
+			}},
+			want: []string{`"mcpTrust":{"server":"srv"`, `"trustState":"workspace"`, `"trustSource":"user"`,
+				`"isolationState":"unavailable_unconfined"`, `"changedTools":["write"]`,
+				`"toolChanges":[{"name":"write","kind":"schema_changed"}]`, `"readers":["search"]`,
+				`"writers":["write"]`, `"destructive":[]`},
 		},
 		{
 			name: "ask",

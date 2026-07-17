@@ -45,6 +45,8 @@ export interface WireTool {
   truncated?: boolean;
   durationMs?: number;
   partial?: boolean; // an early dispatch (name only) — a full one with args follows
+  argChars?: number; // partial only: cumulative argument chars streamed so far
+  refreshed?: boolean; // same-ID full dispatch with a preview recomputed after an earlier write
   parentId?: string; // set on a sub-agent's calls — the parent `task` call's id
   diff?: string;
   added?: number;
@@ -88,6 +90,23 @@ export interface WireApproval {
   tool: string;
   subject: string;
   reason?: string;
+  fresh?: boolean;
+  mcpTrust?: WireMCPTrust;
+}
+
+export interface WireMCPTrust {
+  server: string;
+  trustState: string;
+  trustSource?: string;
+  trustScope?: string;
+  isolationState: string;
+  isolationReason?: string;
+  identityChanged?: boolean;
+  changedTools: string[];
+  toolChanges: MCPToolTrustChangeView[];
+  readers: string[];
+  writers: string[];
+  destructive: string[];
 }
 
 export interface WireGuardian {
@@ -156,6 +175,8 @@ export interface WireEvent {
   kind: EventKind;
   text?: string;
   detail?: string;
+  // Stable notice id for localization; empty/absent = localize by text match.
+  code?: string;
   reasoning?: string;
   memoryCitations?: MemoryCitation[];
   memoryCompiler?: MemoryCompilerStats;
@@ -167,6 +188,8 @@ export interface WireEvent {
   compaction?: WireCompaction;
   guardian?: WireGuardian;
   err?: string;
+  outcome?: "final_readiness";
+  readiness?: WireFinalReadiness;
   retryAttempt?: number;
   retryMax?: number;
   // Tab routing: set by the Go-side tabEventSink so multi-tab frontends
@@ -180,6 +203,11 @@ export interface WireEvent {
   sessionCostUsd?: number;
 }
 
+export interface WireFinalReadiness {
+  attempts?: number;
+  missing?: string[];
+}
+
 // Tab management types (desktop/tabs.go).
 export interface TabMeta {
   id: string;
@@ -189,6 +217,7 @@ export interface TabMeta {
   workspaceName: string;
   workspacePath?: string;
   gitBranch?: string;
+  isolatedWorktree?: boolean;
   topicId: string;
   topicTitle: string;
   sessionPath?: string;
@@ -237,7 +266,25 @@ export interface ProjectNode {
   recoveryReason?: string;
   recoveryDigest?: string;
   recoveryParentId?: string;
+  isolatedWorktree?: boolean;
   children?: ProjectNode[];
+}
+
+export interface DeliveryWorktreeAvailability {
+  available: boolean;
+  reason?: string;
+  repoRoot?: string;
+  branch?: string;
+  sourceDirty?: boolean;
+}
+
+export interface DeliveryWorktreeOpenResult {
+  workspaceRoot: string;
+  worktreeRoot: string;
+  sourceRoot: string;
+  branch: string;
+  sourceDirty: boolean;
+  tab: TabMeta;
 }
 
 export type ProjectTopicStatus = "thinking" | "streaming" | "waiting_confirmation" | "background_job" | "paused" | "error";
@@ -326,6 +373,7 @@ export interface HistoryMessage {
   role: string;
   content: string;
   detail?: string;
+  code?: string;
   submitText?: string;
   checkpointTurn?: number;
   createdAt?: number;
@@ -472,7 +520,8 @@ export interface Meta {
 
 export type CollaborationMode = "normal" | "plan" | "goal";
 export type ToolApprovalMode = "ask" | "auto" | "yolo";
-export type TokenMode = "full" | "economy";
+// "full" is the persisted compatibility value for the Balanced runtime profile.
+export type TokenMode = "full" | "economy" | "delivery";
 export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
 
 export interface AutoResearchCompactView {
@@ -546,11 +595,12 @@ export function normalizeToolApprovalMode(
 
 export function normalizeTokenMode(mode?: string): TokenMode {
   if (mode === "economy") return "economy";
+  if (mode === "delivery") return "delivery";
   return "full";
 }
 
 // Mode is the compatibility string for two independent composer axes:
-// plan (read-only/user-plan gate) and yolo/full access (tool auto-approval).
+// plan (plan-first workflow) and yolo (tool auto-approval).
 export type Mode = "normal" | "plan" | "yolo" | "plan-yolo";
 
 export function normalizeMode(mode?: string): Mode {
@@ -587,7 +637,10 @@ export interface CommandInfo {
   name: string; // without the leading slash
   description: string;
   hint?: string;
-  kind: "builtin" | "custom" | "mcp" | "skill";
+  kind: "builtin" | "custom" | "mcp" | "skill" | "subagent";
+  group?: "actions" | "management" | "subagents" | "skills" | "integrations";
+  plugin?: string;
+  color?: string;
 }
 
 export interface DirEntry {
@@ -650,7 +703,7 @@ export interface GitCommitDetailView {
 export interface ComposerInsertRequest {
   id: number;
   text: string;
-  mode?: "insert" | "replace";
+  mode?: "insert" | "replace" | "prefix";
 }
 
 // MCP & Skills drawer (desktop/app.go Capabilities) — the GUI counterpart to
@@ -677,15 +730,65 @@ export interface ServerView {
   error?: string;
   toolList?: MCPToolView[];
   trustedReadOnlyTools?: string[];
+  callTimeoutSeconds?: number;
+  toolTimeoutSeconds?: Record<string, number>;
+  defaultToolsApprovalMode?: MCPApprovalMode;
+  toolPolicies?: Record<string, MCPToolPolicy>;
+  approvalsReviewer?: MCPApprovalsReviewer;
   authStatus?: "none" | "possible" | "required" | string;
   authUrl?: string;
   authConfigured?: boolean;
   managedByPlugin?: string;
+  trustState?: "official" | "workspace" | "session" | "changed" | "untrusted" | string;
+  trustSource?: "user" | "official_catalog" | "legacy_import" | string;
+  trustScope?: "session" | "workspace" | "global" | string;
+  isolationState?: "enforced" | "unavailable_unconfined" | "not_applicable" | string;
+  isolationReason?: string;
+  identityChanged?: boolean;
+  changedTools?: string[];
+  toolChanges?: MCPToolTrustChangeView[];
+  catalogSequence?: number;
+  verifiedVersion?: string;
+}
+export type MCPApprovalMode = "auto" | "prompt" | "writes" | "approve";
+export type MCPApprovalsReviewer = "user" | "auto_review";
+export interface MCPToolPolicy {
+  approval_mode: MCPApprovalMode;
 }
 export interface MCPToolView {
   name: string;
   description: string;
   readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  schemaError?: string;
+  trustedReader?: boolean;
+}
+
+export interface MCPToolTrustChangeView {
+  name: string;
+  kind: "added" | "reader_to_writer" | "reader_to_destructive" | "writer_to_reader" | "safety_changed" | "name_changed" | "schema_changed" | string;
+}
+
+export interface MCPTrustInspectionView {
+  name: string;
+  trustState: string;
+  trustSource?: string;
+  trustScope?: string;
+  isolationState: string;
+  isolationReason?: string;
+  identityChanged?: boolean;
+  changedTools: string[];
+  toolChanges?: MCPToolTrustChangeView[];
+  readers: string[];
+  writers: string[];
+  destructive: string[];
+}
+
+export interface MCPCatalogRefreshView {
+  source: string;
+  sequence: number;
+  offline: boolean;
+  stale?: boolean;
 }
 export interface SkillView {
   name: string;
@@ -693,12 +796,28 @@ export interface SkillView {
   scope: string;
   runAs: string;
   enabled: boolean;
+  plugin?: string;
+  model?: string;
+  effort?: string;
+  allowedTools?: string[];
+  color?: string;
+  invocation?: string;
+  invocationMode?: string;
+  body?: string;
+  configuredModel?: string;
+  configuredEffort?: string;
 }
 export interface SkillRootSkillView {
   name: string;
   description: string;
   scope: string;
   runAs: string;
+  plugin?: string;
+  model?: string;
+  effort?: string;
+  allowedTools?: string[];
+  color?: string;
+  invocation?: string;
 }
 export interface SkillRootView {
   dir: string;
@@ -721,6 +840,16 @@ export interface SkillsSettingsView {
   skills: SkillView[];
   skillRoots: SkillRootView[];
 }
+export interface SubagentProfileInput {
+  name: string;
+  description: string;
+  systemPrompt: string;
+  color?: string;
+  model?: string;
+  effort?: string;
+  allowedTools?: string[];
+  scope?: "project" | "global";
+}
 export interface PluginView {
   name: string;
   version?: string;
@@ -730,13 +859,40 @@ export interface PluginView {
   manifestKind?: string;
   enabled: boolean;
   skills: number;
+  commands?: number;
   hooks: number;
   mcpServers: number;
+  agents?: number;
+  compatibility?: "full" | "partial" | "none" | string;
+  mappedCapabilities?: string[];
+  skippedCapabilities?: PluginCompatibilityIssue[];
   skillDetails?: PluginSkillView[];
+  agentDetails?: PluginAgentView[];
+  commandDetails?: PluginCommandView[];
   hookDetails?: PluginHookView[];
   mcpServerDetails?: PluginMCPServerView[];
   warnings?: string[];
   error?: string;
+  verification?: {
+    catalogEntryId: string;
+    commit: string;
+    packageSha256: string;
+    verifiedAt: string;
+    catalogSequence: number;
+  };
+}
+export interface PluginCompatibilityIssue {
+  capability: string;
+  path?: string;
+  reason: string;
+}
+export interface PluginAgentView {
+  name: string;
+  description?: string;
+  path?: string;
+  invocation?: string;
+  model?: string;
+  allowedTools?: string[];
 }
 export interface PluginSkillView {
   name: string;
@@ -744,6 +900,15 @@ export interface PluginSkillView {
   path?: string;
   invocation?: string;
   runAs?: string;
+}
+export interface PluginCommandView {
+  name: string;
+  description?: string;
+  argHint?: string;
+  path?: string;
+  invocation?: string;
+  shadowed?: boolean;
+  shadowedByPlugin?: string;
 }
 export interface PluginHookView {
   event: string;
@@ -754,9 +919,12 @@ export interface PluginHookView {
 }
 export interface PluginMCPServerView {
   name: string;
+  displayName?: string;
+  description?: string;
   transport?: string;
   command?: string;
   url?: string;
+  autoStart?: boolean;
 }
 export interface PluginInstallOptions {
   dryRun?: boolean;
@@ -773,6 +941,12 @@ export interface MCPServerInput {
   env?: Record<string, string> | null;
   headers?: Record<string, string> | null;
   trustedReadOnlyTools?: string[];
+  autoStart?: boolean | null;
+  callTimeoutSeconds?: number | null;
+  toolTimeoutSeconds?: Record<string, number> | null;
+  defaultToolsApprovalMode?: MCPApprovalMode | "" | null;
+  tools?: Record<string, MCPToolPolicy> | null;
+  approvalsReviewer?: MCPApprovalsReviewer | "" | null;
 }
 
 export interface ModelInfo {
@@ -867,8 +1041,107 @@ export interface MemoryView {
 }
 
 // SettingsTab is the top-level navigation item in the Settings Centre modal.
-export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "plugins" | "memory" | "hooks" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
+export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "subagents" | "plugins" | "memory" | "hooks" | "diagnostics" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
 
+/** Capability diagnostics report from App.CapabilityDiagnostics (capdiag.Report). */
+export interface CapabilityDiagnosticsReport {
+  schema_version: number;
+  root: string;
+  live: boolean;
+  summary: {
+    errors: number;
+    warnings: number;
+    infos: number;
+    instructions: number;
+    skills: number;
+    commands: number;
+    hooks: number;
+    plugins: number;
+    mcp_servers: number;
+  };
+  instructions: { docs: Array<{ path: string; scope: string; order: number }> };
+  skills: CapabilityAssetReport;
+  commands: CapabilityAssetReport;
+  hooks: {
+    trusted_project: boolean;
+    project_defines_hooks: boolean;
+    sources: Array<{ scope: string; path: string; status: string; hook_count: number; parse_error?: string }>;
+    entries: Array<{
+      event: string;
+      match?: string;
+      command?: string;
+      context_file?: string;
+      description?: string;
+      timeout_ms?: number;
+      scope: string;
+      source: string;
+      blocking: boolean;
+    }>;
+  };
+  plugins: {
+    state_path?: string;
+    packages: Array<{
+      name: string;
+      enabled: boolean;
+      version?: string;
+      root: string;
+      manifest_kind?: string;
+      skills: number;
+      commands: number;
+      hooks: number;
+      mcp_servers: number;
+      warnings?: string[];
+      status: string;
+    }>;
+  };
+  mcp: {
+    servers: Array<{
+      name: string;
+      source?: string;
+      package_owner?: string;
+      transport: string;
+      start_intent: string;
+      command?: string;
+      url_host?: string;
+      env_keys?: string[];
+      header_keys?: string[];
+      runtime_status?: string;
+      tool_count?: number;
+      tools?: Array<{ name: string; read_only_hint?: boolean }>;
+      error?: string;
+    }>;
+  };
+  issues: CapabilityIssue[];
+}
+
+export interface CapabilityAssetReport {
+  roots: Array<{ path: string; scope?: string; status: string }>;
+  entries: Array<{
+    name: string;
+    description?: string;
+    scope?: string;
+    path: string;
+    status: string;
+    winner_path?: string;
+    error?: string;
+    run_as?: string;
+  }>;
+  winners: number;
+  shadowed: number;
+  disabled?: number;
+  parse_errors?: number;
+}
+
+export interface CapabilityIssue {
+  severity: "error" | "warning" | "info" | string;
+  code: string;
+  subsystem: string;
+  name?: string;
+  source?: string;
+  message: string;
+  remediation?: string;
+  settings_tab?: string;
+}
 // Settings panel payloads (desktop/settings_app.go).
 export interface ProviderView {
   name: string;
@@ -1237,6 +1510,21 @@ export interface DesktopStartupSettingsView {
   statusBarStyle: string; // "icon" | "text"
   statusBarItems: string[]; // ordered visible status bar item ids
   checkUpdates: boolean; // check for new versions on startup
+  safeMode?: boolean; // recovery startup with external integrations disabled
+}
+
+export type ExternalOpenerKind = "file-manager" | "editor" | "terminal";
+
+export interface ExternalOpenerView {
+  id: string;
+  name: string;
+  kind: ExternalOpenerKind;
+  iconDataUrl?: string;
+}
+
+export interface ExternalOpenersView {
+  openers: ExternalOpenerView[];
+  preferred: string;
 }
 
 // Auto-updater payloads (desktop/updater.go). UpdateInfo drives the update banner;

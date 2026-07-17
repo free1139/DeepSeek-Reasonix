@@ -87,7 +87,7 @@ type Messages struct {
 	BashPrefixChoices                      string // approval choice list when a bash prefix can be granted
 	PlanModeReadOnlyCommandChoices         string // approval choice list for plan-mode read-only command trust
 	FreshHumanApprovalChoices              string // approval choice list for prompts that cannot be remembered
-	SandboxEscapeApprovalChoices           string // approval choice list for Windows sandbox escape prompts
+	SandboxEscapeApprovalChoices           string // approval choice list for OS sandbox escape prompts
 	ApprovalNeededFmt                      string // notification text for a pending approval, tool only
 	ApprovalNeededWithSubjectFmt           string // notification text for a pending approval with subject
 	ToolApprovalSourceFmt                  string // "Source: %s" / "来源: %s"
@@ -102,22 +102,23 @@ type Messages struct {
 	ApprovalToolLabelRunSkill              string // user-facing label for run_skill approvals
 	ApprovalToolLabelRemember              string // user-facing label for remember approvals
 	ApprovalToolLabelForget                string // user-facing label for forget approvals
-	ApprovalToolLabelSandboxEscape         string // user-facing label for Windows sandbox escape approvals
+	ApprovalToolLabelSandboxEscape         string // user-facing label for OS sandbox escape approvals
 	ApprovalToolLabelPlanModeReadOnly      string // user-facing label for plan-mode read-only command trust approvals
 	MemoryApprovalSaveUpdate               string // subject prefix for remember approval
 	MemoryApprovalBodyLabel                string // label before the body excerpt in remember approval
 	MemoryApprovalArchiveFmt               string // subject for forget approval, %q = memory name
-	PlanModeMCPTrustMetadataMissing        string // denial when MCP trust metadata is incomplete
-	PlanModeMCPTrustSubjectFmt             string // subject for MCP read-only trust approval, server/tool
-	PlanModeMCPTrustReason                 string // reason for MCP read-only trust approval
-	PlanModeMCPTrustDeclined               string // model-facing denial after MCP read-only trust rejection
+	MCPDestructiveSubjectFmt               string // subject for destructive MCP approval, target
+	MCPDestructiveReason                   string // reason for destructive MCP approval
+	MCPDestructiveDeclined                 string // model-facing denial after destructive MCP rejection
+	MCPReviewerUnavailableReason           string // reason for fresh approval when auto_review is unavailable
+	MCPReviewerUnavailableDeclined         string // model-facing denial after reviewer-unavailable rejection
 	PlanModeBashTrustSubjectFmt            string // subject for bash read-only prefix trust approval, prefix + command
 	PlanModeBashTrustReason                string // reason for bash read-only prefix trust approval
 	PlanModeBashTrustDeclined              string // model-facing denial after bash read-only prefix rejection
-	SandboxEscapeSubjectFallback           string // fallback subject for one-shot unconfined Windows sandbox escape approval
+	SandboxEscapeSubjectFallback           string // fallback subject for a one-shot unconfined sandbox escape approval
 	SandboxEscapeSubjectPrefix             string // subject prefix before the shell command for one-shot unconfined escape approval
-	SandboxEscapeWrapReason                string // reason when the Windows sandbox cannot wrap the command
-	SandboxEscapeRuntimeReason             string // reason when the Windows sandbox helper fails while starting the command
+	SandboxEscapeWrapReason                string // reason when no OS sandbox can wrap the command
+	SandboxEscapeRuntimeReason             string // fallback reason when an OS sandbox cannot start the command
 	SandboxEscapeDeclined                  string // model-facing denial when the user declines a one-shot unconfined retry
 	ApprovalToolLabelConfigWrite           string // user-facing label for Reasonix-managed config write approvals
 	ConfigWriteSubjectPrefix               string // subject prefix before the config file path for managed config write approval
@@ -127,9 +128,6 @@ type Messages struct {
 	PermissionSavedFmt                     string // permission rule saved notice: path, rule
 	PermissionAlreadyAllowedFmt            string // permission rule already covered notice: path, rule
 	PermissionSaveFailedFmt                string // permission rule save failure notice: rule, error
-	MCPReadOnlyTrustSavedFmt               string // MCP trusted read-only saved notice: path, server, tool
-	MCPReadOnlyTrustAlreadyFmt             string // MCP trusted read-only already covered notice: path, server, tool
-	MCPReadOnlyTrustFailedFmt              string // MCP trusted read-only save failure notice: server, tool, error
 	PlanModeReadOnlyCommandTrustSavedFmt   string // plan-mode bash read-only prefix saved notice: path, prefix
 	PlanModeReadOnlyCommandTrustAlreadyFmt string // plan-mode bash read-only prefix already covered notice: path, prefix
 	PlanModeReadOnlyCommandTrustFailedFmt  string // plan-mode bash read-only prefix save failure notice: prefix, error
@@ -208,6 +206,8 @@ type Messages struct {
 	CmdResume           string // /resume
 	CmdRename           string // /rename
 	CmdModel            string // /model
+	CmdStatus           string // /status
+	CmdWorkMode         string // /work-mode
 	CmdMemory           string // /memory
 	CmdMigrate          string // /migrate
 	CmdGoal             string // /goal
@@ -277,37 +277,50 @@ type Messages struct {
 	ListMcpNone         string // no mcp servers
 
 	// in-chat memory/model/rewind notices.
-	MemoryNone             string
-	MemoryLoaded           string
-	MemorySavedHeader      string
-	MemoryStoredUnderFmt   string
-	MemoryEditHint         string
-	ForgetUsage            string
-	ForgetDoneFmt          string
-	QuickRememberEmpty     string
-	QuickRememberDoneFmt   string
-	GoalEmpty              string
-	GoalCurrentFmt         string
-	GoalSetFmt             string
-	GoalCleared            string
-	ModelSwitchUnavailable string
-	ModelSwitchBusy        string
-	ModelAlreadyOnFmt      string
-	ModelSwitchingFmt      string
-	ModelSwitchedFmt       string
-	ModelListHeader        string
-	RewindNone             string
-	RewindCodeConversation string
-	RewindConversationOnly string
-	RewindCodeOnly         string
-	RewindFork             string
-	RewindSummarizeFrom    string
-	RewindSummarizeUpto    string
-	RewindPickTitle        string
-	RewindPickHint         string
-	RewindRestoreTitleFmt  string
-	RewindApplyHint        string
-	RewindEmpty            string
+	MemoryNone                string
+	MemoryLoaded              string
+	MemorySavedHeader         string
+	MemoryStoredUnderFmt      string
+	MemoryEditHint            string
+	ForgetUsage               string
+	ForgetDoneFmt             string
+	QuickRememberEmpty        string
+	QuickRememberDoneFmt      string
+	GoalEmpty                 string
+	GoalCurrentFmt            string
+	GoalSetFmt                string
+	GoalCleared               string
+	ModelSwitchUnavailable    string
+	ModelSwitchBusy           string
+	ModelAlreadyOnFmt         string
+	ModelSwitchingFmt         string
+	ModelSwitchedFmt          string
+	ModelListHeader           string
+	RuntimeSwitchPending      string
+	WorkModeStatusFmt         string
+	WorkModeListHeaderFmt     string
+	WorkModeListHint          string
+	WorkModeEconomyDesc       string
+	WorkModeBalancedDesc      string
+	WorkModeDeliveryDesc      string
+	WorkModeUsage             string
+	WorkModeSwitchUnavailable string
+	WorkModeSwitchBusy        string
+	WorkModeAlreadyOnFmt      string
+	WorkModeSwitchingFmt      string
+	WorkModeSwitchedFmt       string
+	RewindNone                string
+	RewindCodeConversation    string
+	RewindConversationOnly    string
+	RewindCodeOnly            string
+	RewindFork                string
+	RewindSummarizeFrom       string
+	RewindSummarizeUpto       string
+	RewindPickTitle           string
+	RewindPickHint            string
+	RewindRestoreTitleFmt     string
+	RewindApplyHint           string
+	RewindEmpty               string
 
 	// skill picker overlay (/skills interactive panel in CLI TUI)
 	SkillPickerTitle             string
@@ -356,17 +369,50 @@ type Messages struct {
 	SkillPickerStatusUnreadable  string // "unreadable" path status label
 
 	// init wizard
-	SelectProvidersLabel  string // multi-select label
-	EnterAPIKeysHeader    string // header before the per-env-var prompts
-	MissingKeyIntro       string // shown when re-running the key step on a configured setup
-	WroteFileFmt          string // "Wrote %s" — used for reasonix.toml and .env both
-	SetupComplete         string // success line at end of init
-	SetupCancelled        string // shown when the user aborts the wizard
-	TryHintFmt            string // "Try: %s" — %s = command to try (styled)
-	NextHint              string // non-interactive post-write hint
-	ConfirmReconfigureFmt string // "%s already exists. Reconfigure and overwrite?"
-	KeepingExisting       string // when the user declines to overwrite
-	NotOverwritingFmt     string // non-interactive overwrite refusal
+	SelectProvidersLabel     string // multi-select label
+	EnterAPIKeysHeader       string // header before the per-env-var prompts
+	MissingKeyIntro          string // shown when re-running the key step on a configured setup
+	WroteFileFmt             string // "Wrote %s" — used for reasonix.toml and .env both
+	SetupComplete            string // success line at end of init
+	SetupCancelled           string // shown when the user aborts the wizard
+	TryHintFmt               string // "Try: %s" — %s = command to try (styled)
+	NextHint                 string // non-interactive post-write hint
+	ConfirmReconfigureFmt    string // "%s already exists. Reconfigure and overwrite?"
+	KeepingExisting          string // when the user declines to overwrite
+	NotOverwritingFmt        string // non-interactive overwrite refusal
+	SetupManagerTitle        string
+	SetupAddOpenAI           string
+	SetupAddAnthropic        string
+	SetupProviderExistsFmt   string
+	SetupSaveExit            string
+	SetupSaveExitDesc        string
+	SetupCancel              string
+	SetupCancelDesc          string
+	SetupModelsUnit          string
+	SetupKeySet              string
+	SetupKeyMissing          string
+	SetupDefaultBadge        string
+	SetupProviderActionsFmt  string
+	SetupEditProvider        string
+	SetupUpdateKey           string
+	SetupTestRefresh         string
+	SetupSetDefault          string
+	SetupRemoveProvider      string
+	SetupBack                string
+	SetupPromptModels        string
+	SetupSharedKeyWarningFmt string
+	SetupPromptAPIKeyFmt     string
+	SetupSelectDefaultModel  string
+	SetupConfirmRemoveFmt    string
+	SetupSummaryTitle        string
+	SetupSummaryAddedFmt     string
+	SetupSummaryEditedFmt    string
+	SetupSummaryRemovedFmt   string
+	SetupSummaryDefaultFmt   string
+	SetupSummaryKeysFmt      string
+	SetupSummaryNoChanges    string
+	SetupConfirmSave         string
+	SetupConcurrentChangeFmt string
 
 	// model fetching
 	FetchingModelsFmt          string // "Fetching models for %s..."
@@ -381,6 +427,8 @@ type Messages struct {
 	SkipStaleCustomEntryFmt    string // "skipping stale %q entry from reasonix.toml (pointing at %s) — please remove it"
 	APIKeyAlreadySetFmt        string // "reusing existing value for %s"
 	APIKeyResetPromptFmt       string // "Re-enter %s?"
+	InvalidAPIKeyEnvFmt        string // "%q is not a valid API Key variable name..."
+	RepairedAPIKeyEnvFmt       string // "provider %s: replaced invalid api_key_env %q with %q"
 
 	// custom provider
 	CustomProviderLabel  string // "Custom Model"
