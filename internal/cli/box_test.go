@@ -86,7 +86,7 @@ func TestBoxedMultipleLines(t *testing.T) {
 
 func TestBoxedEmpty(t *testing.T) {
 	got := boxed([]string{})
-	if len(got) != 0 {
-		t.Error("boxed empty should produce no output")
+	if len(got) == 0 {
+		t.Error("boxed empty should still produce a box")
 	}
 }

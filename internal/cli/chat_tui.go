@@ -270,10 +270,6 @@ type chatTUI struct {
 	// can start successfully.
 	mcpImport *mcpImportPicker
 
-	// modePicker is the interactive mode-switch overlay (/audit). Non-nil while
-	// the user browses Auto / Plan / YOLO with ↑/↓ and confirms with Enter.
-	modePicker *modePicker
-
 	// host is the running MCP servers (nil when no plugins). The TUI reads
 	// prompts (slash commands), resources (@-references), and server status
 	// (/mcp) from it.
@@ -531,6 +527,7 @@ type clipboardPasteMsg struct {
 func newChatTUI(ctrl control.SessionAPI, missing string, eventCh chan event.Event, termW int) chatTUI {
 	ti := textarea.New()
 	configureChatTextarea(&ti)
+
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = themeStyle(activeCLITheme.accent)
@@ -586,8 +583,7 @@ func transcriptContentWidth(termW int, nativeScrollback bool) int {
 // wheel-scroll) without having to type "/mouse" each session.
 func mouseCaptureOffByDefault() bool {
 	v := strings.TrimSpace(os.Getenv("REASONIX_DISABLE_MOUSE"))
-	// default is disabled, by free1139
-	return v != "0"
+	return v != "" && v != "0"
 }
 
 func configureChatTextarea(ti *textarea.Model) {
@@ -1138,10 +1134,6 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.skillPick != nil {
 			return m.handleSkillPickerKey(msg)
 		}
-		// The mode picker is modal while open: keys navigate it.
-		if m.modePicker != nil {
-			return m.handleModePickerKey(msg)
-		}
 		// A pending tool approval is modal: keystrokes answer it (y/a/n, Enter,
 		// Esc) rather than reaching the input.
 		if m.pendingApproval != nil {
@@ -1169,20 +1161,6 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if msg.String() == "enter" && m.completionSelectedInsertPresent() {
 					m.completion = completion{}
 					break // fall through to regular Enter
-				}
-				// For /audit descend, accept the selection and dispatch immediately
-				// (like shift+tab), without falling through to the Enter handler
-				// which would queue the message during tuiRunning.
-				if msg.String() == "enter" && m.auditCompletionActive() {
-					m.acceptCompletion()
-					m.completion = completion{}
-					m.rememberSubmittedInput(m.input.Value())
-					if _, arg := m.parseAuditLine(); arg != "" {
-						m.input.Reset()
-						m.pastedBlocks = nil
-						m.setModeByArg(arg)
-					}
-					return m, finalize(m, cmds)
 				}
 				m.acceptCompletion()
 				return m, nil
@@ -1242,12 +1220,12 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			default:
 				// Idle (any mode): a double-Esc on an empty composer opens the
-				// session picker (all saved sessions by title); a first Esc just
-				// arms it. Non-empty input clears as before.
+				// rewind picker (Claude Code's gesture); a first Esc just arms
+				// it. Non-empty input clears as before.
 				if strings.TrimSpace(m.input.Value()) == "" {
 					if !m.lastEsc.IsZero() && time.Since(m.lastEsc) < 600*time.Millisecond {
 						m.lastEsc = time.Time{}
-						m.openResumePicker()
+						m.openRewind()
 					} else {
 						m.lastEsc = time.Now()
 					}
@@ -1343,15 +1321,6 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cycleMode()
 			return m, nil
 		case "enter":
-			// /audit auto|plan|yolo is a local mode switch, execute immediately
-			// regardless of turn state (like shift+tab).
-			if auditLine, auditArg := m.parseAuditLine(); auditArg != "" {
-				m.rememberSubmittedInput(auditLine)
-				m.input.Reset()
-				m.pastedBlocks = nil
-				m.setModeByArg(auditArg)
-				return m, finalize(m, cmds)
-			}
 			if m.state == tuiRunning {
 				line := strings.TrimSpace(m.input.Value())
 				if line == "" {
@@ -1401,32 +1370,6 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.notice(fmt.Sprintf(i18n.M.QuickRememberDoneFmt, path))
 				}
 				return m, finalize(m, cmds)
-			}
-
-			// ":!<cmd>" is Vim-style shell execution: runs a system command directly.
-			if strings.HasPrefix(line, ":!") {
-				cmd := strings.TrimPrefix(line, ":!")
-				if strings.TrimSpace(cmd) == "" {
-					m.input.Reset()
-					m.pastedBlocks = nil
-					m.notice(i18n.M.ShellExecEmpty)
-					return m, finalize(m, cmds)
-				}
-				m.input.Reset()
-				m.pastedBlocks = nil
-				m.state = tuiRunning
-				m.runStart = time.Now()
-				m.elapsed = 0
-				m.turnTokens = 0
-				m.pendingRestore = line
-				m.bubbleStartIdx = len(m.transcript)
-				m.commitLine("")
-				m.commitLine(renderUserBubble(line, m.width, m.planMode))
-				m.bubblePending = true
-				m.turnDiscarded = false
-				m.confirmBubbleSent() // shell events arrive instantly
-				m.ctrl.RunShell(cmd)
-				return m, tea.Batch(m.spinner.Tick, elapsedTick())
 			}
 
 			// "!<cmd>" runs a shell command directly, bypassing the model.
@@ -1867,7 +1810,6 @@ func (m chatTUI) bottomRows() int {
 		m.renderApprovalBanner(),
 		m.renderChooser(),
 		m.renderRewind(),
-		m.renderModePicker(),
 		m.renderMCPImport(),
 		m.renderResumePicker(),
 		m.renderQuickPicker(),
@@ -1915,20 +1857,13 @@ func (m chatTUI) hideComposer() bool {
 	if m.mcp != nil || m.clearConfirm != nil || m.mcpImport != nil || m.skillPick != nil || m.resumePick != nil || m.quickPick != nil || m.copyPick != nil || m.rewind != nil || m.pendingApproval != nil {
 		return true
 	}
-
-	// 246e4d46 (add /audit auto/plan/yoto)
-	if m.modePicker != nil {
-		return true
-	}
 	return m.chooser != nil && !m.chooser.typing
 }
 
 // transcriptHeight is the row budget left for the transcript viewport once the
-// pinned bottom region is accounted for (at least one row). Also accounts for
+// pinned bottom region is accounted for (at least one row).
 func (m chatTUI) transcriptHeight() int {
-	// Subtract the top header/separator rows if present
-	h := m.height - m.bottomRows()
-	if h > 1 {
+	if h := m.height - m.bottomRows(); h > 1 {
 		return h
 	}
 	return 1
@@ -2846,10 +2781,6 @@ func (m chatTUI) View() tea.View {
 		parts = append(parts, card)
 		rowsAboveBox += strings.Count(card, "\n") + 1
 	}
-	if card := m.renderModePicker(); card != "" {
-		parts = append(parts, card)
-		rowsAboveBox += strings.Count(card, "\n") + 1
-	}
 	if card := m.renderMCPImport(); card != "" {
 		parts = append(parts, card)
 		rowsAboveBox += strings.Count(card, "\n") + 1
@@ -2898,6 +2829,21 @@ func (m chatTUI) View() tea.View {
 	}
 	parts = append(parts, statusBlockStyle.Width(boxW).MaxWidth(boxW).Render(statusBlock))
 
+	if m.nativeScrollback {
+		v := tea.NewView(strings.Join(parts, "\n"))
+		if !hideComposer {
+			if cur := m.input.Cursor(); cur != nil {
+				cur.X += 1
+				cur.Y += rowsAboveBox + 1
+				v.Cursor = cur
+			}
+		}
+		return v
+	}
+
+	// Full-screen frame: the transcript viewport on top (it pads to exactly its
+	// height), the pinned bottom region beneath. Alt-screen owns the grid, so
+	// resize repaints cleanly — no scrollback reflow, no ghost borders.
 	mainArea := m.renderTranscript()
 	if card := m.renderMainManager(); card != "" {
 		mainArea = m.renderTranscriptWithMainManager(card)
@@ -2913,14 +2859,12 @@ func (m chatTUI) View() tea.View {
 		v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript; text selection is handled in-app
 	}
 	// Anchor the real terminal cursor at the textarea's insertion point only when
-	// the composer is visible. Input box position stays fixed from screen top:
-	// row 0 (header if present) + row 1 (separator if present) + viewport height
-	// + rowsAboveBox + 1 (box border). Adjust Y so cursor aligns to input box top.
+	// the composer is visible. input.Cursor() is relative to the textarea; offset
+	// by the viewport height + rows above + the box's top border row (+1 column
+	// for PaddingLeft).
 	if !hideComposer {
 		if cur := m.input.Cursor(); cur != nil {
 			cur.X += 1
-			// Input box starts at: topRows + viewport.Height() + rowsAboveBox + 1
-			// We must add topRows to the Y offset to keep the absolute position fixed.
 			cur.Y += m.viewport.Height() + rowsAboveBox + 1
 			v.Cursor = cur
 		}
@@ -3892,15 +3836,6 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 	case "/auto-plan":
 		m.echoLocalCommand(input)
 		m.runAutoPlanCommand(input)
-	case "/audit":
-		args := tokenizeArgs(input)
-		if len(args) >= 2 {
-			// Silent mode switch: no echo to transcript, just switch.
-			m.setModeByArg(args[1])
-		} else {
-			m.echoLocalCommand(input)
-			m.openModePicker()
-		}
 	case "/reasoning-language":
 		m.echoLocalCommand(input)
 		m.runReasoningLanguageCommand(input)

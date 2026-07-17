@@ -13,6 +13,7 @@ import (
 	"reasonix/internal/shellparse"
 )
 
+// add by free1139
 // sandboxBypassCtx is the context key for signaling that the sandbox should be
 // bypassed for a bash command the user explicitly authorized.
 type sandboxBypassCtx struct{}
@@ -30,6 +31,7 @@ func SandboxBypass(ctx context.Context) bool {
 	v, _ := ctx.Value(sandboxBypassCtx{}).(bool)
 	return v
 }
+// add end
 
 // Decision is the outcome of evaluating a tool call against a Policy.
 type Decision int

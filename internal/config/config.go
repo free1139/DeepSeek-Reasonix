@@ -39,9 +39,6 @@ func SkillNameKey(name string) string {
 
 // Config is Reasonix's runtime configuration.
 type Config struct {
-	// add by free1139
-	Keybindings KeybindingsConfig `toml:"keybindings"`
-
 	ConfigVersion    int                 `toml:"config_version"`
 	DefaultModel     string              `toml:"default_model"`
 	Language         string              `toml:"language"` // ui/model language tag (e.g. "zh"); empty = auto-detect from $LANG / $REASONIX_LANG
@@ -1648,215 +1645,6 @@ func Default() *Config {
 	}
 }
 
-func backfillMimoDomesticPrices(e *ProviderEntry) {
-	if e == nil {
-		return
-	}
-	defaults := mimoDomesticPrices(e.ModelList())
-	if len(defaults) == 0 {
-		return
-	}
-	if e.Prices == nil {
-		e.Prices = map[string]*provider.Pricing{}
-	}
-	for model, price := range defaults {
-		if e.Prices[model] == nil {
-			e.Prices[model] = clonePricing(price)
-		}
-	}
-}
-
-func resetMimoOfficialPricing(p *ProviderEntry) {
-	if p == nil {
-		return
-	}
-	defaults := mimoDomesticPrices(p.ModelList())
-	if len(defaults) == 0 {
-		return
-	}
-	p.Price = nil
-	if strings.TrimSpace(p.Model) != "" && len(p.Models) == 0 {
-		if price := defaults[strings.TrimSpace(p.Model)]; price != nil {
-			p.Price = clonePricing(price)
-			p.Prices = nil
-			return
-		}
-	}
-	p.Prices = map[string]*provider.Pricing{}
-	for model, price := range defaults {
-		p.Prices[model] = clonePricing(price)
-	}
-}
-
-func ensureMimoAPIProvider(c *Config) {
-	models := []string{"mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-omni"}
-	visionModels := []string{"mimo-v2.5", "mimo-v2-omni"}
-	if p, ok := c.Provider("mimo-api"); ok {
-		if isOfficialMimoAPIProvider(p) {
-			mergeCuratedModelsIntoProvider(p, models, "mimo-v2.5-pro")
-			mergeVisionModelsIntoProvider(p, visionModels)
-			backfillMimoDomesticPrices(p)
-		}
-		return
-	}
-	c.Providers = append(c.Providers, ProviderEntry{
-		Name:          "mimo-api",
-		Kind:          "openai",
-		BaseURL:       "https://api.xiaomimimo.com/v1",
-		Models:        models,
-		VisionModels:  visionModels,
-		Default:       "mimo-v2.5-pro",
-		APIKeyEnv:     "MIMO_API_KEY",
-		ContextWindow: 1_048_576,
-		Prices:        mimoDomesticPrices(models),
-		NoProxy:       true,
-	})
-}
-
-func ensureMimoTokenPlanProvider(c *Config, includeMimoFlash bool) {
-	models := []string{"mimo-v2.5-pro", "mimo-v2.5"}
-	visionModels := []string{"mimo-v2.5"}
-	if p, ok := c.Provider("mimo-token-plan"); ok {
-		if isOfficialMimoTokenPlanProvider(p) {
-			mergeCuratedModelsIntoProvider(p, models, "mimo-v2.5-pro")
-			mergeVisionModelsIntoProvider(p, visionModels)
-			clearMixedMimoTokenPlanPrice(p)
-			backfillMimoDomesticPrices(p)
-		}
-		return
-	}
-	entry := ProviderEntry{
-		Name:          "mimo-token-plan",
-		Kind:          "openai",
-		BaseURL:       "https://token-plan-cn.xiaomimimo.com/v1",
-		Models:        models,
-		VisionModels:  visionModels,
-		Default:       "mimo-v2.5-pro",
-		APIKeyEnv:     "MIMO_API_KEY",
-		ContextWindow: 1_048_576,
-		Prices:        mimoDomesticPrices(models),
-		NoProxy:       true,
-	}
-	if old, ok := c.Provider("mimo-pro"); ok {
-		entry = officialProviderFromLegacy(entry, old)
-		entry.Models = mergeModelLists(models, old.ModelList())
-		entry.Default = firstKnownModel(entry.Default, entry.Models, "mimo-v2.5-pro")
-	}
-	if old, ok := c.Provider("mimo-flash"); includeMimoFlash && ok {
-		if !providerHasAnyModel(entry) {
-			entry = officialProviderFromLegacy(entry, old)
-		}
-		entry.Models = mergeModelLists(entry.Models, old.ModelList())
-		entry.Default = firstKnownModel(entry.Default, entry.Models, entry.Default)
-	}
-	clearMixedMimoTokenPlanPrice(&entry)
-	backfillMimoDomesticPrices(&entry)
-	c.Providers = append(c.Providers, entry)
-}
-
-func isOfficialMimoAPIProvider(e *ProviderEntry) bool {
-	return isOpenAIProviderKind(e) && officialMimoHost(e.BaseURL) == "api.xiaomimimo.com"
-}
-
-func isOfficialMimoTokenPlanProvider(e *ProviderEntry) bool {
-	return isOpenAIProviderKind(e) && officialMimoHost(e.BaseURL) == "token-plan-cn.xiaomimimo.com"
-}
-
-func mergeVisionModelsIntoProvider(e *ProviderEntry, models []string) {
-	if e == nil {
-		return
-	}
-	enabled := map[string]bool{}
-	for _, model := range e.ChatModelList() {
-		enabled[model] = true
-	}
-	merged := e.VisionModels
-	if merged == nil {
-		merged = models
-	}
-	out := make([]string, 0, len(merged))
-	for _, model := range merged {
-		if enabled[model] && IsLikelyChatModel(model) {
-			out = append(out, model)
-		}
-	}
-	e.VisionModels = out
-}
-
-func clearMixedMimoTokenPlanPrice(e *ProviderEntry) {
-	if e != nil && e.HasModel("mimo-v2.5-pro") && e.HasModel("mimo-v2.5") {
-		e.Price = nil
-	}
-}
-
-// IsProjectInitialized reports whether root has a .reasonix convention directory,
-// signalling that the project has been set up for local session storage.
-func IsProjectInitialized(root string) bool {
-	if root == "" {
-		return false
-	}
-	info, err := os.Stat(filepath.Join(root, ".reasonix"))
-	return err == nil && info.IsDir()
-}
-
-// InitProject creates the project-local .reasonix directory and its sessions
-// subdirectory, plus attachments, autoresearch, skills, commands, and
-// output-styles so eager consumers and convention-dir scanners find them
-// ready. It returns the project-local sessions path on success. Safe to
-// call on an already-initialized project.
-func InitProject(root string) (string, error) {
-	if root == "" {
-		return "", fmt.Errorf("project root is empty")
-	}
-	base := filepath.Join(root, ".reasonix")
-	for _, sub := range []string{
-		"sessions",
-		"attachments",
-		"autoresearch",
-		"skills",
-		"commands",
-		"output-styles",
-	} {
-		if err := os.MkdirAll(filepath.Join(base, sub), 0o755); err != nil {
-			return "", fmt.Errorf("creating .reasonix/%s: %w", sub, err)
-		}
-	}
-	return filepath.Join(base, "sessions"), nil
-}
-
-// ResolveSessionDir returns the project-local sessions path when root is
-// not empty and not the user's home directory. Callers should ensure
-// .reasonix/sessions/ exists before using the returned path. Falls back to
-// SessionDir when root is empty or is the home dir.
-func ResolveSessionDir(root string) string {
-	if root == "" {
-		return SessionDir()
-	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		p, perr := filepath.Abs(root)
-		if perr == nil && p == home {
-			return SessionDir()
-		}
-	}
-	return filepath.Join(root, ".reasonix", "sessions")
-}
-
-// UserCredentialsPath is the reasonix-owned global secrets file under Reasonix
-// home. It holds KEY=value lines loaded into the environment by loadDotEnv. The
-// setup wizard writes API keys here, deliberately NOT named .env: keys never
-// land in a project's own .env (which can't be selectively gitignored), never
-// get committed, and resolve from any working directory. "" when Reasonix home
-// can't be resolved.
-
-// ConventionDirs are the parent directories scanned for agent assets (skills,
-// commands), in canonical-first order. .reasonix is ours; .agents / .agent /
-// .claude let users drop in assets authored for other agent tools without moving
-// files. Shared so skills (internal/skill) and commands (CommandDirs) discover
-// the same set. Note: hooks are NOT scanned across these — a .claude/settings.json
-// uses a different hook schema that can't be parsed as ours, so hooks stay in
-// .reasonix/settings.json (see internal/hook).
-
 // WriteFile writes the configuration to path as annotated TOML. The write is
 // atomic + fsynced so an interrupted write or power loss can never truncate the
 // main config into an unparseable state that leaves the app with no usable
@@ -1967,15 +1755,11 @@ func (e *ProviderEntry) APIKey() string {
 	if e.APIKeyEnv == "" {
 		return ""
 	}
-	if value, _, ok := storedCredentialValue(e.APIKeyEnv); ok {
-		return value
+	value, _, ok := storedCredentialValue(e.APIKeyEnv)
+	if !ok {
+		return ""
 	}
-	// Fallback to the process environment variable — the user may have exported
-	// it without writing it to the Reasonix credentials .env file.
-	if v := os.Getenv(e.APIKeyEnv); v != "" {
-		return v
-	}
-	return ""
+	return value
 }
 
 // ResolveAPIKeyFromProcessEnvForProbe pins a setup-time, user-entered key onto

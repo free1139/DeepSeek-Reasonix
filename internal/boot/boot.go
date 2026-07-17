@@ -233,7 +233,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	sink := event.Sync(opts.Sink)
 
 	if migErr != nil {
-		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "config migration from ~/.config/reasonix failed: " + migErr.Error()})
+		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "Config migration did not complete.", Detail: "config migration from ~/.reasonix failed: " + migErr.Error()})
 	} else if migrated != nil {
 		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: migrated.Notice()})
 	}
@@ -293,7 +293,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	jm := jobs.NewManager(sink, jobOptions...)
 	sessionDir := opts.SessionDir
 	if sessionDir == "" {
-		sessionDir = config.ResolveSessionDir(root)
+		sessionDir = config.SessionDir()
 	}
 	reconcileCleanupPending := opts.CleanupPendingReconciler
 	if reconcileCleanupPending == nil {
@@ -1445,10 +1445,6 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			}, executor, cfg.Agent.Temperature, sink, control.NewPlannerGate(classifier))
 			label = entry.Model + " + planner " + pe.Model
 		}
-	}
-
-	if opts.SessionDir == "" {
-		sessionDir = config.ResolveSessionDir(root) // add init project and move global session to project sessoin
 	}
 
 	ctrlOpts := control.Options{

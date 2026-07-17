@@ -54,10 +54,9 @@ func TestSlashCompletionFilterAndAccept(t *testing.T) {
 		t.Fatalf("filter = %v, want [/compact /copy]", labels(m.completion.items))
 	}
 
-	// Accept the item.
 	m.acceptCompletion()
 	if got := m.input.Value(); got != "/compact " {
-		t.Errorf("accept first should fill /compact, got %q", got)
+		t.Errorf("accept should fill the input, got %q", got)
 	}
 	if m.completion.active {
 		t.Error("menu should close after accept")

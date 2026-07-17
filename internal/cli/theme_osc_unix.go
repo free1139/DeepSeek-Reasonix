@@ -20,6 +20,7 @@ func queryTerminalBackground() (terminalRGB, bool) {
 	if !colorEnabled {
 		return terminalRGB{}, false
 	}
+	// fixed bug on mac air shell when ssh on linux.
 	return terminalRGB{int(0x9e), int(0x9e), int(0x9e)}, true
 
 	inFd := int(os.Stdin.Fd())

@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"reasonix/internal/evidence"
-	"reasonix/internal/provider"
 )
 
 func TestTodoWriteAcceptsLevels(t *testing.T) {

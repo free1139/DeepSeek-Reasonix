@@ -421,7 +421,7 @@ api_key_env = "`+key+`"
 	}
 }
 
-func TestLoadForRootFallsBackToProcessEnv(t *testing.T) {
+func TestLoadForRootIgnoresProjectProviderEnvAndInheritedEnv(t *testing.T) {
 	project := t.TempDir()
 	cfgHome := t.TempDir()
 	key := "KEY_PROVIDER_PROJECT_PRIORITY"
@@ -456,8 +456,11 @@ api_key_env = "`+key+`"
 	if !ok {
 		t.Fatalf("provider missing: %+v", cfg.Providers)
 	}
-	if got := provider.APIKey(); got != "from_env" {
-		t.Fatalf("provider API key = %q, want fallback to process env", got)
+	if got := provider.APIKey(); got != "" {
+		t.Fatalf("provider API key = %q, want no key without global credentials", got)
+	}
+	if got := os.Getenv(key); got != "from_env" {
+		t.Fatalf("process env = %q, want inherited env left untouched", got)
 	}
 }
 

@@ -131,18 +131,11 @@ func (m chatTUI) handleChooserKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			c.cursor++
 		}
 	case " ", "space":
-		// Space toggles the current option only in multi-select mode
 		if c.cursor < len(q.Options) && q.Multi {
 			c.sel[c.tab][c.cursor] = !c.sel[c.tab][c.cursor]
 			c.custom[c.tab] = ""
 		}
-		return m, nil
 	case "enter":
-		if c.cursor < len(q.Options) && q.Multi {
-			// Multi-select: Enter advances/submits (Space toggles individual options)
-			return m.chooserAdvance()
-		}
-		// Single-select or non-option cursor: delegate to chooserActivate
 		return m.chooserActivate(c.cursor)
 	default:
 		// number keys 1..9 jump to / pick an option

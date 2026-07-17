@@ -101,12 +101,6 @@ func MigrateLegacyIfNeededForRoot(root string) (*MigrationResult, error) {
 		return nil, credErr
 	}
 	if _, err := os.Stat(dest); err == nil {
-		if res, err := backfillLegacyProviders(dest); res != nil || err != nil {
-			if err == nil {
-				err = credErr
-			}
-			return res, err
-		}
 		return nil, credErr
 	}
 	home, err := os.UserHomeDir()
@@ -438,83 +432,6 @@ func mergeUniqueTrimmed(base []string, values ...string) []string {
 		}
 		seen[value] = true
 		out = append(out, value)
-	}
-	return out
-}
-
-// backfillLegacyProviders merges providers from legacy TOML configs into dest
-// when dest exists but only contains the default provider set (deepseek-flash +
-// deepseek-pro). This handles the case where an older version or setup wizard
-// created the canonical config file before the user added custom providers to a
-// legacy path.
-func backfillLegacyProviders(dest string) (*MigrationResult, error) {
-	def := Default()
-	destCfg := Default()
-	if err := mergeFile(destCfg, dest); err != nil {
-		return nil, err
-	}
-	if hasNonDefaultProviders(destCfg.Providers, def.Providers) {
-		return nil, nil
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, nil
-	}
-	for _, src := range legacyTOMLPaths(dest, home) {
-		if src == "" || filepath.Clean(src) == filepath.Clean(dest) {
-			continue
-		}
-		if _, err := os.Stat(src); err != nil {
-			continue
-		}
-		legacyCfg := Default()
-		if err := mergeFile(legacyCfg, src); err != nil {
-			continue
-		}
-		added := providersNotInList(legacyCfg.Providers, destCfg.Providers)
-		if len(added) == 0 {
-			continue
-		}
-		destCfg.Providers = append(destCfg.Providers, added...)
-		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			return nil, fmt.Errorf("create config dir: %w", err)
-		}
-		if err := destCfg.WriteFile(dest); err != nil {
-			return nil, fmt.Errorf("write %s: %w", dest, err)
-		}
-		return &MigrationResult{From: src, To: dest, Plugins: len(destCfg.Plugins)}, nil
-	}
-	return nil, nil
-}
-
-// hasNonDefaultProviders reports whether providers contains any entry whose name
-// is not present in the default provider set.
-func hasNonDefaultProviders(providers, defaults []ProviderEntry) bool {
-	defNames := make(map[string]bool, len(defaults))
-	for _, p := range defaults {
-		defNames[p.Name] = true
-	}
-	for _, p := range providers {
-		if !defNames[p.Name] {
-			return true
-		}
-	}
-	return false
-}
-
-// providersNotInList returns providers from src whose names are not present in
-// existing.
-func providersNotInList(src, existing []ProviderEntry) []ProviderEntry {
-	names := make(map[string]bool, len(existing))
-	for _, p := range existing {
-		names[p.Name] = true
-	}
-	var out []ProviderEntry
-	for _, p := range src {
-		if !names[p.Name] {
-			out = append(out, p)
-		}
 	}
 	return out
 }

@@ -232,9 +232,6 @@ type client struct {
 	effort       string        // reasoning_effort for OpenAI; thinking.type for MiniMax; "" = auto/provider default
 	idleTimeout  time.Duration // SSE stall watchdog window; defaultStreamIdleTimeout unless a test overrides
 	authed       atomic.Bool   // a request has succeeded — gate transient-401 retry
-
-	// c1abf4d9 (auto-disable reasoning_effort/thinking for models that reject them on 400)
-	thinkingDisabled atomic.Bool
 }
 
 func (c *client) Name() string { return c.name }
@@ -369,17 +366,16 @@ var bufPool = sync.Pool{
 }
 
 func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provider.Chunk, error) {
-	marshalBody := func() []byte {
-		buf := bufPool.Get().(*bytes.Buffer)
-		buf.Reset()
-		_ = json.NewEncoder(buf).Encode(c.buildRequest(req))
-		body := make([]byte, buf.Len())
-		copy(body, buf.Bytes())
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if err := json.NewEncoder(buf).Encode(c.buildRequest(req)); err != nil {
 		bufPool.Put(buf)
-		return body
+		return nil, fmt.Errorf("%s: marshal request: %w", c.name, err)
 	}
+	body := make([]byte, buf.Len())
+	copy(body, buf.Bytes())
+	bufPool.Put(buf)
 
-	body := marshalBody()
 	newReq := func(ctx context.Context) (*http.Request, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatURL, bytes.NewReader(body))
 		if err != nil {
@@ -400,30 +396,6 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 	out := make(chan provider.Chunk)
 	go c.streamWithReconnect(ctx, resp, newReq, out)
 	return out, nil
-}
-
-// isThinkingRelatedError reports whether a 400 error suggests the model doesn't
-// support the reasoning_effort / thinking parameters. When true, the client
-// disables them and retries once, so models that don't support thinking work
-// without manual config changes.
-func (c *client) isThinkingRelatedError(apiErr *provider.APIError) bool {
-	body := strings.ToLower(apiErr.Body)
-	// Only relevant when we're actually sending thinking-related parameters.
-	hasEffort := c.effort != ""
-	hasThinking := c.deepseek
-	if !hasEffort && !hasThinking {
-		return false
-	}
-	// Match known patterns from Ollama, LiteLLM, and other OpenAI-compatible
-	// gateways that reject thinking parameters.
-	return strings.Contains(body, "reasoning_effort") ||
-		strings.Contains(body, "not supported") ||
-		(strings.Contains(body, "thinking") &&
-			(strings.Contains(body, "invalid") ||
-				strings.Contains(body, "unsupported") ||
-				strings.Contains(body, "unknown") ||
-				strings.Contains(body, "not support") ||
-				strings.Contains(body, "not allow")))
 }
 
 // maxStreamReconnects bounds how many times a mid-stream connection drop is
@@ -527,11 +499,7 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		for _, tc := range m.ToolCalls {
 			wire := chatToolCall{ID: tc.ID, Type: "function"}
 			wire.Function.Name = tc.Name
-			if !json.Valid([]byte(tc.Arguments)) {
-				wire.Function.Arguments = "{}"
-			} else {
-				wire.Function.Arguments = tc.Arguments
-			}
+			wire.Function.Arguments = tc.Arguments
 			cm.ToolCalls = append(cm.ToolCalls, wire)
 		}
 		switch {
@@ -573,7 +541,6 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		ReasoningEffort: c.effort,
 		ExtraBody:       c.extraBody,
 	}
-
 	switch {
 	case c.deepseek:
 		// DeepSeek's CoT is controlled by `thinking` plus `reasoning_effort` for
@@ -626,7 +593,6 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		// is left untouched for backends that also honour it.
 		out.Thinking = &thinkingMode{Type: c.thinkingType}
 	}
-
 	return out
 }
 

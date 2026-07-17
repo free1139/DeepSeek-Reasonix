@@ -293,8 +293,8 @@ func (c *client) buildRequest(req provider.Request) anthRequest {
 			}
 			for _, tc := range m.ToolCalls {
 				input := json.RawMessage(tc.Arguments)
-				if !json.Valid(input) || len(input) == 0 {
-					input = json.RawMessage("{}") // input is required, even when empty or invalid
+				if len(input) == 0 {
+					input = json.RawMessage("{}") // input is required, even when empty
 				}
 				blocks = append(blocks, contentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})
 			}

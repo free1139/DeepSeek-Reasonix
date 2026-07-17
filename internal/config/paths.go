@@ -57,7 +57,7 @@ func reasonixHomeDir() string {
 		return ""
 	}
 	if home, err := osUserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".config", "reasonix")
+		return filepath.Join(home, ".reasonix")
 	}
 	if dir := osUserConfigDir(); dir != "" {
 		return filepath.Join(dir, "reasonix")
@@ -137,7 +137,7 @@ func legacyXDGConfigPaths() []string {
 		add(filepath.Join(dir, "reasonix", "config.toml"))
 	}
 	if home, err := osUserHomeDir(); err == nil && home != "" {
-		add(filepath.Join(home, ".reasonix", "config.toml"))
+		add(filepath.Join(home, ".config", "reasonix", "config.toml"))
 	}
 	return paths
 }
@@ -226,7 +226,7 @@ func IsolatedHomeDir() string {
 
 // userConfigDisplayPath is userConfigPath collapsed to a ~-relative form for
 // comments rendered into the user's own config.toml, so Windows users see the
-// real location instead of a hardcoded ~/.config/reasonix path.
+// real location instead of a hardcoded ~/.reasonix path.
 func userConfigDisplayPath() string {
 	p := userConfigPath()
 	if p == "" {
@@ -241,7 +241,7 @@ func userConfigDisplayPath() string {
 }
 
 // UserConfigPath is the user-global config.toml. It lives under Reasonix home:
-// REASONIX_HOME/config.toml, then ~/.config/reasonix/config.toml on Unix-like systems,
+// REASONIX_HOME/config.toml, then ~/.reasonix/config.toml on Unix-like systems,
 // or %AppData%/reasonix/config.toml on Windows. If %AppData% is unavailable on
 // Windows, it falls back to %USERPROFILE%/AppData/Roaming/reasonix/config.toml.
 // "" when the user config dir can't be resolved.
@@ -307,7 +307,7 @@ func appendUniquePath(paths []string, path string) []string {
 }
 
 // ReasonixHomeDir is the current Reasonix home directory. It honors
-// REASONIX_HOME, then uses ~/.config/reasonix on macOS/Linux or %APPDATA%/reasonix on
+// REASONIX_HOME, then uses ~/.reasonix on macOS/Linux or %APPDATA%/reasonix on
 // Windows, with a %USERPROFILE%/AppData/Roaming fallback when %APPDATA% is
 // unavailable.
 func ReasonixHomeDir() string { return reasonixHomeDir() }

@@ -61,9 +61,6 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 	prior := strings.Fields(line[:from]) // committed tokens, including the command word
 	var raw []SlashItem
 	switch line[:cmdEnd] {
-	case "/audit":
-		raw = auditArgItems(prior)
-
 	case "/mcp":
 		raw = mcpArgItems(prior, cur, d)
 	case "/model":
@@ -94,17 +91,6 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		return nil, from
 	}
 	return filterSlash(raw, line, from, cur), from
-}
-
-func auditArgItems(prior []string) []SlashItem {
-	if len(prior) > 1 {
-		return nil
-	}
-	return []SlashItem{
-		{Label: "auto", Insert: "auto", Hint: "normal mode — ask before tool calls"},
-		{Label: "plan", Insert: "plan", Hint: "read-only plan mode"},
-		{Label: "yolo", Insert: "yolo", Hint: "auto-approve all tool calls"},
-	}
 }
 
 func goalArgItems(prior []string) []SlashItem {

@@ -357,13 +357,6 @@ type Agent struct {
 	// Set via SetPreEditHook.
 	onPreEdit func(diff.Change)
 
-	// onPostEdit, when non-nil, is called after a successful writer tool call.
-	// It receives the previewed change (carrying the Path) and the tool's result
-	// string, and returns the result string to feed back to the model — the seam
-	// that attaches LSP diagnostics to Go file writes so the model sees
-	// compiler/linter feedback inline with the edit result. Set via SetPostEditHook.
-	onPostEdit func(diff.Change, string) string
-
 	// jobs, when non-nil, is the session's background-job manager. executeOne
 	// stamps it onto each tool call's context so the background tools (bash
 	// run_in_background, task run_in_background, bash_output/kill_shell/wait) can
@@ -812,10 +805,6 @@ func (a *Agent) SetMemoryQueue(q memory.Queue) { a.memQueue = q }
 // SetPreEditHook installs the pre-edit snapshot hook (see onPreEdit). The
 // controller wires it to its per-session checkpoint store; nil disables capture.
 func (a *Agent) SetPreEditHook(fn func(diff.Change)) { a.onPreEdit = fn }
-
-// SetPostEditHook installs the post-edit diagnostics hook (see onPostEdit).
-// The controller wires it to run LSP diagnostics on .go files after writes.
-func (a *Agent) SetPostEditHook(fn func(diff.Change, string) string) { a.onPostEdit = fn }
 
 // Session returns the agent's current conversation, useful for persistence
 // hooks that need to read the message log between turns. sessMu serialises this
@@ -3495,15 +3484,6 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	// it doesn't fire here.) SubagentStop lets a hook react to delegated work.
 	if a.hooks != nil && call.Name == "task" && !isBackgroundTaskCall(call.Arguments) {
 		a.hooks.SubagentStop(ctx, result)
-	}
-	// After a successful write, attach LSP diagnostics so the model sees
-	// compiler/linter feedback (e.g. gopls on .go files) inline.
-	if a.onPostEdit != nil && !t.ReadOnly() {
-		if pv, ok := t.(tool.Previewer); ok {
-			if change, perr := pv.Preview(json.RawMessage(call.Arguments)); perr == nil {
-				result = a.onPostEdit(change, result)
-			}
-		}
 	}
 	body, truncMsg := truncateToolOutput(result)
 	return toolOutcome{output: body, images: images, truncated: truncMsg != "", truncMsg: truncMsg}
