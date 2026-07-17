@@ -50,7 +50,7 @@ var English = Messages{
 	ChatStatusCancellingFmt:                "%s stopping… (%ds · Ctrl+C exits)",
 	ChatStatusIdle:                         "ready",
 	ChatStatusYoloIdle:                     "tool approvals skipped",
-	ChatStatusCycleHint:                    "shift+tab ask/auto/plan · ctrl+y yolo",
+	ChatStatusCycleHint:                    "shift+tab ask/auto/plan · ctrl+y yolo · ctrl+m mouse",
 	ChatStatusCacheNowFmt:                  "turn hit %s",
 	ChatStatusCacheAvgFmt:                  "avg %s",
 	ChatStatusPlanApproval:                 "Enter/y approves & executes · n/Esc keeps planning · PgUp/PgDn/Ctrl+Home/End scrolls",

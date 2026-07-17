@@ -1360,6 +1360,26 @@ func TestViewMouseModeFollowsCapture(t *testing.T) {
 	}
 }
 
+// TestCtrlMTogglesMouse proves Ctrl+M flips mouseCaptureOff (like /mouse).
+func TestCtrlMTogglesMouse(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+	m.cfg = config.Default()
+
+	ctrlM := tea.KeyPressMsg{Code: 'm', Mod: tea.ModCtrl}
+	out, _ := m.Update(ctrlM)
+	m = out.(chatTUI)
+	if !m.mouseCaptureOff {
+		t.Fatal("Ctrl+M first press should turn mouse capture off")
+	}
+
+	out, _ = m.Update(ctrlM)
+	m = out.(chatTUI)
+	if m.mouseCaptureOff {
+		t.Fatal("Ctrl+M second press should turn mouse capture back on")
+	}
+}
+
 func TestEchoLocalCommandAddsTranscriptMarker(t *testing.T) {
 	m := newTestChatTUI()
 	m.echoLocalCommand("  /tree  ")

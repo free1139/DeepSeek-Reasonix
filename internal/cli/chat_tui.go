@@ -1328,6 +1328,9 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+y", "super+y", "meta+y":
 			m.toggleYoloMode()
 			return m, nil
+		case "ctrl+m":
+			m.toggleMouseCapture()
+			return m, nil
 		case "ctrl+o":
 			m.toggleVerboseReasoning(m.state != tuiRunning)
 			return m, finalize(m, cmds)
