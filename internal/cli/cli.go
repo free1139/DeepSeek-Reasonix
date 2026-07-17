@@ -300,7 +300,10 @@ func resolveCLISessionDir() string {
 	if err != nil {
 		return config.SessionDir()
 	}
-	return config.ResolveSessionDir(cwd)
+	if projDir := config.ProjectSessionDir(cwd); projDir != "" && projDir != config.SessionDir() {
+		return projDir
+	}
+	return config.SessionDir()
 }
 
 // setupQuietProfile is like setupProfile but suppresses plugin subprocess
@@ -889,7 +892,7 @@ func chatREPL(args []string) int {
 		}
 		resumePath = path
 	case *cont:
-		sessions, err := agent.ListSessions(config.ResolveSessionDir(root))
+		sessions, err := agent.ListSessions(resolveCLISessionDir())
 		if err != nil || len(sessions) == 0 {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 			return 1
