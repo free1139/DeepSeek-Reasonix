@@ -21,12 +21,10 @@ import (
 	"reasonix/internal/instruction"
 	"reasonix/internal/jobs"
 	"reasonix/internal/memory"
-	"reasonix/internal/memorycompiler"
 	"reasonix/internal/nilutil"
 	"reasonix/internal/planmode"
 	"reasonix/internal/provider"
 	"reasonix/internal/sandbox"
-	"reasonix/internal/secrets"
 	"reasonix/internal/shellparse"
 	"reasonix/internal/tool"
 	"reasonix/internal/workspacelease"
@@ -51,8 +49,6 @@ const maxFinalReadinessBlocksWithProgress = 6
 const maxEmptyFinalBlocks = 3
 const maxStreamRecoveries = 3
 const maxExecutorHandoffNudges = 1
-const memoryCompilerInjectionMax = 5
-const memoryCompilerInjectionCooldown = 30 * time.Second
 
 // DeliveryRuntimeMarker is the delivery-mode contract block appended to user
 // turns (withTurnPreferences). Exported as the single source of truth for the
@@ -196,14 +192,16 @@ type Gate interface {
 
 // FreshApprovalGate is an optional Gate extension for calls that must be
 // answered by a current human decision even when Auto/YOLO or an allow rule
-// would normally bypass approval. Installed MCP destructiveHint uses it.
+// would normally bypass approval. MCP destructiveHint uses it as a conservative
+// fallback when the gate does not implement MCP-local approval policy.
 type FreshApprovalGate interface {
 	CheckFresh(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly bool) (allow bool, reason string, err error)
 }
 
 // MCPApprovalGate applies local per-server/per-tool MCP policy without changing
 // provider-visible tool metadata. Destructive calls are identified separately
-// so the gate can route every invocation through the configured reviewer.
+// so the gate can apply the effective approval mode before deciding whether a
+// fresh review is required.
 type MCPApprovalGate interface {
 	CheckMCP(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly, destructive bool, mode, reviewer string) (allow bool, reason string, err error)
 }
@@ -226,11 +224,6 @@ type PlanModeReadOnlyTrustRequest struct {
 type PlanModeReadOnlyTrustGate interface {
 	CheckPlanModeReadOnlyTrust(ctx context.Context, req PlanModeReadOnlyTrustRequest) (allow bool, reason string, err error)
 }
-
-const (
-	MemoryCompilerVerbosityObserve = "observe"
-	MemoryCompilerVerbosityCompact = "compact"
-)
 
 const DefaultMaxSubagentDepth = 2
 
@@ -363,6 +356,15 @@ type Agent struct {
 	// reach it. nil leaves those tools to degrade gracefully.
 	jobs *jobs.Manager
 
+	// writeScheduler coordinates parent-agent writes against background
+	// subagent write claims. Set on the parent executor only (subagentDepth 0);
+	// reservation is taken around Execute so late-loaded MCP/Economy tools are
+	// covered without registry wrapping. Provider-visible schemas are unchanged.
+	writeScheduler *SubagentScheduler
+	// writeWorkspaceRoot is the workspace used to normalize parent write
+	// reservations when writeScheduler is set.
+	writeWorkspaceRoot string
+
 	// workspaceLease is shared by every writer-capable agent in one Delivery
 	// session. It is acquired lazily on the first mutation and held through the
 	// final participating run/background job so verification remains isolated.
@@ -450,34 +452,6 @@ type Agent struct {
 	// session without touching the cache-stable prefix. Set via SetMemoryQueue.
 	memQueue memory.Queue
 
-	// memoryCompiler, when non-nil, records execution traces and may compile the
-	// user turn into a compact execution contract. It never mutates the stable
-	// system prompt or tool schema.
-	memoryCompilerMu sync.RWMutex
-	memoryCompiler   *memorycompiler.Runtime
-	// observe is the default: Memory v5 writes traces without adding a
-	// provider-visible execution contract. compact preserves the old injection.
-	memoryCompilerVerbosity string
-	compilerTurn            *memorycompiler.Turn
-	// lastCompilerOutcome is the previous finished turn's persisted outcome.
-	// The immediately following user message may retroactively downgrade it
-	// when it reports the result wrong. Every non-synthetic turn start
-	// consumes it (one-shot) — even while the runtime is nil — so a ref can
-	// never survive intervening turns and be replayed after Memory v5 is
-	// re-enabled. Session switches clear it. Guarded by memoryCompilerMu.
-	lastCompilerOutcome *memorycompiler.OutcomeRef
-
-	// compilerInjectionMu bounds how often Memory v5 may replace a visible user
-	// turn with an execution contract. The runtime can still observe throttled
-	// turns for trace writeback, but prompt injection and UI citations stay
-	// limited so the compiler does not dominate every conversation turn.
-	compilerInjectionMu    sync.Mutex
-	lastCompilerInjectedAt time.Time
-	compilerInjectionCount int
-
-	// classifier 用于判断用户输入是任务还是聊天，决定是否启动 Memory v5
-	classifier TaskClassifier
-
 	// subagentDepth tracks the current agent's nesting depth. maxSubagentDepth
 	// caps delegation; when reached, recursive agent/skill tools are excluded.
 	subagentDepth    int
@@ -501,6 +475,11 @@ type Agent struct {
 	keepPolicy          KeepPolicy
 	compactStuck        bool
 	consecutiveCompacts int
+	// activeTurnCreatedAt identifies the real/synthetic user message that began
+	// the currently running turn. Compaction may rewrite older history while a
+	// tool loop is active, but it must keep this message and everything after it
+	// verbatim so cancellation/crash recovery can retain completed tool pairs.
+	activeTurnCreatedAt atomic.Int64
 
 	// stormSig / stormCount track a run of turns that keep failing or getting
 	// blocked the same way so the loop can break a death-spiral. The signature is
@@ -585,150 +564,6 @@ func (a *Agent) SetResponseLanguage(lang string) {
 		return
 	}
 	a.responseLanguage.Store(NormalizeResponseLanguage(lang))
-}
-
-// SetMemoryCompiler updates the Memory v5 runtime used for subsequent turns.
-// It is safe for desktop settings to call while other tabs are idle or running;
-// an already-started turn keeps its own Turn handle and future turns observe the
-// new runtime.
-func (a *Agent) SetMemoryCompiler(rt *memorycompiler.Runtime) {
-	if a == nil {
-		return
-	}
-	a.memoryCompilerMu.Lock()
-	a.memoryCompiler = rt
-	a.memoryCompilerMu.Unlock()
-	a.resetMemoryCompilerInjectionGate()
-}
-
-func (a *Agent) SetMemoryCompilerVerbosity(verbosity string) {
-	if a == nil {
-		return
-	}
-	a.memoryCompilerMu.Lock()
-	a.memoryCompilerVerbosity = normalizeMemoryCompilerVerbosity(verbosity)
-	a.memoryCompilerMu.Unlock()
-	a.resetMemoryCompilerInjectionGate()
-}
-
-func (a *Agent) memoryCompilerRuntime() *memorycompiler.Runtime {
-	if a == nil {
-		return nil
-	}
-	a.memoryCompilerMu.RLock()
-	defer a.memoryCompilerMu.RUnlock()
-	return a.memoryCompiler
-}
-
-func (a *Agent) memoryCompilerShouldInject() bool {
-	if a == nil {
-		return false
-	}
-	a.memoryCompilerMu.RLock()
-	defer a.memoryCompilerMu.RUnlock()
-	return normalizeMemoryCompilerVerbosity(a.memoryCompilerVerbosity) == MemoryCompilerVerbosityCompact
-}
-
-func normalizeMemoryCompilerVerbosity(v string) string {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "compact", "inject", "injected", "contract", "on":
-		return MemoryCompilerVerbosityCompact
-	default:
-		return MemoryCompilerVerbosityObserve
-	}
-}
-
-// clearClassifierCache 清除 LLM 分类器的缓存（在会话边界调用）
-func (a *Agent) clearClassifierCache() {
-	if a == nil || a.classifier == nil {
-		return
-	}
-	if llm, ok := a.classifier.(*llmClassifier); ok && llm.cache != nil {
-		llm.cache.Clear()
-	}
-}
-
-// reviseMemoryCompilerOutcomeForFeedback retroactively downgrades the previous
-// turn's recorded success when the user's immediate follow-up reports the
-// result wrong. The ref is consumed unconditionally so it can never outlive
-// the turn that follows it; the revision itself additionally requires a live
-// runtime and corrective feedback.
-func (a *Agent) reviseMemoryCompilerOutcomeForFeedback(rt *memorycompiler.Runtime, input string) {
-	a.memoryCompilerMu.Lock()
-	ref := a.lastCompilerOutcome
-	a.lastCompilerOutcome = nil
-	a.memoryCompilerMu.Unlock()
-	if ref == nil || rt == nil {
-		return
-	}
-	if !memorycompiler.IsCorrectiveFeedback(input) {
-		return
-	}
-	rt.ReviseOutcomeFromFeedback(*ref, input)
-}
-
-func shouldStartMemoryCompiler(input string) bool {
-	trimmed := strings.TrimSpace(input)
-	if trimmed == "" {
-		return false
-	}
-	// Contract-like leading XML is host-generated control text, not a genuine
-	// user task. Let it pass through normally instead of compiling it again and
-	// risking nested Memory v5 blocks in previews or future source_event fields.
-	return !strings.HasPrefix(trimmed, "<")
-}
-
-func shouldInjectMemoryCompilerContractForInput(input string) bool {
-	trimmed := strings.TrimSpace(input)
-	if trimmed == "" {
-		return false
-	}
-	normalized := strings.ToLower(strings.Trim(trimmed, " \t\r\n.!?。！？,，;；:："))
-	switch normalized {
-	case "", "hello", "hi", "hey", "你好", "您好", "nihao", "thanks", "thank you", "谢谢", "ok", "okay", "好的", "嗯":
-		return false
-	}
-	actionNeedles := []string{
-		"fix", "debug", "repair", "resolve", "reproduce",
-		"create", "add", "write", "edit", "update", "change", "delete", "remove", "rename",
-		"review", "inspect", "analyze", "check", "test", "run", "build", "implement", "refactor",
-		"continue work", "continue the", "continue this",
-		"修复", "调试", "解决", "复现", "创建", "新建", "添加", "编写", "编辑", "修改", "更新",
-		"删除", "移除", "重命名", "评审", "检查", "分析", "测试", "运行", "构建", "实现", "重构", "继续处理",
-	}
-	for _, needle := range actionNeedles {
-		if strings.Contains(normalized, needle) {
-			return true
-		}
-	}
-	return false
-}
-
-func (a *Agent) tryMarkMemoryCompilerInjected(now time.Time) bool {
-	if a == nil {
-		return false
-	}
-	a.compilerInjectionMu.Lock()
-	defer a.compilerInjectionMu.Unlock()
-	if a.compilerInjectionCount >= memoryCompilerInjectionMax {
-		return false
-	}
-	if !a.lastCompilerInjectedAt.IsZero() && now.Sub(a.lastCompilerInjectedAt) < memoryCompilerInjectionCooldown {
-		return false
-	}
-	a.compilerInjectionCount++
-	a.lastCompilerInjectedAt = now
-	return true
-}
-
-func (a *Agent) resetMemoryCompilerInjectionGate() {
-	if a == nil {
-		return
-	}
-	a.compilerInjectionMu.Lock()
-	defer a.compilerInjectionMu.Unlock()
-	a.compilerInjectionCount = 0
-	a.lastCompilerInjectedAt = time.Time{}
 }
 
 // SetGate installs the per-call permission gate. Used by interactive CLI sessions to swap the
@@ -831,15 +666,6 @@ func (a *Agent) SetSession(s *Session) {
 	if s != nil {
 		a.rebuildTodoState(s.Snapshot())
 	}
-	a.resetMemoryCompilerInjectionGate()
-	// A session switch breaks the "immediately preceding turn" relationship:
-	// the next input belongs to a different conversation, so the pending
-	// outcome ref must not be revisable from it.
-	a.memoryCompilerMu.Lock()
-	a.lastCompilerOutcome = nil
-	a.memoryCompilerMu.Unlock()
-	// 清除分类缓存（会话边界）
-	a.clearClassifierCache()
 }
 
 // LastUsage returns the most recent per-turn token telemetry the provider
@@ -1038,6 +864,14 @@ type Options struct {
 	// Jobs is the session's background-job manager (nil disables background tools).
 	Jobs *jobs.Manager
 
+	// WriteScheduler is the session-scoped subagent concurrency/write-claim
+	// controller. When set on the parent executor, write-capable tools reserve
+	// paths for the duration of Execute so background writers cannot TOCTOU
+	// race parent writes. Subagents leave this nil (or depth > 0 skips it).
+	WriteScheduler *SubagentScheduler
+	// WriteWorkspaceRoot normalizes parent write reservations.
+	WriteWorkspaceRoot string
+
 	// WorkspaceLease serializes Delivery mutations across sessions that target
 	// the same workspace. nil preserves source compatibility for direct Agent
 	// construction; boot always supplies it for Delivery sessions.
@@ -1089,17 +923,6 @@ type Options struct {
 	// depth 0; child subagents are depth 1. MaxSubagentDepth caps delegation.
 	SubagentDepth    int
 	MaxSubagentDepth int
-
-	// MemoryCompiler enables Memory v5 execution trace writeback and cache-safe
-	// execution-contract compilation.
-	MemoryCompiler *memorycompiler.Runtime
-	// MemoryCompilerVerbosity controls provider-visible injection. Empty defaults
-	// to observe; compact restores the execution-contract user-turn injection.
-	MemoryCompilerVerbosity string
-
-	// UseMemoryCompilerLLMClassification 启用 LLM 分类来判断任务 vs 聊天
-	// 默认 false 时使用启发式分类器
-	UseMemoryCompilerLLMClassification bool
 }
 
 // New constructs an Agent. MaxSteps <= 0 means no cap — the run loop continues
@@ -1163,50 +986,41 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		subagentDepth = 0
 	}
 	a := &Agent{
-		prov:                    prov,
-		tools:                   tools,
-		session:                 session,
-		maxSteps:                opts.MaxSteps,
-		maxStepsKey:             maxStepsKey,
-		temperature:             opts.Temperature,
-		pricing:                 opts.Pricing,
-		usageSource:             usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
-		sink:                    sink,
-		gate:                    gate,
-		readOnlyExecution:       opts.ReadOnlyExecution,
-		planModeReadOnlyTrust:   planModeReadOnlyTrust,
-		sandboxEscapeApprover:   sandboxEscapeApprover,
-		configWriteApprover:     configWriteApprover,
-		hooks:                   hooks,
-		jobs:                    opts.Jobs,
-		workspaceLease:          opts.WorkspaceLease,
-		evidence:                evidence.NewLedger(),
-		projectChecks:           append([]instruction.VerifyCheck(nil), opts.ProjectChecks...),
-		deliveryProfile:         opts.DeliveryProfile,
-		classifierTaskText:      opts.ClassifierTaskText,
-		capabilityLedger:        opts.CapabilityLedger,
-		capabilityAudit:         opts.CapabilityAudit,
-		contextWindow:           opts.ContextWindow,
-		softCompactRatio:        opts.SoftCompactRatio,
-		toolResultSnipRatio:     opts.ToolResultSnipRatio,
-		compactRatio:            opts.CompactRatio,
-		compactForceRatio:       opts.CompactForceRatio,
-		recentKeep:              opts.RecentKeep,
-		archiveDir:              opts.ArchiveDir,
-		keepPolicy:              opts.KeepPolicy,
-		subagentDepth:           subagentDepth,
-		maxSubagentDepth:        maxSubagentDepth,
-		memoryCompiler:          opts.MemoryCompiler,
-		memoryCompilerVerbosity: normalizeMemoryCompilerVerbosity(opts.MemoryCompilerVerbosity),
-	}
-	// 初始化分类器
-	if opts.UseMemoryCompilerLLMClassification && prov != nil {
-		// 使用 LLM 分类器（Haiku）
-		fallback := newHeuristicClassifier()
-		a.classifier = newLLMClassifier(prov, fallback)
-	} else {
-		// 默认使用启发式分类器
-		a.classifier = newHeuristicClassifier()
+		prov:                  prov,
+		tools:                 tools,
+		session:               session,
+		maxSteps:              opts.MaxSteps,
+		maxStepsKey:           maxStepsKey,
+		temperature:           opts.Temperature,
+		pricing:               opts.Pricing,
+		usageSource:           usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
+		sink:                  sink,
+		gate:                  gate,
+		readOnlyExecution:     opts.ReadOnlyExecution,
+		planModeReadOnlyTrust: planModeReadOnlyTrust,
+		sandboxEscapeApprover: sandboxEscapeApprover,
+		configWriteApprover:   configWriteApprover,
+		hooks:                 hooks,
+		jobs:                  opts.Jobs,
+		writeScheduler:        opts.WriteScheduler,
+		writeWorkspaceRoot:    strings.TrimSpace(opts.WriteWorkspaceRoot),
+		workspaceLease:        opts.WorkspaceLease,
+		evidence:              evidence.NewLedger(),
+		projectChecks:         append([]instruction.VerifyCheck(nil), opts.ProjectChecks...),
+		deliveryProfile:       opts.DeliveryProfile,
+		classifierTaskText:    opts.ClassifierTaskText,
+		capabilityLedger:      opts.CapabilityLedger,
+		capabilityAudit:       opts.CapabilityAudit,
+		contextWindow:         opts.ContextWindow,
+		softCompactRatio:      opts.SoftCompactRatio,
+		toolResultSnipRatio:   opts.ToolResultSnipRatio,
+		compactRatio:          opts.CompactRatio,
+		compactForceRatio:     opts.CompactForceRatio,
+		recentKeep:            opts.RecentKeep,
+		archiveDir:            opts.ArchiveDir,
+		keepPolicy:            opts.KeepPolicy,
+		subagentDepth:         subagentDepth,
+		maxSubagentDepth:      maxSubagentDepth,
 	}
 	a.SetResponseLanguage(opts.ResponseLanguage)
 	a.SetReasoningLanguage(opts.ReasoningLanguage)
@@ -1219,6 +1033,25 @@ func usageSourceOrDefault(source, fallback string) string {
 		return source
 	}
 	return fallback
+}
+
+// reserveParentWrite holds write claims for the duration of a parent-agent
+// write tool call. Returns a no-op release when reservation is not needed
+// (subagent, read-only, no scheduler, or non-write tool).
+func (a *Agent) reserveParentWrite(runTool tool.Tool, args json.RawMessage, readOnly bool) (release func(), err error) {
+	noop := func() {}
+	if a == nil || a.writeScheduler == nil || a.subagentDepth > 0 || readOnly || runTool == nil {
+		return noop, nil
+	}
+	name := runTool.Name()
+	if !parentWriteGuardTarget(name) {
+		return noop, nil
+	}
+	claim, err := parentWriteReservation(a.writeWorkspaceRoot, name, args)
+	if err != nil {
+		return noop, err
+	}
+	return a.writeScheduler.ReserveParentWrite(claim)
 }
 
 // Run appends the user input and drives the tool loop until the model returns a
@@ -1329,62 +1162,20 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	}
 	a.deliveryTaskExpected = deliveryTaskNeedsEvidence(classifierInput)
 	a.deliveryMutationExpected = deliveryTaskNeedsMutation(classifierInput) && registryHasWriterTools(a.tools)
+	// A cancelled/error turn leaves a provider-excluded recovery record at the
+	// transcript tail. Fold its bounded facts into this new user turn exactly
+	// once; the user's raw text remains the classifier source above.
+	rawInput = withInterruptedRecovery(rawInput, a.pendingInterruptedRecovery())
 	a.repeatSuccessCounts = nil
 	a.blockedTurnStreak = 0
 	a.loopGuardArmed = false
 	a.loopGuardReceiptMark = 0
 	a.sink.Emit(event.Event{Kind: event.TurnStarted})
-	memoryCompilerInput := rawInput
-	if sourceInput, ok := MemoryCompilerSourceInputFromContext(ctx); ok {
-		memoryCompilerInput = sourceInput
-	}
 	input = a.withTurnPreferences(rawInput)
-	// Consume the previous turn's outcome ref on every non-synthetic turn,
-	// even while the runtime is nil (/memory-v5 off): revision must only ever
-	// target the immediately preceding turn.
-	if !MemoryCompilerSkipFromContext(ctx) {
-		a.reviseMemoryCompilerOutcomeForFeedback(a.memoryCompilerRuntime(), memoryCompilerInput)
-	}
-	if memCompiler := a.memoryCompilerRuntime(); memCompiler != nil && !MemoryCompilerSkipFromContext(ctx) && shouldStartMemoryCompiler(memoryCompilerInput) {
-		// 使用分类器判断是否为任务
-		isTask := true // 默认为任务
-		var classifyErr error
-		if a.classifier != nil {
-			isTask, classifyErr = a.classifier.IsTask(ctx, memoryCompilerInput)
-			if classifyErr != nil {
-				// 分类失败时降级到启发式分类器
-				isTask = shouldInjectMemoryCompilerContractForInput(memoryCompilerInput)
-			}
-		}
-
-		// 只有任务才启动 Memory v5
-		if isTask {
-			if compiledInput, turn := memCompiler.StartTurn(ctx, memoryCompilerInput, a.session.Snapshot()); turn != nil {
-				injected := strings.TrimSpace(compiledInput) != "" &&
-					a.memoryCompilerShouldInject() &&
-					a.tryMarkMemoryCompilerInjected(time.Now())
-				if !injected {
-					turn.SuppressInjection()
-				}
-				a.compilerTurn = turn
-				a.emitMemoryCompilerStats(turn)
-				defer func() {
-					turn.Finish(runErr)
-					ref := turn.OutcomeRef()
-					a.memoryCompilerMu.Lock()
-					a.lastCompilerOutcome = &ref
-					a.memoryCompilerMu.Unlock()
-					if a.compilerTurn == turn {
-						a.compilerTurn = nil
-					}
-				}()
-				if injected {
-					input = a.withTurnPreferences(compiledInput)
-				}
-			}
-		}
-	}
-	a.session.Add(provider.Message{Role: provider.RoleUser, Content: input, Images: userImages(ctx)})
+	userCreatedAt := time.Now().UnixMilli()
+	a.activeTurnCreatedAt.Store(userCreatedAt)
+	defer a.activeTurnCreatedAt.Store(0)
+	a.session.Add(provider.Message{Role: provider.RoleUser, Content: input, Images: userImages(ctx), CreatedAt: userCreatedAt})
 
 	finalReadinessBlocks := 0
 	seenReadinessStates := make(map[string]struct{})
@@ -1418,20 +1209,11 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 			prevPrefixShape = prefixShape
 		}
 
-		text, reasoning, signature, calls, usage, interrupted, partialToolStarted, err := a.stream(ctx, step+1)
+		text, reasoning, signature, calls, usage, interrupted, partialToolStarted, partialCalls, err := a.stream(ctx, step+1)
 		if err != nil {
 			if interrupted && streamRecoveries < maxStreamRecoveries {
 				streamRecoveries++
-				if hasVisibleFinalAnswer(text) {
-					a.session.Add(provider.Message{
-						Role:               provider.RoleAssistant,
-						Content:            text,
-						ReasoningContent:   reasoning,
-						ReasoningSignature: signature,
-						MemoryCitations:    a.memoryCitations(),
-						WorkDurationMs:     workDurationMs(),
-					})
-				}
+				a.recordInterruptedDisplay(text, reasoning, partialCalls, false, workDurationMs())
 				a.session.Add(provider.Message{
 					Role:    provider.RoleUser,
 					Content: a.withTurnPreferences(streamRecoveryMessage(hasVisibleFinalAnswer(text), partialToolStarted)),
@@ -1440,6 +1222,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 				step-- // recovery retries do not consume the tool-round maxSteps budget
 				continue
 			}
+			a.recordInterruptedDisplay(text, reasoning, partialCalls, true, workDurationMs())
 			return err
 		}
 		streamRecoveries = 0
@@ -1468,7 +1251,6 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 			ReasoningContent:   reasoning,
 			ReasoningSignature: signature,
 			ToolCalls:          calls,
-			MemoryCitations:    a.memoryCitations(),
 			WorkDurationMs:     workDurationMs(),
 		})
 
@@ -1505,14 +1287,24 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 				continue
 			}
 			if !hasVisibleFinalAnswer(text) {
-				emptyFinalBlocks++
-				if emptyFinalBlocks >= maxEmptyFinalBlocks {
-					return fmt.Errorf("model finished without a visible final answer %d times", emptyFinalBlocks)
+				// DeepSeek thinking mode can stream a long reasoning_content and
+				// then finish with finish_reason="stop" but an empty content
+				// block: the model has explicitly signalled completion and its
+				// reasoning was already streamed to the user. Retrying here overrides
+				// that stop signal and forces another expensive thinking round (the
+				// "still thinking after the task is done" symptom), so honour the
+				// stop when reasoning carried the substance of the answer and treat
+				// the turn as a final answer instead of retrying.
+				if !reasoningOnlyFinishHonoured(a.prov, usage, reasoning) {
+					emptyFinalBlocks++
+					if emptyFinalBlocks >= maxEmptyFinalBlocks {
+						return fmt.Errorf("model finished without a visible final answer %d times", emptyFinalBlocks)
+					}
+					a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeEmptyFinal, Text: emptyFinalNotice(), Detail: emptyFinalNoticeDetail(a.prov.Name(), usage, len(reasoning))})
+					a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withTurnPreferences(emptyFinalRetryMessage())})
+					a.maybeCompact(ctx, usage)
+					continue
 				}
-				a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Code: event.NoticeCodeEmptyFinal, Text: emptyFinalNotice(), Detail: emptyFinalNoticeDetail(a.prov.Name(), usage, len(reasoning))})
-				a.session.Add(provider.Message{Role: provider.RoleUser, Content: a.withTurnPreferences(emptyFinalRetryMessage())})
-				a.maybeCompact(ctx, usage)
-				continue
 			}
 			if executorHandoff && !usedAnyTool && handoffNudges < maxExecutorHandoffNudges && shouldNudgeExecutorHandoff(input, text) {
 				handoffNudges++
@@ -1559,6 +1351,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 		// If the context was cancelled during tool execution, return after storing
 		// the batch results so the session keeps paired tool-call history.
 		if ctx.Err() != nil {
+			a.recordInterruptedDisplay("", "", nil, true, workDurationMs())
 			return ctx.Err()
 		}
 		if !a.planMode.Load() {
@@ -1670,29 +1463,6 @@ func isToolLoopPause(err error) bool {
 	var maxPause *maxStepsPause
 	var stallPause *todoStallPause
 	return errors.As(err, &maxPause) || errors.As(err, &stallPause)
-}
-
-func (a *Agent) emitMemoryCompilerStats(turn *memorycompiler.Turn) {
-	if a == nil || turn == nil {
-		return
-	}
-	m := turn.Metrics()
-	a.sink.Emit(event.Event{Kind: event.MemoryCompilerStatsEvent, MemoryCompiler: &event.MemoryCompilerStats{
-		Injected:         m.Injected,
-		UsefulIR:         m.UsefulIR,
-		CompiledTokens:   m.CompiledTokens,
-		IROverheadTokens: m.IROverheadTokens,
-		MemoryReferences: m.MemoryReferences,
-		Constraints:      m.Constraints,
-		RiskNotes:        m.RiskNotes,
-		ExecutionSteps:   m.ExecutionSteps,
-		TotalNodes:       m.TotalNodes,
-		HighSignalNodes:  m.HighSignalNodes,
-		ToolResultNodes:  m.ToolResultNodes,
-		DecisionNodes:    m.DecisionNodes,
-		StrategyCount:    m.StrategyCount,
-		LearningCount:    m.LearningCount,
-	}})
 }
 
 func (a *Agent) finalReadinessFailure() string {
@@ -2111,8 +1881,7 @@ func registryHasWriterTools(reg *tool.Registry) bool {
 }
 
 func deliveryTaskNeedsEvidence(input string) bool {
-	isTask, err := newHeuristicClassifier().IsTask(context.Background(), input)
-	return err == nil && isTask
+	return heuristicInputIsTask(input)
 }
 
 func deliveryTaskNeedsMutation(input string) bool {
@@ -2425,6 +2194,28 @@ func hasVisibleFinalAnswer(text string) bool {
 	return strings.TrimSpace(text) != ""
 }
 
+// reasoningOnlyFinishHonoured reports whether the model finished with a stop
+// signal but placed its answer in the reasoning stream rather than the content
+// block. DeepSeek thinking mode does this occasionally: it streams a long
+// reasoning_content, then returns finish_reason="stop" with an empty content.
+// The model has signalled completion, so the host accepts the turn instead of
+// retrying and forcing another expensive thinking round.
+//
+// The accept is scoped to DeepSeek thinking mode (ToolCallReasoningPolicy):
+// for other providers a reasoning-only turn keeps the empty-final retry
+// safety net — local <think>-tag models often recover a visible answer on
+// the second attempt, and a gateway that mislabels truncation as "stop"
+// must not have a degenerate turn committed as the final answer.
+func reasoningOnlyFinishHonoured(p provider.Provider, u *provider.Usage, reasoning string) bool {
+	if !provider.RequiresToolCallReasoning(p) {
+		return false
+	}
+	if u == nil || u.FinishReason != "stop" {
+		return false
+	}
+	return strings.TrimSpace(reasoning) != ""
+}
+
 func emptyFinalRetryMessage() string {
 	return "The previous assistant response finished without any visible answer text. Continue the same task now and provide a concise visible answer to the user. Do not send reasoning only."
 }
@@ -2454,7 +2245,7 @@ func streamRecoveryMessage(hasPartialText, hadPartialTool bool) string {
 	case hadPartialTool:
 		return "The previous assistant response was interrupted while a tool call was streaming. Continue the same task now. If a tool is still needed, issue a fresh complete tool call from scratch; do not rely on any partial tool-call arguments from the interrupted stream."
 	case hasPartialText:
-		return "The previous assistant response was interrupted during streaming. Continue the same task from immediately after the partial assistant message above. Do not repeat text that is already visible."
+		return "The previous assistant response was interrupted during streaming. Continue the same task now. Partial text remains visible to the user but was excluded from model context; avoid needlessly repeating it, and do not assume it was complete."
 	default:
 		return "The previous assistant response was interrupted during streaming before visible answer text was completed. Continue the same task now and provide the next useful response."
 	}
@@ -2465,17 +2256,24 @@ func streamRecoveryMessage(hasPartialText, hadPartialTool bool) string {
 // stream so a sink can re-render the streamed raw text as styled markdown. The
 // accumulated text and reasoning are also returned so the caller can round-trip
 // reasoning on the next turn.
-func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, []provider.ToolCall, *provider.Usage, bool, bool, error) {
+func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, []provider.ToolCall, *provider.Usage, bool, bool, []provider.ToolCall, error) {
 	ctx = provider.WithRetryNotify(ctx, func(info provider.RetryInfo) {
 		a.sink.Emit(event.Event{Kind: event.Retrying, RetryAttempt: info.Attempt, RetryMax: info.Max})
 	})
+	// CreatedAt is durable UI metadata, not model input. Strip it from the
+	// transport copy so wall-clock differences never invalidate the provider's
+	// prompt-cache prefix (and custom providers cannot accidentally send it).
+	requestMessages := append([]provider.Message(nil), provider.ModelMessages(a.session.Messages)...)
+	for i := range requestMessages {
+		requestMessages[i].CreatedAt = 0
+	}
 	ch, err := a.prov.Stream(ctx, provider.Request{
-		Messages:    a.session.Messages,
+		Messages:    requestMessages,
 		Tools:       a.tools.Schemas(),
 		Temperature: provider.OptionalTemperature(a.temperature),
 	})
 	if err != nil {
-		return "", "", "", nil, nil, false, false, err
+		return "", "", "", nil, nil, false, false, nil, err
 	}
 
 	// A PostLLMCall hook rewrites the whole reasoning block, so when one is wired
@@ -2487,6 +2285,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 	var text, reasoning strings.Builder
 	var signature string // provider-issued proof for the reasoning (Anthropic thinking)
 	var calls []provider.ToolCall
+	var partialCalls []provider.ToolCall
 	var usage *provider.Usage
 	var partialToolStarted bool
 	var lastArgProgress time.Time
@@ -2510,23 +2309,22 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 		select {
 		case <-ctx.Done():
 			stored, _ := finishReasoning()
-			return text.String(), stored, signature, calls, usage, false, partialToolStarted, ctx.Err()
+			return text.String(), stored, signature, calls, usage, false, partialToolStarted, partialCalls, ctx.Err()
 		case c, ok := <-ch:
 			if !ok {
 				if err := ctx.Err(); err != nil {
 					stored, _ := finishReasoning()
-					return text.String(), stored, signature, calls, usage, false, partialToolStarted, err
+					return text.String(), stored, signature, calls, usage, false, partialToolStarted, partialCalls, err
 				}
 				stored, display := finishReasoning()
 				if text.Len() > 0 || display != "" {
 					a.sink.Emit(event.Event{
-						Kind:            event.Message,
-						Text:            StripGoalMarkers(text.String()),
-						Reasoning:       display,
-						MemoryCitations: a.memoryCitations(),
+						Kind:      event.Message,
+						Text:      StripGoalMarkers(text.String()),
+						Reasoning: display,
 					})
 				}
-				return text.String(), stored, signature, calls, usage, false, false, nil
+				return text.String(), stored, signature, calls, usage, false, false, partialCalls, nil
 			}
 			chunk = c
 		}
@@ -2549,6 +2347,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 			// working instead of a stall. executeBatch emits the full dispatch
 			// (with args) once the call completes; the frontend merges by ID.
 			if tc := chunk.ToolCall; tc != nil {
+				partialCalls = upsertPartialToolCall(partialCalls, *tc)
 				a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
 					ID: tc.ID, Name: tc.Name, ReadOnly: a.toolReadOnly(tc.Name), Partial: true,
 				}})
@@ -2560,6 +2359,7 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 			// UI can show progress instead of a dead counter for the duration of
 			// a 30KB write_file body.
 			if tc := chunk.ToolCall; tc != nil && time.Since(lastArgProgress) >= 250*time.Millisecond {
+				partialCalls = upsertPartialToolCall(partialCalls, *tc)
 				lastArgProgress = time.Now()
 				a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
 					ID: tc.ID, Name: tc.Name, ReadOnly: a.toolReadOnly(tc.Name), Partial: true, ArgChars: chunk.ArgChars,
@@ -2567,7 +2367,10 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 			}
 		case provider.ChunkToolCall:
 			partialToolStarted = true
-			calls = append(calls, *chunk.ToolCall)
+			if chunk.ToolCall != nil {
+				calls = append(calls, *chunk.ToolCall)
+				partialCalls = upsertPartialToolCall(partialCalls, *chunk.ToolCall)
+			}
 		case provider.ChunkUsage:
 			usage = chunk.Usage
 			a.lastUsage.Store(chunk.Usage)
@@ -2576,18 +2379,56 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 		case provider.ChunkError:
 			if provider.IsStreamInterrupted(chunk.Err) {
 				stored, _ := finishReasoning()
-				return text.String(), stored, signature, calls, usage, true, partialToolStarted, chunk.Err
+				return text.String(), stored, signature, calls, usage, true, partialToolStarted, partialCalls, chunk.Err
 			}
-			return "", "", "", nil, nil, false, false, chunk.Err
+			stored, _ := finishReasoning()
+			return text.String(), stored, signature, calls, usage, false, partialToolStarted, partialCalls, chunk.Err
 		}
 	}
 }
 
-func (a *Agent) memoryCitations() []provider.MemoryCitation {
-	if a.compilerTurn == nil {
-		return nil
+func upsertPartialToolCall(calls []provider.ToolCall, call provider.ToolCall) []provider.ToolCall {
+	for i := range calls {
+		if call.ID != "" && calls[i].ID == call.ID {
+			calls[i] = call
+			return calls
+		}
 	}
-	return a.compilerTurn.MemoryCitations()
+	return append(calls, call)
+}
+
+func (a *Agent) recordInterruptedDisplay(text, reasoning string, calls []provider.ToolCall, pending bool, workDurationMs int64) {
+	displayCalls := make([]provider.ToolCall, 0, len(calls))
+	interrupted := make([]string, 0, len(calls))
+	seen := make(map[string]struct{}, len(calls))
+	for _, call := range calls {
+		name := strings.TrimSpace(call.Name)
+		key := call.ID + "\x00" + name
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		displayCalls = append(displayCalls, provider.ToolCall{ID: call.ID, Name: name})
+		if name != "" {
+			interrupted = append(interrupted, name)
+		}
+	}
+	a.session.Add(provider.Message{
+		Role:             provider.RoleTool,
+		Content:          text,
+		ReasoningContent: reasoning,
+		ToolCalls:        displayCalls,
+		ToolCallID:       provider.LocalOnlyToolID,
+		Name:             provider.LocalOnlyToolName,
+		WorkDurationMs:   workDurationMs,
+		LocalOnly:        true,
+		InterruptedTurn: &provider.InterruptedTurnRecovery{
+			Pending:                 pending,
+			InterruptedTools:        interrupted,
+			DroppedPartialText:      strings.TrimSpace(text) != "",
+			DroppedPartialReasoning: strings.TrimSpace(reasoning) != "",
+		},
+	})
 }
 
 func (a *Agent) capturePrefixShape(schemas []provider.ToolSchema) PrefixShape {
@@ -2643,7 +2484,8 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 	// The first writer stays on the single-preview fast path.
 	earlierWriterRan := false
 	run := func(i int) {
-		t, known := a.tools.Get(calls[i].Name)
+		t, _, ambiguous := a.tools.ResolveCall(calls[i].Name)
+		known := t != nil && len(ambiguous) == 0
 		writer := known && !t.ReadOnly()
 		if earlierWriterRan && writer {
 			if refreshed, changed := refreshCurrentFileDiff(t, calls[i]); changed {
@@ -2727,7 +2569,8 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 
 	for i, c := range calls {
 		o := outcomes[i]
-		t, ok := a.tools.Get(c.Name)
+		t, _, ambiguous := a.tools.ResolveCall(c.Name)
+		ok := t != nil && len(ambiguous) == 0
 		a.sink.Emit(event.Event{Kind: event.ToolResult, Tool: event.Tool{
 			ID:         c.ID,
 			Name:       c.Name,
@@ -2742,25 +2585,6 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: o.truncMsg})
 		}
 	}
-	if a.compilerTurn != nil {
-		records := make([]memorycompiler.ToolRecord, 0, len(calls))
-		for i, c := range calls {
-			o := outcomes[i]
-			t, ok := a.tools.Get(c.Name)
-			records = append(records, memorycompiler.ToolRecord{
-				ID:         c.ID,
-				Name:       c.Name,
-				Args:       c.Arguments,
-				Output:     o.output,
-				Error:      o.errMsg,
-				ReadOnly:   ok && t.ReadOnly(),
-				Blocked:    o.blocked,
-				DurationMs: durations[i],
-				Truncated:  o.truncated,
-			})
-		}
-		a.compilerTurn.RecordToolResults(records)
-	}
 	if !cancelled {
 		a.applyStormBreaker(calls, outcomes, results, receiptMark)
 	}
@@ -2772,7 +2596,8 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) ([]
 }
 
 func (a *Agent) emitFullToolDispatch(c provider.ToolCall, refreshed bool) {
-	t, ok := a.tools.Get(c.Name)
+	t, _, ambiguous := a.tools.ResolveCall(c.Name)
+	ok := t != nil && len(ambiguous) == 0
 	ev := event.Tool{ID: c.ID, Name: c.Name, Args: c.Arguments, ReadOnly: ok && t.ReadOnly(), Refreshed: refreshed}
 	ev.FileDiff = event.FileDiff{Diff: c.Diff, Added: c.Added, Removed: c.Removed}
 	if ok && ev.Diff == "" && ev.Added == 0 && ev.Removed == 0 {
@@ -2822,7 +2647,8 @@ func (a *Agent) withPreviewFileDiffs(calls []provider.ToolCall) []provider.ToolC
 		if out[i].Diff != "" || out[i].Added != 0 || out[i].Removed != 0 {
 			continue
 		}
-		t, ok := a.tools.Get(out[i].Name)
+		t, _, ambiguous := a.tools.ResolveCall(out[i].Name)
+		ok := t != nil && len(ambiguous) == 0
 		if !ok {
 			continue
 		}
@@ -2871,8 +2697,8 @@ func parallelisable(r *tool.Registry, name string) bool {
 	case "complete_step", "todo_write", "wait", "bash_output":
 		return false
 	}
-	t, ok := r.Get(name)
-	return ok && t.ReadOnly()
+	t, _, ambiguous := r.ResolveCall(name)
+	return t != nil && len(ambiguous) == 0 && t.ReadOnly()
 }
 
 func runParallel(ctx context.Context, start, end int, run func(int)) int {
@@ -3079,8 +2905,15 @@ type toolOutcome struct {
 // — the caller emits ToolDispatch/ToolResult — so it is safe to invoke from
 // parallel goroutines.
 func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutcome {
-	t, ok := a.tools.Get(call.Name)
-	if !ok {
+	t, canonicalName, ambiguous := a.tools.ResolveCall(call.Name)
+	if len(ambiguous) > 0 {
+		msg := fmt.Sprintf("ambiguous MCP tool reference %q; use one of: %s", call.Name, strings.Join(ambiguous, ", "))
+		return toolOutcome{
+			output: "error: " + msg,
+			errMsg: msg,
+		}
+	}
+	if t == nil {
 		return toolOutcome{
 			output: fmt.Sprintf("error: unknown tool %q", call.Name),
 			errMsg: fmt.Sprintf("unknown tool %q", call.Name),
@@ -3111,7 +2944,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 				safety = planmode.PlanSafetyUnsafe
 			}
 		}
-		if decision := a.planModeDecision(call.Name, t.ReadOnly(), planModeUntrustedReadOnly(t), safety, json.RawMessage(call.Arguments)); decision.Blocked {
+		if decision := a.planModeDecision(canonicalName, t.ReadOnly(), planModeUntrustedReadOnly(t), safety, json.RawMessage(call.Arguments)); decision.Blocked {
 			return toolOutcome{
 				output:  decision.Message,
 				blocked: true,
@@ -3122,11 +2955,11 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	sandboxBypass := false
 	// Resolve proxy tools (use_capability) to the real MCP target before
 	// permission, hooks, and evidence. Provider transcript keeps call.Name.
-	permName := call.Name
+	permName := canonicalName
 	permArgs := json.RawMessage(call.Arguments)
 	execTool := t
 	execArgs := json.RawMessage(call.Arguments)
-	evidenceName := call.Name
+	evidenceName := canonicalName
 	evidenceArgs := json.RawMessage(call.Arguments)
 	readOnly := t.ReadOnly()
 	var resolved tool.ResolvedCall
@@ -3173,7 +3006,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			if rc.ProxyAction == "call" && !rc.Unavailable {
 				a.noteCapabilityInvocation(call.Name, json.RawMessage(call.Arguments), nil)
 			}
-			result := secrets.RedactToolOutput(rc.Result)
+			result := rc.Result
 			if a.evidence != nil {
 				// inspect/decline are not mutations; unavailable call targets are not success.
 				success := !rc.Unavailable
@@ -3327,6 +3160,31 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			}
 		}
 	}
+	// Resolve the concrete execution target before hooks. A proxy may carry a
+	// different target/name/argument set than the provider-visible call.
+	runTool := execTool
+	runArgs := execArgs
+	if resolved.Target != nil {
+		runTool = resolved.Target
+		runArgs = resolved.Args
+		if len(runArgs) == 0 {
+			runArgs = json.RawMessage(`{}`)
+		}
+	}
+	// Hold the parent claim before PreToolUse: hooks are user shell code and may
+	// mutate the same workspace. The reservation remains live through hooks,
+	// checkpointing, and the concrete Execute call, closing both hook-side and
+	// check-before-write TOCTOU windows. Dynamic Economy/MCP tools are covered
+	// here after registry lookup without schema-changing wrappers.
+	if releaseParentWrite, perr := a.reserveParentWrite(runTool, runArgs, readOnly); perr != nil {
+		return toolOutcome{
+			output:  "blocked: " + perr.Error(),
+			blocked: true,
+			errMsg:  "blocked: write path claimed by background subagent",
+		}
+	} else if releaseParentWrite != nil {
+		defer releaseParentWrite()
+	}
 	// PreToolUse hooks run after permission is granted but before the call: a
 	// gating hook (exit 2) refuses it, surfaced to the model like a gate denial.
 	// Proxy tools fire hooks against the real MCP target name and arguments.
@@ -3395,22 +3253,11 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	}
 	callID := call.ID
 	cctx = tool.WithProgress(cctx, func(chunk string) {
-		a.sink.Emit(event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: callID, Output: secrets.RedactToolOutput(chunk)}})
+		a.sink.Emit(event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: callID, Output: chunk}})
 	})
 	var result string
 	var images []string
 	var err error
-	// When a proxy resolved a concrete target, execute that target (not the
-	// proxy again) so permission-approved args and evidence stay aligned.
-	runTool := execTool
-	runArgs := execArgs
-	if resolved.Target != nil {
-		runTool = resolved.Target
-		runArgs = resolved.Args
-		if len(runArgs) == 0 {
-			runArgs = json.RawMessage(`{}`)
-		}
-	}
 	// A call that was authorized under reader classification carries that
 	// basis into dispatch: the MCP execution layer re-verifies it linearizably
 	// against live trust state and refuses to promote it into a writer lane if
@@ -3427,7 +3274,6 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	} else {
 		result, err = runTool.Execute(cctx, runArgs)
 	}
-	result = secrets.RedactToolOutput(result)
 	if a.evidence != nil {
 		// Always record the model-visible call for audit, then the real target
 		// attributes for mutation/read classification when they differ.
@@ -3513,7 +3359,7 @@ func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.Resolve
 		if readOnlyExecutionMCPDestructive(visible) {
 			return block("execute a destructive MCP capability")
 		}
-		if h, ok := visible.(tool.ReadOnlyExecutionHostMutation); ok && h.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsTrustedMCPStartup(visible) {
+		if h, ok := visible.(tool.ReadOnlyExecutionHostMutation); ok && h.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsMCPStartup(visible) {
 			return block("start or mutate a host capability")
 		}
 		return toolOutcome{}, false
@@ -3543,7 +3389,7 @@ func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.Resolve
 		if readOnlyExecutionMCPDestructive(resolved.Target) {
 			return block("execute a destructive MCP capability")
 		}
-		if h, ok := resolved.Target.(tool.ReadOnlyExecutionHostMutation); ok && h.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsTrustedMCPStartup(resolved.Target) {
+		if h, ok := resolved.Target.(tool.ReadOnlyExecutionHostMutation); ok && h.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsMCPStartup(resolved.Target) {
 			return block("start or mutate a host capability")
 		}
 		return toolOutcome{}, false
@@ -3556,7 +3402,7 @@ func readOnlyExecutionMCPDestructive(t tool.Tool) bool {
 	return mcpDestructiveHint(t)
 }
 
-func readOnlyExecutionAllowsTrustedMCPStartup(t tool.Tool) bool {
+func readOnlyExecutionAllowsMCPStartup(t tool.Tool) bool {
 	if t == nil || !t.ReadOnly() || readOnlyExecutionMCPDestructive(t) {
 		return false
 	}
@@ -3567,10 +3413,10 @@ func readOnlyExecutionAllowsTrustedMCPStartup(t tool.Tool) bool {
 	if !ok || strings.TrimSpace(meta.MCPServerName()) == "" || strings.TrimSpace(meta.MCPRawToolName()) == "" {
 		return false
 	}
-	// A reader classification only admits a host start when it is backed by a
-	// real trust store: the hint/legacy compatibility paths used by direct
-	// library embedders never satisfy the strict boundary.
-	if authority, ok := t.(tool.ReadOnlyExecutionTrustAuthority); !ok || !authority.ReadOnlyExecutionTrustAuthority() {
+	// A reader classification only admits a host start when explicit local or
+	// signed package policy backs it. A server hint alone never satisfies the
+	// strict boundary.
+	if authority, ok := t.(tool.ReadOnlyExecutionAuthority); !ok || !authority.ReadOnlyExecutionAuthority() {
 		return false
 	}
 	_, governed := t.(tool.MCPApprovalPolicy)
@@ -3872,8 +3718,8 @@ func isBackgroundTaskCall(args string) bool {
 // toolReadOnly reports a tool's ReadOnly classification by name (false for an
 // unknown tool), for stamping early ToolDispatch events.
 func (a *Agent) toolReadOnly(name string) bool {
-	t, ok := a.tools.Get(name)
-	return ok && t.ReadOnly()
+	t, _, ambiguous := a.tools.ResolveCall(name)
+	return t != nil && len(ambiguous) == 0 && t.ReadOnly()
 }
 
 // firstLine returns s up to its first newline — a one-line failure summary for

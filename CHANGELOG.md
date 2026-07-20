@@ -8,6 +8,18 @@ branch.
 
 ### Added
 
+- Added a **Remote SSH** module (VS Code Remote-SSH style): a user-global
+  `[remote]` host config, `reasonix remote` CLI (add/list/remove/import/test/
+  connect/status/forward/serve/fs) and `/remote` slash command, an SSH transport
+  with trust-on-first-use host-key verification, keepalive + exponential-backoff
+  reconnect, `-L`/`-R` port forwarding, and SFTP file access. `connect`
+  bootstraps a persistent `reasonix serve` on the remote host and tunnels its
+  loopback port so the full agent runs remotely. The desktop app adds a
+  **Settings -> Remote SSH** host manager, a remote file browser/editor, a
+  port-forwarding panel, and a status-bar connection chip. Linux/macOS remotes.
+- Added `reasonix serve --port-file/--token-file/--pid-file` so a supervised
+  headless serve can bind an ephemeral port and read its auth token from a file
+  (keeping it out of `ps`).
 - Added Claude Code-style searchable CLI pickers for models, providers, and
   sessions, with arrow, Vim, and `Ctrl+P` / `Ctrl+N` navigation.
 - Added `-p` / `--print`, `text`, `json`, and `stream-json` output modes for
@@ -24,6 +36,17 @@ branch.
   remains an independent `Ctrl+Y` toggle.
 - Model, provider, resume, and approval menus now use consistent row selection;
   slash completion, help, aliases, and dispatch share one command registry.
+- The full-screen CLI composer now uses theme-accented borders and a slim bar
+  cursor by default, grows within the available terminal height, scrolls long
+  drafts independently, and preserves selections across explicit image paste.
+- The persistent CLI footer now uses a responsive, theme-aware layout for
+  interaction state, model, effort, localized work mode, Git identity, cache,
+  context, compaction headroom, jobs, and balance. Narrow terminals move or
+  compact complete groups instead of clipping labels.
+- CLI clipboard actions now separate terminal-native text paste from explicit
+  image paste: `Ctrl+V` on macOS/Linux, `Alt+V` on Windows, or `/paste-image`.
+  Local transcript copy verifies the native clipboard write, while SSH uses a
+  clearly labelled OSC 52 fallback.
 - Runtime rebuilds after model, effort, or work-mode changes now preserve the
   conversation, session permission overrides, additional directories, and
   session lease ownership.
@@ -39,6 +62,28 @@ branch.
   `[agent].max_steps` and `planner_max_steps` keys remain parseable for upgrades,
   but are ignored and removed by a one-time migration so stale hidden limits
   cannot truncate new behavior. One-off CLI and unattended bot limits remain.
+
+### Fixed
+
+- Restored captured-mouse right-click text paste, made composer drag selection
+  copy through the verified native clipboard path, and kept non-Git footer
+  telemetry left-aligned without reserving an empty data band.
+- Restored stateful MCP behavior after the v1.17.13 regression: user-added
+  servers work without extra trust settings (including delivery-mode on-demand
+  calls), repository-provided servers use one exact launch confirmation, and
+  stdio tools reuse one persistent process so browser sessions survive across
+  calls without repeated startup latency. The former trust/reverify/catalog
+  management UI and CLI are removed.
+- Localized persistent-footer labels and displayed work-mode values in English,
+  Simplified Chinese, and Traditional Chinese, while keeping command arguments
+  stable.
+- Restored the `0.53` content boundary: model output, tool output, session
+  transcripts, recovery branches, and background-job artifacts retain their
+  original text instead of being rewritten by heuristic secret redaction.
+  Credential masking remains in key-entry summaries and explicit diagnostic or
+  session-cleanup paths. Transcript-bearing session/job sidecars are kept
+  private (`0600`, with private job directories), and the retired
+  `redact_tool_output` setting is removed with a one-time upgrade notice.
 
 ## [1.0.0] — 2026-06-03
 

@@ -92,6 +92,7 @@ type ProviderModelOverrideView struct {
 	SupportedEfforts  []string `json:"supportedEfforts"`
 	DefaultEffort     string   `json:"defaultEffort"`
 	Vision            *bool    `json:"vision"`
+	ContextWindow     int      `json:"contextWindow,omitempty"`
 }
 
 type PermissionsView struct {
@@ -128,13 +129,15 @@ type NetworkView struct {
 }
 
 type AgentView struct {
-	Temperature       float64 `json:"temperature"`
-	MaxSteps          int     `json:"maxSteps"`
-	PlannerMaxSteps   int     `json:"plannerMaxSteps"`
-	MaxSubagentDepth  int     `json:"maxSubagentDepth"`
-	SystemPrompt      string  `json:"systemPrompt"`
-	ColdResumePrune   bool    `json:"coldResumePrune"`
-	ReasoningLanguage string  `json:"reasoningLanguage"`
+	Temperature            float64 `json:"temperature"`
+	MaxSteps               int     `json:"maxSteps"`
+	PlannerMaxSteps        int     `json:"plannerMaxSteps"`
+	MaxSubagentDepth       int     `json:"maxSubagentDepth"`
+	MaxSubagentConcurrency int     `json:"maxSubagentConcurrency"`
+	MaxParallelWriters     int     `json:"maxParallelWriters"`
+	SystemPrompt           string  `json:"systemPrompt"`
+	ColdResumePrune        bool    `json:"coldResumePrune"`
+	ReasoningLanguage      string  `json:"reasoningLanguage"`
 }
 
 type BotAllowlistView struct {
@@ -274,8 +277,8 @@ type SettingsView struct {
 	CheckUpdates            bool                 `json:"checkUpdates"`
 	Telemetry               bool                 `json:"telemetry"`
 	Metrics                 bool                 `json:"metrics"`
-	MemoryCompiler          bool                 `json:"memoryCompilerEnabled"`
 	ExpandThinking          bool                 `json:"expandThinking"`
+	ConversationWidth       string               `json:"conversationWidth,omitempty"`
 	ConfigPath              string               `json:"configPath"`
 	// ProviderKinds lists the provider implementations the kernel actually
 	// registered (provider.Kinds()), so the editor's "kind" picker offers only
@@ -303,6 +306,7 @@ type DesktopStartupSettingsView struct {
 	StatusBarItems     []string        `json:"statusBarItems"`
 	CheckUpdates       bool            `json:"checkUpdates"`
 	SafeMode           bool            `json:"safeMode,omitempty"`
+	ConversationWidth  string          `json:"conversationWidth,omitempty"`
 }
 
 func nonNil(s []string) []string {
@@ -355,6 +359,7 @@ func providerModelOverridesForView(overrides map[string]config.ProviderModelOver
 			SupportedEfforts:  nonNil(ov.SupportedEfforts),
 			DefaultEffort:     ov.DefaultEffort,
 			Vision:            ov.Vision,
+			ContextWindow:     ov.ContextWindow,
 		})
 	}
 	return out
@@ -379,8 +384,9 @@ func providerModelOverridesForSave(overrides []ProviderModelOverrideView, models
 			SupportedEfforts:  nonNil(item.SupportedEfforts),
 			DefaultEffort:     strings.TrimSpace(item.DefaultEffort),
 			Vision:            item.Vision,
+			ContextWindow:     max(item.ContextWindow, 0),
 		}
-		if strings.TrimSpace(ov.ReasoningProtocol) == "" && len(ov.SupportedEfforts) == 0 && strings.TrimSpace(ov.DefaultEffort) == "" && ov.Vision == nil {
+		if strings.TrimSpace(ov.ReasoningProtocol) == "" && len(ov.SupportedEfforts) == 0 && strings.TrimSpace(ov.DefaultEffort) == "" && ov.Vision == nil && ov.ContextWindow == 0 {
 			continue
 		}
 		out[model] = ov
@@ -757,6 +763,7 @@ func desktopStartupSettingsFromConfig(cfg *config.Config) DesktopStartupSettings
 			StatusBarStyle:     "text",
 			StatusBarItems:     config.DefaultDesktopStatusBarItems(),
 			CheckUpdates:       true,
+			ConversationWidth:  "standard",
 		}
 	}
 	return DesktopStartupSettingsView{
@@ -770,6 +777,7 @@ func desktopStartupSettingsFromConfig(cfg *config.Config) DesktopStartupSettings
 		StatusBarItems:     cfg.DesktopStatusBarItems(),
 		CheckUpdates:       cfg.DesktopCheckUpdates(),
 		SafeMode:           cfg.SafeMode(),
+		ConversationWidth:  cfg.DesktopConversationWidth(),
 	}
 }
 
@@ -803,8 +811,15 @@ func (a *App) Settings() SettingsView {
 				Ask:   []string{},
 				Deny:  []string{},
 			},
-			Sandbox:                 SandboxView{Bash: config.Default().BashMode(), AllowWrite: []string{}, EffectiveWriteRoots: []string{}, Shell: "auto", EffectiveShell: sandboxEffectiveShellView(sandbox.ResolveShell("", "", nil))},
-			Agent:                   AgentView{PlannerMaxSteps: 0, MaxSubagentDepth: agent.DefaultMaxSubagentDepth, ColdResumePrune: true, ReasoningLanguage: "auto"},
+			Sandbox: SandboxView{Bash: config.Default().BashMode(), AllowWrite: []string{}, EffectiveWriteRoots: []string{}, Shell: "auto", EffectiveShell: sandboxEffectiveShellView(sandbox.ResolveShell("", "", nil))},
+			Agent: AgentView{
+				PlannerMaxSteps:        0,
+				MaxSubagentDepth:       agent.DefaultMaxSubagentDepth,
+				MaxSubagentConcurrency: agent.DefaultMaxSubagentConcurrency,
+				MaxParallelWriters:     agent.DefaultMaxParallelWriters,
+				ColdResumePrune:        true,
+				ReasoningLanguage:      "auto",
+			},
 			Bot:                     botSettingsView(config.BotConfig{}),
 			AutoPlan:                "off",
 			DesktopLayoutStyle:      "workbench",
@@ -818,8 +833,8 @@ func (a *App) Settings() SettingsView {
 			CheckUpdates:            true,
 			Telemetry:               true,
 			Metrics:                 true,
-			MemoryCompiler:          true,
 			ExpandThinking:          false,
+			ConversationWidth:       "standard",
 		}
 	}
 	ctrl := a.activeCtrl()
@@ -868,7 +883,17 @@ func (a *App) Settings() SettingsView {
 				Password: cfg.Network.Proxy.Password,
 			},
 		},
-		Agent:                   AgentView{Temperature: cfg.Agent.Temperature, MaxSteps: cfg.Agent.MaxSteps, PlannerMaxSteps: cfg.Agent.PlannerMaxSteps, MaxSubagentDepth: desktopMaxSubagentDepth(cfg.Agent.MaxSubagentDepth), SystemPrompt: cfg.Agent.SystemPrompt, ColdResumePrune: cfg.ColdResumePruneEnabled(), ReasoningLanguage: cfg.ReasoningLanguage()},
+		Agent: AgentView{
+			Temperature:            cfg.Agent.Temperature,
+			MaxSteps:               cfg.Agent.MaxSteps,
+			PlannerMaxSteps:        cfg.Agent.PlannerMaxSteps,
+			MaxSubagentDepth:       desktopMaxSubagentDepth(cfg.Agent.MaxSubagentDepth),
+			MaxSubagentConcurrency: desktopSubagentConcurrency(cfg.Agent.MaxSubagentConcurrency),
+			MaxParallelWriters:     desktopParallelWriters(cfg.Agent.MaxParallelWriters, cfg.Agent.MaxSubagentConcurrency),
+			SystemPrompt:           cfg.Agent.SystemPrompt,
+			ColdResumePrune:        cfg.ColdResumePruneEnabled(),
+			ReasoningLanguage:      cfg.ReasoningLanguage(),
+		},
 		Bot:                     botSettingsView(cfg.Bot),
 		DesktopLanguage:         cfg.DesktopLanguage(),
 		DesktopLayoutStyle:      cfg.DesktopLayoutStyle(),
@@ -882,8 +907,8 @@ func (a *App) Settings() SettingsView {
 		CheckUpdates:            cfg.DesktopCheckUpdates(),
 		Telemetry:               cfg.DesktopTelemetry(),
 		Metrics:                 cfg.DesktopMetrics(),
-		MemoryCompiler:          cfg.MemoryCompilerEnabled(),
 		ExpandThinking:          cfg.Desktop.ExpandThinking,
+		ConversationWidth:       cfg.DesktopConversationWidth(),
 		ConfigPath:              cfgPath,
 		ProviderKinds:           nonNil(provider.Kinds()),
 		AutoApproveTools:        ctrl != nil && ctrl.AutoApproveTools(),
@@ -1210,6 +1235,10 @@ func appendSettingsWarning(existing, warning string) string {
 // callers must use loadDesktopUserConfigForView (or its WithCredentials
 // variant), which never writes to disk.
 func (a *App) loadDesktopUserConfigForEdit() (*config.Config, string, error) {
+	return a.loadDesktopUserConfigForEditForRoot(a.activeWorkspaceRoot())
+}
+
+func (a *App) loadDesktopUserConfigForEditForRoot(root string) (*config.Config, string, error) {
 	userPath := config.UserConfigPath()
 	if userPath == "" {
 		return nil, "", fmt.Errorf("cannot resolve user config directory")
@@ -1219,13 +1248,13 @@ func (a *App) loadDesktopUserConfigForEdit() (*config.Config, string, error) {
 		if err := normalizeLegacyDesktopProviderAccessForSettings(cfg, userPath); err != nil {
 			return nil, "", err
 		}
-		if err := a.migrateLegacyBotConfigToUser(cfg, userPath); err != nil {
+		if err := a.migrateLegacyBotConfigToUserForRoot(root, cfg, userPath); err != nil {
 			return nil, "", err
 		}
 		return cfg, userPath, nil
 	}
 	cfg := config.LoadForEdit(userPath)
-	legacyPath := config.SourcePathForRoot(a.activeWorkspaceRoot())
+	legacyPath := config.SourcePathForRoot(root)
 	if legacyPath == "" || sameConfigPath(legacyPath, userPath) {
 		if err := normalizeLegacyDesktopProviderAccessForSettings(cfg, userPath); err != nil {
 			return nil, "", err
@@ -1252,7 +1281,11 @@ func (a *App) loadDesktopUserConfigForEdit() (*config.Config, string, error) {
 // loaded; callers that hand the config to a runtime resolving secrets from the
 // process env must use loadDesktopUserConfigForViewWithCredentials.
 func (a *App) loadDesktopUserConfigForView() (*config.Config, string, error) {
-	return a.loadDesktopUserConfigReadOnly(config.LoadForEditWithoutCredentials)
+	return a.loadDesktopUserConfigForViewForRoot(a.activeWorkspaceRoot())
+}
+
+func (a *App) loadDesktopUserConfigForViewForRoot(root string) (*config.Config, string, error) {
+	return a.loadDesktopUserConfigReadOnlyForRoot(root, config.LoadForEditWithoutCredentials)
 }
 
 // loadDesktopUserConfigForViewWithCredentials is loadDesktopUserConfigForView
@@ -1262,13 +1295,17 @@ func (a *App) loadDesktopUserConfigForView() (*config.Config, string, error) {
 // (app-secret/control-token envs) and MCP server connects. It still never
 // writes to disk.
 func (a *App) loadDesktopUserConfigForViewWithCredentials() (*config.Config, string, error) {
-	return a.loadDesktopUserConfigReadOnly(config.LoadForEdit)
+	return a.loadDesktopUserConfigForViewWithCredentialsForRoot(a.activeWorkspaceRoot())
 }
 
-// loadDesktopUserConfigReadOnly is the shared pure-read loader behind the View
-// variants: same shape as loadDesktopUserConfigForEdit, but every legacy
-// migration stays in memory (zero SaveTo).
-func (a *App) loadDesktopUserConfigReadOnly(load func(string) *config.Config) (*config.Config, string, error) {
+func (a *App) loadDesktopUserConfigForViewWithCredentialsForRoot(root string) (*config.Config, string, error) {
+	return a.loadDesktopUserConfigReadOnlyForRoot(root, config.LoadForEdit)
+}
+
+// loadDesktopUserConfigReadOnlyForRoot is the shared pure-read loader behind
+// the View variants: same shape as loadDesktopUserConfigForEdit, but every
+// legacy migration stays in memory (zero SaveTo) and resolves from root.
+func (a *App) loadDesktopUserConfigReadOnlyForRoot(root string, load func(string) *config.Config) (*config.Config, string, error) {
 	userPath := config.UserConfigPath()
 	if userPath == "" {
 		return nil, "", fmt.Errorf("cannot resolve user config directory")
@@ -1276,14 +1313,14 @@ func (a *App) loadDesktopUserConfigReadOnly(load func(string) *config.Config) (*
 	if _, err := os.Stat(userPath); err == nil {
 		cfg := load(userPath)
 		normalizeLegacyDesktopProviderAccessInMemory(cfg, userPath)
-		legacyPath := config.SourcePathForRoot(a.activeWorkspaceRoot())
+		legacyPath := config.SourcePathForRoot(root)
 		if legacyPath != "" && !sameConfigPath(legacyPath, userPath) {
 			mergeLegacyBotConfigInMemory(cfg, load(legacyPath))
 		}
 		return cfg, userPath, nil
 	}
 	cfg := load(userPath)
-	legacyPath := config.SourcePathForRoot(a.activeWorkspaceRoot())
+	legacyPath := config.SourcePathForRoot(root)
 	if legacyPath == "" || sameConfigPath(legacyPath, userPath) {
 		normalizeLegacyDesktopProviderAccessInMemory(cfg, userPath)
 		return cfg, userPath, nil
@@ -1297,14 +1334,14 @@ func (a *App) loadDesktopUserConfigReadOnly(load func(string) *config.Config) (*
 	return legacyCfg, userPath, nil
 }
 
-// migrateLegacyBotConfigToUser (method) is the write-path legacy bot-config
-// migration against the active workspace's legacy config file. Callers must
+// migrateLegacyBotConfigToUserForRoot is the write-path legacy bot-config
+// migration against an explicit workspace's legacy config file. Callers must
 // hold config.LockUserConfigEdits() (see loadDesktopUserConfigForEdit).
-func (a *App) migrateLegacyBotConfigToUser(userCfg *config.Config, userPath string) error {
+func (a *App) migrateLegacyBotConfigToUserForRoot(root string, userCfg *config.Config, userPath string) error {
 	if userCfg == nil {
 		return nil
 	}
-	legacyPath := config.SourcePathForRoot(a.activeWorkspaceRoot())
+	legacyPath := config.SourcePathForRoot(root)
 	if legacyPath == "" || sameConfigPath(legacyPath, userPath) {
 		return nil
 	}
@@ -1525,10 +1562,24 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	}
 	tab.turnStartMu.Lock()
 	defer tab.turnStartMu.Unlock()
+	return a.rebuildSettingTurnLocked(setting, tab, false)
+}
+
+// rebuildSettingTurnLocked is rebuildSettingLocked's body; callers must hold
+// runtimeRebuildMu and the passed tab's turnStartMu. admissionHeld is true for
+// MCP lifecycle callers that also hold runtimeAdmissionMu's write side.
+func (a *App) rebuildSettingTurnLocked(setting string, tab *WorkspaceTab, admissionHeld bool) error {
+	if a.ctx == nil {
+		return nil
+	}
 	if controllerHasActiveRuntimeWork(a.controllerForTab(tab)) {
 		return rebuildControllerActiveWorkError(setting)
 	}
-	if err := a.ensureTabControllerWorkspace(tab); err != nil {
+	ensureWorkspace := a.ensureTabControllerWorkspace
+	if admissionHeld {
+		ensureWorkspace = a.ensureTabControllerWorkspaceAdmissionHeld
+	}
+	if err := ensureWorkspace(tab); err != nil {
 		return err
 	}
 	prevPath := a.reconciledSessionPathForTab(tab)
@@ -1544,7 +1595,7 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	if controllerHasActiveRuntimeWork(a.controllerForTab(tab)) {
 		return rebuildControllerActiveWorkError(setting)
 	}
-	if err := a.ensureTabControllerWorkspace(tab); err != nil {
+	if err := ensureWorkspace(tab); err != nil {
 		return err
 	}
 
@@ -1840,6 +1891,36 @@ func (a *App) SetMaxSubagentDepth(depth int) error {
 	})
 }
 
+func desktopSubagentConcurrency(n int) int {
+	total, _ := agent.NormalizeConcurrencyLimits(n, 0)
+	return total
+}
+
+func desktopParallelWriters(writers, total int) int {
+	_, w := agent.NormalizeConcurrencyLimits(total, writers)
+	return w
+}
+
+// SetMaxSubagentConcurrency sets the session-wide sub-agent concurrency cap (1–32).
+func (a *App) SetMaxSubagentConcurrency(n int) error {
+	return a.applyConfigChange(func(c *config.Config) error {
+		total, writers := agent.NormalizeConcurrencyLimits(n, c.Agent.MaxParallelWriters)
+		c.Agent.MaxSubagentConcurrency = total
+		c.Agent.MaxParallelWriters = writers
+		return nil
+	})
+}
+
+// SetMaxParallelWriters sets the concurrent writer cap (1–32, ≤ total concurrency).
+func (a *App) SetMaxParallelWriters(n int) error {
+	return a.applyConfigChange(func(c *config.Config) error {
+		total, writers := agent.NormalizeConcurrencyLimits(c.Agent.MaxSubagentConcurrency, n)
+		c.Agent.MaxSubagentConcurrency = total
+		c.Agent.MaxParallelWriters = writers
+		return nil
+	})
+}
+
 // SetAutoPlan updates the automatic plan-first workflow setting (off|on).
 func (a *App) SetAutoPlan(mode string) error {
 	if err := a.ensureLiveControllersRuntimeMutationAllowed("auto-plan"); err != nil {
@@ -1884,57 +1965,6 @@ func (a *App) SetDefaultToolApprovalMode(mode string) error {
 	return a.applyConfigOnly(func(c *config.Config) error {
 		return c.SetDesktopDefaultToolApprovalMode(mode)
 	})
-}
-
-// SetMemoryCompilerEnabled toggles the Memory v5 execution compiler.
-func (a *App) SetMemoryCompilerEnabled(enabled bool) error {
-	// Lock only the load-modify-save cycle; the live-controller fan-out below
-	// must not hold the config edit lock.
-	if err := func() error {
-		unlock := config.LockUserConfigEdits()
-		defer unlock()
-		cfg, path, err := a.loadDesktopUserConfigForEdit()
-		if err != nil {
-			return err
-		}
-		if err := cfg.SetMemoryCompilerEnabled(enabled); err != nil {
-			return err
-		}
-		return cfg.SaveTo(path)
-	}(); err != nil {
-		return err
-	}
-	a.applyMemoryCompilerToLiveControllers(enabled)
-	return nil
-}
-
-func (a *App) applyMemoryCompilerToLiveControllers(enabled bool) {
-	if a == nil {
-		return
-	}
-	var controllers []memoryCompilerTarget
-	a.mu.RLock()
-	for _, id := range a.orderedTabIDsLocked() {
-		tab := a.tabs[id]
-		if tab == nil || tab.Ctrl == nil {
-			continue
-		}
-		controllers = append(controllers, tab.Ctrl)
-	}
-	a.mu.RUnlock()
-	applyMemoryCompilerToControllers(enabled, controllers)
-}
-
-type memoryCompilerTarget interface {
-	SetMemoryCompilerEnabled(enabled bool)
-}
-
-func applyMemoryCompilerToControllers(enabled bool, controllers []memoryCompilerTarget) {
-	for _, ctrl := range controllers {
-		if ctrl != nil {
-			ctrl.SetMemoryCompilerEnabled(enabled)
-		}
-	}
 }
 
 func desktopAutoPlanMode(mode string) string {
@@ -2389,6 +2419,13 @@ func retargetProviderReferences(c *config.Config, name, fallbackRef string) {
 }
 
 func (a *App) removeBuiltInProviderAccessAndRetargetTabs(name string) error {
+	defer a.lockRuntimeMutation("remove-provider-access")()
+	releaseGates, err := a.lockRuntimeTurnGates("provider access", nil)
+	if err != nil {
+		return err
+	}
+	defer releaseGates()
+
 	// This first load is a read-only planning copy (fallback ref + affected-tab
 	// scan); it loads credentials because the fallback choice depends on which
 	// providers resolve a key. The saved edit below reloads under the config
@@ -2454,7 +2491,7 @@ func (a *App) removeBuiltInProviderAccessAndRetargetTabs(name string) error {
 		return err
 	}
 	if len(affected) == 0 {
-		if err := a.rebuild(); err != nil {
+		if err := a.rebuildActiveSettingRuntimeMutationLocked("provider access"); err != nil {
 			if _, ok := a.deferredRebuildWarning("provider access", err); ok {
 				return nil
 			}
@@ -2469,6 +2506,7 @@ func (a *App) removeBuiltInProviderAccessAndRetargetTabs(name string) error {
 	}
 
 	var rebuildTabs []*WorkspaceTab
+	var releasedHostKeys []string
 	a.mu.Lock()
 	for _, item := range affected {
 		tab := a.tabs[item.id]
@@ -2481,6 +2519,9 @@ func (a *App) removeBuiltInProviderAccessAndRetargetTabs(name string) error {
 			continue
 		}
 		tab.Ctrl = nil
+		if key := takeTabSharedHostKey(tab); key != "" {
+			releasedHostKeys = append(releasedHostKeys, key)
+		}
 		// Supersede any in-flight startup build: it was planned against the
 		// removed provider and would otherwise finish later, pass its
 		// generation check, and reinstall a controller for it.
@@ -2495,6 +2536,9 @@ func (a *App) removeBuiltInProviderAccessAndRetargetTabs(name string) error {
 	}
 	a.saveTabsLocked()
 	a.mu.Unlock()
+	for _, key := range releasedHostKeys {
+		a.releaseSharedHost(key)
+	}
 
 	for _, tab := range rebuildTabs {
 		go a.buildTabController(tab)
@@ -2507,6 +2551,13 @@ func (a *App) deleteProviderAndRetargetTabs(name string) error {
 	if name == "" {
 		return fmt.Errorf("remove provider: empty provider name")
 	}
+	defer a.lockRuntimeMutation("delete-provider")()
+	releaseGates, err := a.lockRuntimeTurnGates("provider", nil)
+	if err != nil {
+		return err
+	}
+	defer releaseGates()
+
 	// Read-only planning copy (with credentials — the fallback choice depends
 	// on which providers resolve a key); the saved edit below reloads under the
 	// config edit lock (see removeBuiltInProviderAccessAndRetargetTabs).
@@ -2573,7 +2624,7 @@ func (a *App) deleteProviderAndRetargetTabs(name string) error {
 	}
 
 	if len(affected) == 0 {
-		if err := a.rebuild(); err != nil {
+		if err := a.rebuildActiveSettingRuntimeMutationLocked("provider"); err != nil {
 			if _, ok := a.deferredRebuildWarning("provider", err); ok {
 				return nil
 			}
@@ -2588,6 +2639,7 @@ func (a *App) deleteProviderAndRetargetTabs(name string) error {
 	}
 
 	var rebuildTabs []*WorkspaceTab
+	var releasedHostKeys []string
 	a.mu.Lock()
 	for _, item := range affected {
 		tab := a.tabs[item.id]
@@ -2600,6 +2652,9 @@ func (a *App) deleteProviderAndRetargetTabs(name string) error {
 			continue
 		}
 		tab.Ctrl = nil
+		if key := takeTabSharedHostKey(tab); key != "" {
+			releasedHostKeys = append(releasedHostKeys, key)
+		}
 		// Supersede any in-flight startup build: it was planned against the
 		// removed provider and would otherwise finish later, pass its
 		// generation check, and reinstall a controller for it.
@@ -2614,11 +2669,27 @@ func (a *App) deleteProviderAndRetargetTabs(name string) error {
 	}
 	a.saveTabsLocked()
 	a.mu.Unlock()
+	for _, key := range releasedHostKeys {
+		a.releaseSharedHost(key)
+	}
 
 	for _, tab := range rebuildTabs {
 		go a.buildTabController(tab)
 	}
 	return nil
+}
+
+// rebuildActiveSettingRuntimeMutationLocked refreshes the active controller
+// while lockRuntimeMutation and all runtime turn gates are held.
+func (a *App) rebuildActiveSettingRuntimeMutationLocked(setting string) error {
+	tab := a.activeTab()
+	if tab == nil {
+		if a.ctx == nil {
+			return nil
+		}
+		return fmt.Errorf("no active tab")
+	}
+	return a.rebuildSettingTurnLocked(setting, tab, true)
 }
 
 // SetProviderKey writes a secret to Reasonix's global .env under the given
@@ -3044,6 +3115,12 @@ func (a *App) SetDesktopMetrics(enabled bool) error {
 // the desktop. It is desktop-only and does not rebuild the controller.
 func (a *App) SetExpandThinking(on bool) error {
 	return a.applyConfigOnly(func(c *config.Config) error { return c.SetExpandThinking(on) })
+}
+
+// SetDesktopConversationWidth sets the max transcript width preference.
+// standard = 960px fixed; full = 90% of the parent, with a 960px floor. Pure config-only.
+func (a *App) SetDesktopConversationWidth(width string) error {
+	return a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopConversationWidth(width) })
 }
 
 // MigrateDesktopPreferences imports old browser-local desktop preferences into

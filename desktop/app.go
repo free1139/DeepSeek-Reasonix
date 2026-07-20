@@ -42,16 +42,14 @@ import (
 	fileenc "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/i18n"
 	"reasonix/internal/jobs"
-	"reasonix/internal/mcpcatalog"
 	"reasonix/internal/mcpdiag"
-	"reasonix/internal/mcptrust"
+	"reasonix/internal/mcplaunch"
 	"reasonix/internal/memory"
 	"reasonix/internal/notify"
 	"reasonix/internal/plugin"
 	"reasonix/internal/pluginpkg"
 	"reasonix/internal/provider"
 	"reasonix/internal/repair"
-	"reasonix/internal/sandbox"
 	"reasonix/internal/skill"
 	"reasonix/internal/store"
 	"reasonix/internal/tool"
@@ -109,6 +107,13 @@ type PromptHistoryResult struct {
 type App struct {
 	ctx context.Context
 
+	// remoteWindow marks the lightweight native shell used for an SSH-backed
+	// workspace. It deliberately skips local tab/session runtime startup so a
+	// second window never competes for the primary process's session leases.
+	remoteWindow          *remoteWindowLaunch
+	remoteWindowNavigated atomic.Bool
+	remoteWindowOpener    func(remoteWindowLaunch) error // test-only injection
+
 	// mu protects the tab map, tabOrder, activeTabID, and per-tab fields that are read
 	// from bound methods. All bound methods that touch a controller use activeCtrl().
 	mu          sync.RWMutex
@@ -142,12 +147,23 @@ type App struct {
 	// topic/workspace removal trash the same files while it is in flight.
 	sessionRemovalMu sync.Mutex
 
-	// runtimeRebuildMu serializes controller rebuilds (build + swap) across
-	// rebuildSetting, SetModelForTab, and the deferred-rebuild retry loop. Two
-	// concurrent rebuilds of the same tab both pass the tab-identity check at
-	// swap time (the tab pointer is unchanged), so the loser's controller
-	// would replace the winner's and leak it without Close.
+	// runtimeRebuildMu serializes controller rebuilds (build + swap), teardown,
+	// and MCP lifecycle mutations. Two concurrent rebuilds of the same tab both
+	// pass the tab-identity check at swap time, while MCP launch authorization racing
+	// a toggle/reconnect can restore stale tools or launch a second single-instance
+	// server. Keep the lock order runtimeRebuildMu -> runtimeAdmissionMu -> App.mu
+	// -> Host/Registry.
 	runtimeRebuildMu sync.Mutex
+	// runtimeAdmissionMu is the runtime lifecycle barrier. Foreground turn-start
+	// tokens and controller builds hold the read side; runtime teardown and MCP
+	// lifecycle mutations hold the write side so their captured controller/Host
+	// cannot be replaced, closed, or handed a late turn in flight. Writers already
+	// hold runtimeRebuildMu, making them mutually exclusive. Read holders must never
+	// acquire runtimeRebuildMu, or a queued writer would deadlock the pair.
+	runtimeAdmissionMu sync.RWMutex
+	// runtimeMutationBeforeLockHook is test-only. Set it before starting concurrent
+	// calls and never mutate it afterward.
+	runtimeMutationBeforeLockHook func(string)
 
 	// tryRunMu guards tryRunCancel — the cancel handle for the single
 	// in-flight settings-page subagent try run (TrySubagentProfile /
@@ -196,6 +212,11 @@ type App struct {
 	notificationSender     notify.Sender
 
 	runtimeEvents asyncRuntimeEmitter
+
+	// Remote SSH module: the manager is created lazily on the first remote
+	// binding call and closed on shutdown.
+	remoteMu      sync.Mutex
+	remoteRuntime remoteKernel
 
 	// promptHistoryTape is a lazy, cursor-addressed view of prompt history. It
 	// stores session order and per-session parsed entries only after that session is
@@ -430,6 +451,9 @@ func (a *App) Platform() string {
 // off the initialization in a background goroutine so the webview loads immediately.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	if a.remoteWindow != nil {
+		return
+	}
 	installSystemQuitHook()
 	a.startTray()
 	a.enableDeferredRebuildRetry()
@@ -464,6 +488,9 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) beforeClose(ctx context.Context) bool {
+	if a.remoteWindow != nil {
+		return false
+	}
 	if a.forceQuit.Swap(false) || consumeSystemQuitRequested() {
 		return false
 	}
@@ -776,35 +803,50 @@ func (a *App) snapshotAllTabs() {
 
 // shutdown snapshots all tabs, saves the final window geometry, and closes tabs.
 func (a *App) shutdown(context.Context) {
+	if a.remoteWindow != nil {
+		return
+	}
 	a.stopDeferredRebuildRetry()
 	a.stopMainThreadWatchdog()
 	if a.heartbeat != nil {
 		a.heartbeat.Stop()
 	}
 	a.stopBotRuntime()
+	a.stopRemoteRuntime()
 	a.stopTray()
 	// Save window geometry synchronously from Go so it's persisted even if the
 	// frontend's beforeunload promise hasn't resolved yet.
 	a.saveWindowStateSync()
-	// Close every shared plugin host on exit, even if a tab cleanup panics.
+	// Serialize shutdown with controller rebuilds and live MCP mutations. This
+	// uses the same lifecycle lock order as lockMCPMutation so launch authorization
+	// or reconnect cannot have its captured Host closed underneath it.
+	a.runtimeRebuildMu.Lock()
+	defer a.runtimeRebuildMu.Unlock()
+	a.runtimeAdmissionMu.Lock()
+	defer a.runtimeAdmissionMu.Unlock()
+	// Close every shared plugin host before releasing the lifecycle barrier,
+	// even if a tab cleanup panics.
 	defer a.closeAllSharedHosts()
 
 	a.mu.RLock()
 	tabs := a.runtimeTabsLocked()
 	type shutdownItem struct {
-		tab  *WorkspaceTab
-		ctrl control.SessionAPI
+		tab      *WorkspaceTab
+		ctrl     control.SessionAPI
+		readOnly bool
 	}
 	items := make([]shutdownItem, 0, len(tabs))
 	for _, t := range tabs {
 		if t.Ctrl != nil {
-			items = append(items, shutdownItem{tab: t, ctrl: t.Ctrl})
+			items = append(items, shutdownItem{tab: t, ctrl: t.Ctrl, readOnly: t.ReadOnly})
 		}
 	}
 	a.mu.RUnlock()
 	for _, it := range items {
-		if err := a.snapshotTab(it.tab); err != nil {
-			slog.Warn("desktop: shutdown snapshot failed", "tab", it.tab.ID, "err", err)
+		if !it.readOnly {
+			if err := it.ctrl.SnapshotForShutdown(); err != nil {
+				slog.Warn("desktop: shutdown snapshot failed", "tab", it.tab.ID, "err", err)
+			}
 		}
 		it.ctrl.Close()
 		it.tab.releaseSessionLease()
@@ -828,6 +870,14 @@ func (a *App) shutdown(context.Context) {
 // position and size, then calls WindowShow so the user never sees the default
 // size/position flash.
 func (a *App) domReady(_ context.Context) {
+	// JSC has installed its lazy signal handlers by this point. Restore the
+	// SA_ONSTACK flags required by Go; this is a no-op outside Linux.
+	repairWebKitSignalHandlers()
+
+	if a.remoteWindow != nil {
+		a.domReadyRemoteWindow()
+		return
+	}
 	state, ok := loadWindowState()
 	if ok {
 		// Validate saved position against current screens. Wails v2 doesn't
@@ -910,10 +960,43 @@ func (a *App) SubmitToTab(tabID, input string) error {
 	return a.submitToTab(tabID, input, false)
 }
 
+// tabTurnAdmission owns both locks acquired while a foreground turn starts.
+// Call finish after invoking the controller; callers should also defer abort so
+// every early-return and recovered-panic path releases the admission exactly
+// once.
+type tabTurnAdmission struct {
+	app      *App
+	tab      *WorkspaceTab
+	released bool
+}
+
+func (admission *tabTurnAdmission) finish(ctrl control.SessionAPI) bool {
+	if admission == nil || admission.released {
+		return false
+	}
+	admission.released = true
+	tab := admission.tab
+	if tab != nil {
+		// Release even if a controller implementation panics while reporting its
+		// status. The caller's deferred abort sees released=true and cannot be the
+		// fallback once finish has taken ownership of the release.
+		defer admission.app.runtimeAdmissionMu.RUnlock()
+		defer tab.turnStartMu.Unlock()
+	}
+	started := ctrl != nil && ctrl.RuntimeStatus().Running
+	if !started && tab != nil && tab.sink != nil {
+		tab.sink.cancelTurnStart()
+	}
+	return started
+}
+
+func (admission *tabTurnAdmission) abort() {
+	admission.finish(nil)
+}
+
 // beginTabTurn locks the tab's foreground-turn admission gate and reserves the
-// event sink until TurnDone has completed all of its fan-out. The caller must
-// call finishTabTurnStart exactly once after invoking the controller.
-func (a *App) beginTabTurn(tabID string, reclaim bool) (*WorkspaceTab, control.SessionAPI, error) {
+// event sink until TurnDone has completed all of its fan-out.
+func (a *App) beginTabTurn(tabID string, reclaim bool) (*tabTurnAdmission, control.SessionAPI, error) {
 	tab, ctrl := a.tabAndCtrlByID(tabID)
 	if a.tabIsReadOnly(tab) {
 		return nil, nil, readOnlyChannelErr()
@@ -921,9 +1004,19 @@ func (a *App) beginTabTurn(tabID string, reclaim bool) (*WorkspaceTab, control.S
 	if tab == nil || ctrl == nil {
 		return nil, nil, a.workspaceNotReadyErr(tab)
 	}
+	// Runtime work-admission barrier: held (shared) from here until the turn is
+	// observably running and the returned admission token releases it, so an MCP
+	// MCP authorization or plugin uninstall holding the write side either waits out
+	// this admission or sees its work in the gated re-check. Never acquire
+	// runtimeRebuildMu while this read lock is held.
+	a.runtimeAdmissionMu.RLock()
+	abort := func() {
+		tab.turnStartMu.Unlock()
+		a.runtimeAdmissionMu.RUnlock()
+	}
 	tab.turnStartMu.Lock()
 	if a.tabIsReadOnly(tab) {
-		tab.turnStartMu.Unlock()
+		abort()
 		return nil, nil, readOnlyChannelErr()
 	}
 	if reclaim && a.botBridge != nil {
@@ -931,34 +1024,23 @@ func (a *App) beginTabTurn(tabID string, reclaim bool) (*WorkspaceTab, control.S
 	}
 	ctrl = a.controllerForTab(tab)
 	if ctrl == nil {
-		tab.turnStartMu.Unlock()
+		abort()
 		return nil, nil, a.workspaceNotReadyErr(tab)
 	}
-	if err := a.ensureTabControllerWorkspace(tab); err != nil {
-		tab.turnStartMu.Unlock()
+	if err := a.ensureTabControllerWorkspaceAdmissionHeld(tab); err != nil {
+		abort()
 		return nil, nil, err
 	}
 	ctrl = a.controllerForTab(tab)
 	if ctrl == nil {
-		tab.turnStartMu.Unlock()
+		abort()
 		return nil, nil, a.workspaceNotReadyErr(tab)
 	}
 	if ctrl.RuntimeStatus().Running || (tab.sink != nil && !tab.sink.tryBeginTurn()) {
-		tab.turnStartMu.Unlock()
+		abort()
 		return nil, nil, control.ErrTurnRunning
 	}
-	return tab, ctrl, nil
-}
-
-func (a *App) finishTabTurnStart(tab *WorkspaceTab, ctrl control.SessionAPI) bool {
-	started := ctrl != nil && ctrl.RuntimeStatus().Running
-	if !started && tab != nil && tab.sink != nil {
-		tab.sink.cancelTurnStart()
-	}
-	if tab != nil {
-		tab.turnStartMu.Unlock()
-	}
-	return started
+	return &tabTurnAdmission{app: a, tab: tab}, ctrl, nil
 }
 
 // submitToTab is the shared submit body. fromBridge marks submissions driven
@@ -980,28 +1062,32 @@ func (a *App) submitToTab(tabID, input string, fromBridge bool) error {
 		a.runEffortCommandForTab(tabID, trimmed)
 		return nil
 	}
-	tab, ctrl, err := a.beginTabTurn(tabID, !fromBridge)
+	admission, ctrl, err := a.beginTabTurn(tabID, !fromBridge)
 	if err != nil {
 		return err
 	}
+	defer admission.abort()
+	tab := admission.tab
 	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitDisplay(input, input)
-	a.finishTabTurnStart(tab, ctrl)
+	admission.finish(ctrl)
 	return nil
 }
 
 func (a *App) submitUserTurnToTabWithSink(tabID, input string, forwarder event.Sink) bool {
-	tab, ctrl, err := a.beginTabTurn(tabID, false)
+	admission, ctrl, err := a.beginTabTurn(tabID, false)
 	if err != nil {
 		return false
 	}
+	defer admission.abort()
+	tab := admission.tab
 	var generation uint64
 	if forwarder != nil {
 		generation = tab.sink.SetBotSink(forwarder)
 	}
 	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitUserTurn(input, input)
-	started := a.finishTabTurnStart(tab, ctrl)
+	started := admission.finish(ctrl)
 	if !started && forwarder != nil {
 		tab.sink.clearBotSink(generation)
 	}
@@ -1015,13 +1101,15 @@ func (a *App) RunShell(command string) error {
 }
 
 func (a *App) RunShellForTab(tabID, command string) error {
-	tab, ctrl, err := a.beginTabTurn(tabID, true)
+	admission, ctrl, err := a.beginTabTurn(tabID, true)
 	if err != nil {
 		return err
 	}
+	defer admission.abort()
+	tab := admission.tab
 	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.RunShell(command)
-	a.finishTabTurnStart(tab, ctrl)
+	admission.finish(ctrl)
 	return nil
 }
 
@@ -1032,24 +1120,28 @@ func (a *App) SubmitDisplay(display, input string) error {
 }
 
 func (a *App) SubmitDisplayToTab(tabID, display, input string) error {
-	tab, ctrl, err := a.beginTabTurn(tabID, true)
+	admission, ctrl, err := a.beginTabTurn(tabID, true)
 	if err != nil {
 		return err
 	}
+	defer admission.abort()
+	tab := admission.tab
 	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitDisplay(display, input)
-	a.finishTabTurnStart(tab, ctrl)
+	admission.finish(ctrl)
 	return nil
 }
 
 func (a *App) SubmitDeliveryRecoveryToTab(tabID, display, input string) error {
-	tab, ctrl, err := a.beginTabTurn(tabID, true)
+	admission, ctrl, err := a.beginTabTurn(tabID, true)
 	if err != nil {
 		return err
 	}
+	defer admission.abort()
+	tab := admission.tab
 	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitDeliveryRecovery(display, input)
-	a.finishTabTurnStart(tab, ctrl)
+	admission.finish(ctrl)
 	return nil
 }
 
@@ -1061,10 +1153,12 @@ type InvocationRequest struct {
 }
 
 func (a *App) SubmitInvocationsToTab(tabID, display, input string, invocations []InvocationRequest) error {
-	tab, ctrl, err := a.beginTabTurn(tabID, true)
+	admission, ctrl, err := a.beginTabTurn(tabID, true)
 	if err != nil {
 		return err
 	}
+	defer admission.abort()
+	tab := admission.tab
 	a.ensureTabTopicIndexedForUserTurn(tab)
 	requests := make([]control.InvocationRequest, 0, len(invocations))
 	for _, invocation := range invocations {
@@ -1073,18 +1167,20 @@ func (a *App) SubmitInvocationsToTab(tabID, display, input string, invocations [
 		})
 	}
 	ctrl.SubmitInvocationDisplay(display, input, requests)
-	a.finishTabTurnStart(tab, ctrl)
+	admission.finish(ctrl)
 	return nil
 }
 
 func (a *App) SubmitEditedDisplayToTab(tabID, display, input, original string) error {
-	tab, ctrl, err := a.beginTabTurn(tabID, true)
+	admission, ctrl, err := a.beginTabTurn(tabID, true)
 	if err != nil {
 		return err
 	}
+	defer admission.abort()
+	tab := admission.tab
 	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitEditedDisplay(display, input, original)
-	a.finishTabTurnStart(tab, ctrl)
+	admission.finish(ctrl)
 	return nil
 }
 
@@ -1169,6 +1265,20 @@ func (a *App) activeTabAndCtrl() (*WorkspaceTab, control.SessionAPI) {
 		return nil, nil
 	}
 	return tab, tab.Ctrl
+}
+
+// activeMCPRuntime snapshots the complete target of a Wails MCP action in one
+// critical section. MCP operations may outlive a frontend tab switch; carrying
+// the invoking workspace root prevents config/authorization reads from drifting to the
+// newly active tab while controller calls still target the original runtime.
+func (a *App) activeMCPRuntime() (*WorkspaceTab, control.SessionAPI, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	tab := a.activeTabLocked()
+	if tab == nil {
+		return nil, nil, ""
+	}
+	return tab, tab.Ctrl, tab.WorkspaceRoot
 }
 
 func (a *App) controllerForTab(tab *WorkspaceTab) control.SessionAPI {
@@ -1290,6 +1400,16 @@ func (a *App) reconciledSessionPathForTab(tab *WorkspaceTab) string {
 }
 
 func (a *App) ensureTabControllerWorkspace(tab *WorkspaceTab) error {
+	a.runtimeAdmissionMu.RLock()
+	defer a.runtimeAdmissionMu.RUnlock()
+	return a.ensureTabControllerWorkspaceAdmissionHeld(tab)
+}
+
+// ensureTabControllerWorkspaceAdmissionHeld repairs a stale controller binding
+// while the caller holds either side of runtimeAdmissionMu. The repair may build
+// a controller synchronously, so it must not recursively acquire the read side:
+// sync.RWMutex blocks new readers once a writer is queued.
+func (a *App) ensureTabControllerWorkspaceAdmissionHeld(tab *WorkspaceTab) error {
 	if tab == nil {
 		return nil
 	}
@@ -1365,7 +1485,7 @@ func (a *App) ensureTabControllerWorkspace(tab *WorkspaceTab) error {
 		a.releaseSharedHost(hostKey)
 	}
 
-	a.buildTabController(tab)
+	a.buildTabControllerAdmissionHeld(tab)
 	if tab.Ctrl == nil {
 		if tab.StartupErr != "" {
 			return fmt.Errorf("workspace failed to restart with corrected root: %s", tab.StartupErr)
@@ -2007,6 +2127,9 @@ func removeDesktopSessionArtifacts(path string) error {
 	if err := removeSessionDisplay(filepath.Dir(path), path); err != nil {
 		return err
 	}
+	if err := removeSessionPlannerDisplay(filepath.Dir(path), path); err != nil {
+		return err
+	}
 	if err := agent.DeleteSubagentsByParent(filepath.Dir(path), agent.BranchID(path)); err != nil {
 		return err
 	}
@@ -2385,6 +2508,7 @@ func (a *App) ListSessions() []SessionMeta {
 		}
 	}
 	_ = pruneSessionDisplays(dir, protectedDisplays)
+	_ = pruneSessionPlannerDisplays(dir, protectedDisplays)
 	titles := loadSessionTitles(dir)
 	channelRoutes := channelSessionRoutesForDir(dir)
 	active := a.activeSessionPath(dir)
@@ -2602,6 +2726,7 @@ func (a *App) deleteSession(path string, requireRedundantRecovery bool) error {
 	}
 	var fallback fallbackRuntimeTarget
 	if err := func() error {
+		defer a.lockRuntimeMutation("delete-session")()
 		a.sessionRemovalMu.Lock()
 		defer a.sessionRemovalMu.Unlock()
 		if requireRedundantRecovery && !agent.RecoveryBranchCoveredByParent(sessionPath, dir) {
@@ -2611,16 +2736,16 @@ func (a *App) deleteSession(path string, requireRedundantRecovery bool) error {
 		removed, nextFallback := a.removeSessionRuntimeBindings(dir, sessionPath)
 		fallback = nextFallback
 		if err := a.prepareRemovedSessionRuntimes(removed); err != nil {
-			a.closeRemovedSessionRuntimes(removed)
+			a.closeRemainingRemovedSessionRuntimesAdmissionHeld(removed, map[control.SessionAPI]bool{})
 			return err
 		}
 		closedRemoved := map[control.SessionAPI]bool{}
 		destroys := a.destroyHandlesForSession(dir, sessionPath, removed)
 		teardownTimedOut := waitDestroyHandles(destroys)
-		a.closeRemovedSessionRuntimesForSessionAfterDestroy(removed, dir, sessionPath, closedRemoved)
+		a.closeRemovedSessionRuntimesForSessionAfterDestroyAdmissionHeld(removed, dir, sessionPath, closedRemoved)
 		if teardownTimedOut {
 			if err := agent.MarkCleanupPending(sessionPath, "delete"); err != nil {
-				a.closeRemainingRemovedSessionRuntimesAfterDestroy(removed, closedRemoved)
+				a.closeRemainingRemovedSessionRuntimesAfterDestroyAdmissionHeld(removed, closedRemoved)
 				return err
 			}
 			go delayedDesktopSessionTrash(dir, sessionPath, key, destroys)
@@ -2628,11 +2753,11 @@ func (a *App) deleteSession(path string, requireRedundantRecovery bool) error {
 			err = trashSessionArtifacts(dir, sessionPath, key)
 			finishDestroyHandles(destroys)
 			if err != nil {
-				a.closeRemainingRemovedSessionRuntimesAfterDestroy(removed, closedRemoved)
+				a.closeRemainingRemovedSessionRuntimesAfterDestroyAdmissionHeld(removed, closedRemoved)
 				return err
 			}
 		}
-		a.closeRemainingRemovedSessionRuntimesAfterDestroy(removed, closedRemoved)
+		a.closeRemainingRemovedSessionRuntimesAfterDestroyAdmissionHeld(removed, closedRemoved)
 		return nil
 	}(); err != nil {
 		return err
@@ -2908,10 +3033,11 @@ func delayedDesktopSessionTrash(dir, sessionPath, key string, destroys []control
 }
 
 func (a *App) closeRemovedSessionRuntimes(removed []removedSessionRuntime) {
-	a.closeRemainingRemovedSessionRuntimes(removed, map[control.SessionAPI]bool{})
+	defer a.lockRuntimeMutation("close-removed-session-runtimes")()
+	a.closeRemainingRemovedSessionRuntimesAdmissionHeld(removed, map[control.SessionAPI]bool{})
 }
 
-func (a *App) closeRemovedSessionRuntimesForSessionAfterDestroy(removed []removedSessionRuntime, dir, sessionPath string, closed map[control.SessionAPI]bool) {
+func (a *App) closeRemovedSessionRuntimesForSessionAfterDestroyAdmissionHeld(removed []removedSessionRuntime, dir, sessionPath string, closed map[control.SessionAPI]bool) {
 	releasedTabs := map[*WorkspaceTab]bool{}
 	for _, item := range removed {
 		if item.sessionDir != dir || item.sessionPath != sessionPath {
@@ -2921,14 +3047,14 @@ func (a *App) closeRemovedSessionRuntimesForSessionAfterDestroy(removed []remove
 	}
 }
 
-func (a *App) closeRemainingRemovedSessionRuntimes(removed []removedSessionRuntime, closed map[control.SessionAPI]bool) {
+func (a *App) closeRemainingRemovedSessionRuntimesAdmissionHeld(removed []removedSessionRuntime, closed map[control.SessionAPI]bool) {
 	releasedTabs := map[*WorkspaceTab]bool{}
 	for _, item := range removed {
 		a.closeRemovedSessionRuntime(item, closed, releasedTabs, false)
 	}
 }
 
-func (a *App) closeRemainingRemovedSessionRuntimesAfterDestroy(removed []removedSessionRuntime, closed map[control.SessionAPI]bool) {
+func (a *App) closeRemainingRemovedSessionRuntimesAfterDestroyAdmissionHeld(removed []removedSessionRuntime, closed map[control.SessionAPI]bool) {
 	releasedTabs := map[*WorkspaceTab]bool{}
 	for _, item := range removed {
 		a.closeRemovedSessionRuntime(item, closed, releasedTabs, true)
@@ -3892,6 +4018,7 @@ func promptHistoryFallbackMillis(path string, info os.FileInfo) int64 {
 
 func promptHistoryEventMillis(rec previewEventRecord) (int64, bool) {
 	for _, raw := range []json.RawMessage{
+		rec.TS,
 		rec.Time,
 		rec.Timestamp,
 		rec.CreatedAt,
@@ -4083,6 +4210,7 @@ func (a *App) RemoveWorkspace(dir string) error {
 	// the lock is released. Project bookkeeping, the fallback controller build,
 	// and notifications run after release.
 	if err := func() error {
+		defer a.lockRuntimeMutation("remove-workspace")()
 		a.sessionRemovalMu.Lock()
 		defer a.sessionRemovalMu.Unlock()
 
@@ -4180,10 +4308,10 @@ func (a *App) RemoveWorkspace(dir string) error {
 		a.mu.Unlock()
 
 		for _, tab := range closeTabs {
-			a.closeTabRuntime(tab)
+			a.closeTabRuntimeAdmissionHeld(tab)
 		}
 		for _, tab := range closeDetached {
-			a.closeTabRuntime(tab)
+			a.closeTabRuntimeAdmissionHeld(tab)
 		}
 		return nil
 	}(); err != nil {
@@ -4312,6 +4440,7 @@ type HistoryMessage struct {
 	Code               string                    `json:"code,omitempty"`
 	SubmitText         string                    `json:"submitText,omitempty"`
 	CheckpointTurn     *int                      `json:"checkpointTurn,omitempty"`
+	CreatedAt          int64                     `json:"createdAt,omitempty"`
 	Reasoning          string                    `json:"reasoning,omitempty"`
 	MemoryCitations    []provider.MemoryCitation `json:"memoryCitations,omitempty"`
 	WorkDurationMs     int64                     `json:"workDurationMs,omitempty"`
@@ -4353,6 +4482,46 @@ type HistoryPage struct {
 	HasOlder   bool             `json:"hasOlder"`
 }
 
+// historyProviderMessagesWithPersistedTimes overlays legacy event-record
+// timestamps onto a copy for display. It deliberately leaves the controller's
+// provider transcript untouched: timestamp migration must not change session
+// digests, conflict detection, or model-request cache prefixes.
+func historyProviderMessagesWithPersistedTimes(msgs []provider.Message, sessionPath string) []provider.Message {
+	if len(msgs) == 0 || strings.TrimSpace(sessionPath) == "" {
+		return msgs
+	}
+	needsPersistedTime := false
+	for _, msg := range msgs {
+		if msg.Role == provider.RoleUser && msg.CreatedAt <= 0 && agent.IsUserAuthoredTurn(msg.Content) {
+			needsPersistedTime = true
+			break
+		}
+	}
+	if !needsPersistedTime {
+		return msgs
+	}
+	users, err := agent.LoadSessionUserMessages(sessionPath)
+	if err != nil || len(users) == 0 {
+		return msgs
+	}
+	out := append([]provider.Message(nil), msgs...)
+	userIndex := 0
+	for i := range out {
+		if out[i].Role != provider.RoleUser {
+			continue
+		}
+		if userIndex >= len(users) {
+			break
+		}
+		user := users[userIndex]
+		userIndex++
+		if out[i].CreatedAt <= 0 && !user.At.IsZero() {
+			out[i].CreatedAt = user.At.UnixMilli()
+		}
+	}
+	return out
+}
+
 // History returns the session's message log.
 func (a *App) History() []HistoryMessage {
 	return a.HistoryForTab("")
@@ -4383,9 +4552,9 @@ func (a *App) HistoryPageForTab(tabID string, beforeTurn, limit int) HistoryPage
 		}
 		return page
 	}
-	msgs := ctrl.History()
 	dir := controllerSessionDir(ctrl)
 	path := ctrl.SessionPath()
+	msgs := historyProviderMessagesWithPersistedTimes(ctrl.History(), path)
 	return historyPageFromProviderMessages(
 		msgs,
 		sessionDisplayResolver(dir, path),
@@ -4476,9 +4645,9 @@ func (a *App) HistoryForTab(tabID string) []HistoryMessage {
 		}
 		return messages
 	}
-	msgs := ctrl.History()
 	dir := controllerSessionDir(ctrl)
 	path := ctrl.SessionPath()
+	msgs := historyProviderMessagesWithPersistedTimes(ctrl.History(), path)
 	return historyMessagesWithPlannerDisplays(
 		msgs,
 		sessionDisplayResolver(dir, path),
@@ -4546,7 +4715,14 @@ func historyMessagesWithPlannerDisplaysAndLookups(
 ) []HistoryMessage {
 	out := make([]HistoryMessage, 0, len(msgs))
 	plannerByUserHash := plannerTurnsByUserHash(plannerTurns)
+	suppressCanonicalTurn := false
 	for index, m := range msgs {
+		if suppressCanonicalTurn {
+			if m.Role != provider.RoleUser || !agent.IsUserAuthoredTurn(m.Content) {
+				continue
+			}
+			suppressCanonicalTurn = false
+		}
 		content := m.Content
 		var checkpointTurn *int
 		if m.Role == provider.RoleUser {
@@ -4570,10 +4746,14 @@ func historyMessagesWithPlannerDisplaysAndLookups(
 			}
 		}
 		reasoning := ""
-		if m.Role == provider.RoleAssistant {
+		if m.Role == provider.RoleAssistant || m.LocalOnly {
 			reasoning = m.ReasoningContent
 		}
-		hm := HistoryMessage{Role: string(m.Role), Content: content, CheckpointTurn: checkpointTurn, Reasoning: reasoning, WorkDurationMs: m.WorkDurationMs}
+		displayRole := string(m.Role)
+		if m.LocalOnly {
+			displayRole = "assistant"
+		}
+		hm := HistoryMessage{Role: displayRole, Content: content, CheckpointTurn: checkpointTurn, CreatedAt: m.CreatedAt, Reasoning: reasoning, WorkDurationMs: m.WorkDurationMs}
 		if m.Role == provider.RoleAssistant && len(m.MemoryCitations) > 0 {
 			hm.MemoryCitations = append([]provider.MemoryCitation(nil), m.MemoryCitations...)
 		}
@@ -4589,7 +4769,7 @@ func historyMessagesWithPlannerDisplaysAndLookups(
 				hm.SubmitText = m.Content
 			}
 		}
-		if m.Role == provider.RoleAssistant && len(m.ToolCalls) > 0 {
+		if (m.Role == provider.RoleAssistant || m.LocalOnly) && len(m.ToolCalls) > 0 {
 			hm.ToolCalls = make([]HistoryToolCall, len(m.ToolCalls))
 			for i, tc := range m.ToolCalls {
 				args := tc.Arguments
@@ -4601,20 +4781,39 @@ func historyMessagesWithPlannerDisplaysAndLookups(
 				hm.ToolCalls[i] = historyToolCall(tc, args, toolResults[tc.ID])
 			}
 		}
-		if m.Role == provider.RoleTool {
+		if m.Role == provider.RoleTool && !m.LocalOnly {
 			hm.ToolCallID = m.ToolCallID
 			hm.ToolName = m.Name
 			hm.Content, hm.ToolResultArchived, hm.ToolResultError = historyToolResultContent(m.Content, m.ToolCallID != "")
 		}
-		out = append(out, hm)
+		hasVisibleLocalContent := strings.TrimSpace(hm.Content) != "" || strings.TrimSpace(hm.Reasoning) != "" || len(hm.ToolCalls) > 0 || (!m.LocalOnly && m.Role == provider.RoleTool)
+		if !m.LocalOnly || hasVisibleLocalContent {
+			out = append(out, hm)
+		}
+		if m.LocalOnly && m.InterruptedTurn != nil {
+			out = append(out, HistoryMessage{
+				Role: "notice", Level: "info", Code: event.NoticeCodeCancelledTurn,
+				Content: "This turn was interrupted. Partial output is kept for reference; only completed tool pairs and a bounded recovery summary enter the next model turn. Inspect the workspace before continuing or reverting changes.",
+			})
+		}
 		if m.Role == provider.RoleUser {
 			if turns := plannerByUserHash[messageDisplayKey(m.Content)]; len(turns) > 0 {
 				out = append(out, cloneHistoryMessages(turns[0].Messages)...)
+				suppressCanonicalTurn = plannerDisplaySuppressesCanonical(turns[0])
 				plannerByUserHash[messageDisplayKey(m.Content)] = turns[1:]
 			}
 		}
 	}
 	return out
+}
+
+func plannerDisplaySuppressesCanonical(turn plannerDisplayTurn) bool {
+	for _, message := range turn.Messages {
+		if message.Role == "notice" && message.Code == event.NoticeCodeCancelledTurn {
+			return true
+		}
+	}
+	return false
 }
 
 func historyPageFromProviderMessages(
@@ -5027,7 +5226,7 @@ func previewSessionMessages(sessionDir, path string) ([]HistoryMessage, error) {
 		return nil, err
 	}
 	return historyMessagesWithPlannerDisplays(
-		loaded.Snapshot(),
+		historyProviderMessagesWithPersistedTimes(loaded.Snapshot(), sessionPath),
 		sessionDisplayResolver(sessionDir, sessionPath),
 		sessionPlannerDisplayTurns(sessionDir, sessionPath),
 		nil,
@@ -5050,7 +5249,7 @@ func previewSessionPage(sessionDir, path string, beforeTurn, limit int) (History
 		return HistoryPage{}, err
 	}
 	return historyPageFromProviderMessages(
-		loaded.Snapshot(),
+		historyProviderMessagesWithPersistedTimes(loaded.Snapshot(), sessionPath),
 		sessionDisplayResolver(sessionDir, sessionPath),
 		sessionPlannerDisplayTurns(sessionDir, sessionPath),
 		nil,
@@ -5063,6 +5262,7 @@ type previewEventRecord struct {
 	Kind             string                    `json:"kind"`
 	Type             string                    `json:"type"`
 	Role             string                    `json:"role"`
+	TS               json.RawMessage           `json:"ts"`
 	Time             json.RawMessage           `json:"time"`
 	Timestamp        json.RawMessage           `json:"timestamp"`
 	CreatedAt        json.RawMessage           `json:"createdAt"`
@@ -5140,7 +5340,11 @@ func previewEventSessionMessages(path string) ([]HistoryMessage, bool, error) {
 		switch eventName {
 		case "user.message":
 			if rec.Text != "" {
-				out = append(out, HistoryMessage{Role: "user", Content: rec.Text})
+				hm := HistoryMessage{Role: "user", Content: rec.Text}
+				if at, ok := promptHistoryEventMillis(rec); ok {
+					hm.CreatedAt = at
+				}
+				out = append(out, hm)
 			}
 		case "model.final":
 			hm := HistoryMessage{Role: "assistant", Content: rec.Content, Reasoning: firstNonEmpty(rec.Reasoning, rec.ReasoningContent)}
@@ -5960,20 +6164,11 @@ type ServerView struct {
 	DefaultToolsApprovalMode string                          `json:"defaultToolsApprovalMode,omitempty"`
 	ToolPolicies             map[string]config.MCPToolPolicy `json:"toolPolicies,omitempty"`
 	ApprovalsReviewer        string                          `json:"approvalsReviewer,omitempty"`
+	RequiresLaunchApproval   bool                            `json:"requiresLaunchApproval,omitempty"`
 	AuthStatus               string                          `json:"authStatus,omitempty"`
 	AuthURL                  string                          `json:"authUrl,omitempty"`
 	AuthConfigured           bool                            `json:"authConfigured,omitempty"`
 	ManagedByPlugin          string                          `json:"managedByPlugin,omitempty"`
-	TrustState               string                          `json:"trustState"`
-	TrustSource              string                          `json:"trustSource,omitempty"`
-	TrustScope               string                          `json:"trustScope,omitempty"`
-	IsolationState           string                          `json:"isolationState"`
-	IsolationReason          string                          `json:"isolationReason,omitempty"`
-	IdentityChanged          bool                            `json:"identityChanged,omitempty"`
-	ChangedTools             []string                        `json:"changedTools"`
-	ToolChanges              []MCPToolTrustChangeView        `json:"toolChanges"`
-	CatalogSequence          uint64                          `json:"catalogSequence,omitempty"`
-	VerifiedVersion          string                          `json:"verifiedVersion,omitempty"`
 }
 
 type ToolView struct {
@@ -5982,34 +6177,6 @@ type ToolView struct {
 	ReadOnlyHint    bool   `json:"readOnlyHint,omitempty"`
 	DestructiveHint bool   `json:"destructiveHint,omitempty"`
 	SchemaError     string `json:"schemaError,omitempty"`
-	TrustedReader   bool   `json:"trustedReader,omitempty"`
-}
-
-type MCPTrustInspectionView struct {
-	Name            string                   `json:"name"`
-	TrustState      string                   `json:"trustState"`
-	TrustSource     string                   `json:"trustSource,omitempty"`
-	TrustScope      string                   `json:"trustScope,omitempty"`
-	IsolationState  string                   `json:"isolationState"`
-	IsolationReason string                   `json:"isolationReason,omitempty"`
-	IdentityChanged bool                     `json:"identityChanged,omitempty"`
-	ChangedTools    []string                 `json:"changedTools"`
-	ToolChanges     []MCPToolTrustChangeView `json:"toolChanges"`
-	Readers         []string                 `json:"readers"`
-	Writers         []string                 `json:"writers"`
-	Destructive     []string                 `json:"destructive"`
-}
-
-type MCPToolTrustChangeView struct {
-	Name string `json:"name"`
-	Kind string `json:"kind"`
-}
-
-type MCPCatalogRefreshView struct {
-	Source   string `json:"source"`
-	Sequence uint64 `json:"sequence"`
-	Offline  bool   `json:"offline"`
-	Stale    bool   `json:"stale"`
 }
 
 // SkillView is one discoverable skill for the drawer. Also backs the
@@ -6025,7 +6192,10 @@ type SkillView struct {
 	Model        string   `json:"model,omitempty"`
 	Effort       string   `json:"effort,omitempty"`
 	AllowedTools []string `json:"allowedTools,omitempty"`
-	Color        string   `json:"color,omitempty"`
+	// ReadOnly mirrors frontmatter read-only; omitted/false keeps the legacy
+	// writable default for older profiles.
+	ReadOnly bool   `json:"readOnly,omitempty"`
+	Color    string `json:"color,omitempty"`
 	// Invocation is the user-facing slash name; InvocationMode preserves the
 	// frontmatter policy used by the subagent profile editor.
 	Invocation     string `json:"invocation,omitempty"`
@@ -6086,97 +6256,136 @@ func (a *App) MCPServers() []ServerView {
 	return a.mcpServersView()
 }
 
-// InspectMCPTrust performs only initialize/tools-list when the server is not
-// already connected. No MCP tool is invoked.
-func (a *App) InspectMCPTrust(name string) (MCPTrustInspectionView, error) {
-	ctrl := a.activeCtrl()
-	if ctrl == nil {
-		return MCPTrustInspectionView{}, fmt.Errorf("no active session")
+// lockRuntimeMutation serializes controller rebuild/teardown operations and
+// freezes runtime admission so a captured controller or Host cannot be replaced
+// or closed in flight. The caller must not hold App.mu; the lock order is
+// runtimeRebuildMu -> runtimeAdmissionMu -> App/Host/Registry.
+func (a *App) lockRuntimeMutation(operation string) func() {
+	if hook := a.runtimeMutationBeforeLockHook; hook != nil {
+		hook(operation)
 	}
-	var inspection plugin.TrustInspection
-	var err error
-	if host := ctrl.Host(); host != nil && host.HasClient(name) {
-		inspection, err = host.InspectTrust(name)
-	} else {
-		var spec plugin.Spec
-		spec, err = a.mcpTrustSpec(name)
-		if err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			inspection, err = plugin.InspectSpec(ctx, spec)
-		}
+	a.runtimeRebuildMu.Lock()
+	a.runtimeAdmissionMu.Lock()
+	return func() {
+		a.runtimeAdmissionMu.Unlock()
+		a.runtimeRebuildMu.Unlock()
 	}
-	if err != nil {
-		return MCPTrustInspectionView{}, err
-	}
-	a.recordMCPSecurityMetric("mcp_trust_prompt", "total")
-	if inspection.Security.IdentityChanged {
-		a.recordMCPSecurityMetric("mcp_trust_drift", "identity")
-	} else if len(inspection.Security.ChangedTools) > 0 {
-		a.recordMCPSecurityMetric("mcp_trust_drift", "capability")
-	}
-	if inspection.Security.IsolationState == mcptrust.IsolationUnavailableUnconfined {
-		a.recordMCPSecurityMetric("mcp_isolation", "unavailable_unconfined")
-	}
-	return mcpTrustInspectionView(inspection), nil
 }
 
-// SetMCPTrust grants session/workspace trust or revokes it. The receipt remains
-// host-local and never modifies the project MCP configuration.
-func (a *App) SetMCPTrust(name, decision string) error {
-	a.runtimeRebuildMu.Lock()
-	defer a.runtimeRebuildMu.Unlock()
+// lockMCPMutation is the MCP-specific spelling retained at lifecycle call sites.
+func (a *App) lockMCPMutation(operation string) func() {
+	return a.lockRuntimeMutation(operation)
+}
 
-	ctrl := a.activeCtrl()
-	if ctrl == nil {
+// AuthorizeAndConnectMCPServer is the normal repository-config flow: record
+// durable consent for the exact command or endpoint, then establish one live
+// connection. Unlike the removed multi-step API it never starts a temporary MCP
+// process to inspect tools before connecting the real runtime.
+func (a *App) AuthorizeAndConnectMCPServer(name string) error {
+	defer a.lockMCPMutation("authorize-connect")()
+
+	tab, ctrl, root := a.activeMCPRuntime()
+	if tab == nil || ctrl == nil {
 		return fmt.Errorf("no active session")
 	}
-	decision = strings.ToLower(strings.TrimSpace(decision))
-	host := ctrl.Host()
-	controllers := a.mcpControllersSharingHost(host, name, ctrl)
-	for _, target := range controllers {
-		if controllerHasActiveRuntimeWork(target.ctrl) {
-			return rebuildControllerActiveWorkError("MCP trust")
-		}
-	}
-	if decision != "workspace" && host != nil && host.HasClient(name) {
-		if err := host.SetTrust(name, decision); err != nil {
-			return err
-		}
-		a.recordMCPSecurityMetric("mcp_trust_source", decision)
-		return nil
-	}
-	spec, err := a.mcpTrustSpec(name)
+	host, releaseGates, err := a.lockMCPHostTurnGates("MCP authorization", ctrl)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := plugin.SetSpecTrust(ctx, spec, decision); err != nil {
-		return err
-	}
-	if decision != "workspace" || host == nil || !host.HasClient(name) {
-		a.recordMCPSecurityMetric("mcp_trust_source", decision)
-		return nil
-	}
-	entry, found, err := a.desktopMCPServerForEdit(name)
+	defer releaseGates()
+	entry, found, err := desktopEffectiveMCPServer(root, name)
 	if err != nil {
 		return err
 	}
 	if !found {
-		return fmt.Errorf("trusted MCP server %q but could not reload its configuration", name)
+		return fmt.Errorf("no configured MCP server named %q", name)
 	}
-	// Every controller sharing this Host has its own provider-visible Registry.
-	// Hide the old tools in all of them before replacing the one shared client;
-	// otherwise sibling tabs keep remoteTool values backed by the closed client.
+	spec, err := a.mcpLaunchSpec(root, name)
+	if err != nil {
+		return err
+	}
+	if !spec.RequireLaunchApproval {
+		return fmt.Errorf("MCP server %q was explicitly installed and does not need project authorization", name)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := plugin.AuthorizeProjectSpecLaunch(ctx, spec); err != nil {
+		return err
+	}
+
+	controllers := a.mcpControllersSharingHost(host, name, ctrl)
+	for i := range controllers {
+		if controllers[i].ctrl == ctrl {
+			controllers[i].enabled = true
+		}
+	}
+	// A connected process can only represent the previous approved identity.
+	// Drop it after the new grant is durable, then start the configured server
+	// once and refresh every enabled registry sharing this Host.
+	disconnectMCPServerControllers(name, ctrl, controllers)
+	if host != nil {
+		host.ClearFailure(name)
+	}
+	if err := reconnectMCPServerControllers(entry, controllers); err != nil {
+		recordMCPFailure(ctrl, entry, err)
+		return err
+	}
+	a.mu.Lock()
+	delete(tab.disabledMCP, name)
+	a.mu.Unlock()
+	return nil
+}
+
+type mcpControllerTarget struct {
+	ctrl    control.SessionAPI
+	enabled bool
+}
+
+// lockMCPHostTurnGates freezes every runtime sharing ctrl's Host. Callers hold
+// lockMCPMutation, so runtimeAdmissionMu's write side already prevents new turn
+// admissions, builds, and teardown while this helper snapshots and gates the
+// existing runtimes.
+func (a *App) lockMCPHostTurnGates(setting string, ctrl control.SessionAPI) (*plugin.Host, func(), error) {
+	if ctrl == nil {
+		return nil, nil, fmt.Errorf("no active session")
+	}
+	host := ctrl.Host()
+	release, err := a.lockRuntimeTurnGates(setting, func(tab *WorkspaceTab) bool {
+		if host == nil {
+			return tab.Ctrl == ctrl
+		}
+		return tab.Ctrl != nil && tab.Ctrl.Host() == host
+	})
+	return host, release, err
+}
+
+func disconnectMCPServerControllers(name string, preferred control.SessionAPI, controllers []mcpControllerTarget) bool {
 	for _, target := range controllers {
 		target.ctrl.UnregisterMCPServerTools(name)
 	}
-	ctrl.DisconnectMCPServer(name)
+	return preferred != nil && preferred.DisconnectMCPServer(name)
+}
 
-	// Establish the exact locked server once, then have every enabled sibling
-	// attach to that shared client and refresh its own Registry. Per-tab disabled
-	// state is preserved: those registries remain suspended.
+func (a *App) clearMCPServerTabState(name string, controllers []mcpControllerTarget) {
+	selected := make(map[control.SessionAPI]bool, len(controllers))
+	for _, target := range controllers {
+		selected[target.ctrl] = true
+	}
+	a.mu.Lock()
+	for _, tab := range a.runtimeTabsLocked() {
+		if tab == nil || !selected[tab.Ctrl] {
+			continue
+		}
+		delete(tab.disabledMCP, name)
+		tab.mcpOrder = removeServerOrder(tab.mcpOrder, name)
+	}
+	a.mu.Unlock()
+}
+
+// reconnectMCPServerControllers establishes one shared client, then refreshes
+// every enabled controller's provider-visible Registry. Disabled tabs remain
+// suspended and reconnect only when explicitly enabled.
+func reconnectMCPServerControllers(entry config.PluginEntry, controllers []mcpControllerTarget) error {
 	var startErrors []error
 	connectedTarget := -1
 	for i, target := range controllers {
@@ -6191,15 +6400,9 @@ func (a *App) SetMCPTrust(name, decision string) error {
 		break
 	}
 	if connectedTarget < 0 {
-		if len(startErrors) == 0 {
-			// All tabs disabled this server. Keeping it disconnected preserves
-			// their explicit UI state; enabling a tab will reconnect on demand.
-			a.recordMCPSecurityMetric("mcp_trust_source", decision)
-			return nil
-		}
-		err := errors.Join(startErrors...)
-		recordMCPFailure(ctrl, entry, err)
-		return fmt.Errorf("MCP trust was saved, but reconnecting the exact locked server failed: %w", err)
+		// All tabs may have disabled this server. Keeping it disconnected
+		// preserves their explicit state.
+		return errors.Join(startErrors...)
 	}
 
 	var refreshErrors []error
@@ -6211,18 +6414,7 @@ func (a *App) SetMCPTrust(name, decision string) error {
 			refreshErrors = append(refreshErrors, err)
 		}
 	}
-	if len(refreshErrors) > 0 {
-		err := errors.Join(refreshErrors...)
-		recordMCPFailure(ctrl, entry, err)
-		return fmt.Errorf("MCP trust was saved, but refreshing one or more tabs failed: %w", err)
-	}
-	a.recordMCPSecurityMetric("mcp_trust_source", decision)
-	return nil
-}
-
-type mcpControllerTarget struct {
-	ctrl    control.SessionAPI
-	enabled bool
+	return errors.Join(refreshErrors...)
 }
 
 // mcpControllersSharingHost snapshots visible and detached runtimes before
@@ -6230,7 +6422,17 @@ type mcpControllerTarget struct {
 // locks or network work. preferred (normally the active tab) is returned first.
 func (a *App) mcpControllersSharingHost(host *plugin.Host, name string, preferred control.SessionAPI) []mcpControllerTarget {
 	if host == nil {
-		return []mcpControllerTarget{{ctrl: preferred, enabled: true}}
+		enabled := true
+		a.mu.RLock()
+		for _, tab := range a.runtimeTabsLocked() {
+			if tab != nil && tab.Ctrl == preferred {
+				_, disabled := tab.disabledMCP[name]
+				enabled = !disabled
+				break
+			}
+		}
+		a.mu.RUnlock()
+		return []mcpControllerTarget{{ctrl: preferred, enabled: enabled}}
 	}
 	a.mu.RLock()
 	candidates := make([]mcpControllerTarget, 0, len(a.tabs)+len(a.detachedSessions))
@@ -6265,64 +6467,78 @@ func (a *App) mcpControllersSharingHost(host *plugin.Host, name string, preferre
 	return targets
 }
 
-func (a *App) RefreshMCPCatalog() (MCPCatalogRefreshView, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	result, err := (mcpcatalog.Loader{CacheDir: config.CacheDir()}).Load(ctx, true)
-	if err != nil {
-		a.recordMCPSecurityMetric("mcp_catalog_verify", "failed")
-		return MCPCatalogRefreshView{}, err
-	}
-	if result.Source == mcpcatalog.SourceRemote {
-		a.recordMCPSecurityMetric("mcp_catalog_verify", "remote_valid")
-	} else {
-		a.recordMCPSecurityMetric("mcp_catalog_verify", "offline_snapshot")
-	}
-	// A manual refresh is an explicit security action, so apply newly fetched
-	// revocations to every live shared host immediately instead of waiting for a
-	// restart or the six-hour background refresh window.
+// lockRuntimeTurnGates locks the turn gate of every runtime tab selected by
+// affected (nil selects all visible and detached runtime tabs) in stable tab-ID
+// order, then verifies under the gates that no gated controller has active
+// runtime work. Callers must hold runtimeRebuildMu and the write side of
+// runtimeAdmissionMu (normally through lockMCPMutation), which freezes new turn
+// admission, controller builds, and runtime teardown before this snapshot.
+// On success the returned release func unlocks the per-tab gates in reverse
+// order; on error every gate acquired here is already unlocked.
+func (a *App) lockRuntimeTurnGates(setting string, affected func(*WorkspaceTab) bool) (func(), error) {
 	a.mu.RLock()
-	controllers := make([]control.SessionAPI, 0, len(a.tabs)+len(a.detachedSessions))
+	all := a.runtimeTabsLocked()
+	tabs := make([]*WorkspaceTab, 0, len(all))
+	for _, tab := range all {
+		if tab == nil || (affected != nil && !affected(tab)) {
+			continue
+		}
+		tabs = append(tabs, tab)
+	}
+	a.mu.RUnlock()
+	sort.Slice(tabs, func(i, j int) bool { return tabs[i].ID < tabs[j].ID })
+	locked := 0
+	release := func() {
+		for i := locked - 1; i >= 0; i-- {
+			tabs[i].turnStartMu.Unlock()
+		}
+	}
+	for _, tab := range tabs {
+		tab.turnStartMu.Lock()
+		locked++
+	}
+	// Read tab.Ctrl under a.mu rather than through controllerForTab: detached
+	// runtimes live in detachedSessions, not a.tabs, and their work counts too.
+	a.mu.RLock()
+	for _, tab := range tabs {
+		if controllerHasActiveRuntimeWork(tab.Ctrl) {
+			a.mu.RUnlock()
+			release()
+			return nil, rebuildControllerActiveWorkError(setting)
+		}
+	}
+	a.mu.RUnlock()
+	return release, nil
+}
+
+// disconnectMCPServerAllRuntimes removes an uninstalled MCP server from every
+// live runtime: all visible and detached runtime tabs, across every shared
+// Host — a global plugin uninstall must not leave sibling tabs exposing stale
+// provider-visible tools or other workspaces running the removed server.
+// DisconnectMCPServer stops the shared client once per Host and drops the tool
+// prefix from every other controller's registry.
+func (a *App) disconnectMCPServerAllRuntimes(serverName string) bool {
+	a.mu.RLock()
+	ctrls := make([]control.SessionAPI, 0, len(a.tabs)+len(a.detachedSessions))
+	seen := make(map[control.SessionAPI]bool, len(a.tabs)+len(a.detachedSessions))
 	for _, tab := range a.runtimeTabsLocked() {
-		if tab != nil && tab.Ctrl != nil {
-			controllers = append(controllers, tab.Ctrl)
+		if tab == nil || tab.Ctrl == nil || seen[tab.Ctrl] {
+			continue
 		}
+		seen[tab.Ctrl] = true
+		ctrls = append(ctrls, tab.Ctrl)
 	}
 	a.mu.RUnlock()
-	hosts := map[*plugin.Host]struct{}{}
-	for _, ctrl := range controllers {
-		if host := ctrl.Host(); host != nil {
-			hosts[host] = struct{}{}
+	disconnected := false
+	for _, ctrl := range ctrls {
+		if ctrl.DisconnectMCPServer(serverName) {
+			disconnected = true
 		}
 	}
-	revoked := result.Index.RevokedEntryIDs()
-	for host := range hosts {
-		host.ApplyCatalogRevocations(revoked)
-	}
-	return MCPCatalogRefreshView{Source: string(result.Source), Sequence: result.Index.Sequence, Offline: result.Offline, Stale: result.Stale}, nil
+	return disconnected
 }
 
-func (a *App) recordMCPSecurityMetric(signal, bucket string) {
-	if version == "dev" {
-		return
-	}
-	if metrics := a.metrics.Load(); metrics != nil {
-		metrics.inc(signal, bucket)
-		metrics.persist()
-	}
-}
-
-func (a *App) mcpTrustSpec(name string) (plugin.Spec, error) {
-	a.mu.RLock()
-	tab := a.activeTabLocked()
-	root := ""
-	if tab != nil {
-		root = tab.WorkspaceRoot
-	}
-	a.mu.RUnlock()
-	if tab == nil {
-		return plugin.Spec{}, fmt.Errorf("no active workspace")
-	}
+func (a *App) mcpLaunchSpec(root, name string) (plugin.Spec, error) {
 	cfg, err := config.LoadForRoot(root)
 	if err != nil {
 		return plugin.Spec{}, err
@@ -6339,35 +6555,16 @@ func (a *App) mcpTrustSpec(name string) (plugin.Spec, error) {
 	}
 	specs := boot.PluginSpecsForRootWithOptions([]config.PluginEntry{*entry}, root, boot.PluginSpecOptions{
 		DefaultCallTimeout: time.Duration(cfg.MCPCallTimeoutSeconds()) * time.Second,
-		TrustManager:       mcptrust.ForWorkspace(config.ReasonixHomeDir(), root),
+		LaunchManager:      mcplaunch.ForWorkspace(config.ReasonixHomeDir(), root),
 		ConfigSource:       "workspace_config", StateHome: config.ReasonixHomeDir(),
 		WriterRoots: cfg.WriteRootsForRoot(root), ForbidReadRoots: boot.RuntimeForbidReadRoots(cfg, root),
 		Network:         cfg.Sandbox.Network,
-		OfficialServers: boot.LoadOfficialMCPTrust(context.Background(), cfg),
+		OfficialServers: boot.LoadVerifiedMCPPackages(context.Background(), cfg),
 	})
 	if len(specs) != 1 {
 		return plugin.Spec{}, fmt.Errorf("failed to build MCP server %q", name)
 	}
 	return specs[0], nil
-}
-
-func mcpTrustInspectionView(in plugin.TrustInspection) MCPTrustInspectionView {
-	return MCPTrustInspectionView{
-		Name: in.Security.Name, TrustState: string(in.Security.TrustState),
-		TrustSource: string(in.Security.TrustSource), TrustScope: string(in.Security.TrustScope),
-		IsolationState: string(in.Security.IsolationState), IsolationReason: in.Security.IsolationReason, IdentityChanged: in.Security.IdentityChanged,
-		ChangedTools: append([]string{}, in.Security.ChangedTools...), Readers: append([]string{}, in.Readers...),
-		ToolChanges: mcpToolTrustChangeViews(in.Security.ToolChanges),
-		Writers:     append([]string{}, in.Writers...), Destructive: append([]string{}, in.Destructive...),
-	}
-}
-
-func mcpToolTrustChangeViews(changes []mcptrust.ToolChange) []MCPToolTrustChangeView {
-	out := make([]MCPToolTrustChangeView, 0, len(changes))
-	for _, change := range changes {
-		out = append(out, MCPToolTrustChangeView{Name: change.Name, Kind: change.Kind})
-	}
-	return out
 }
 
 // SkillsSettings returns the skills management snapshot without MCP status.
@@ -6404,6 +6601,7 @@ func (a *App) SkillsSettings() SkillsSettingsView {
 			Model:            s.Model,
 			Effort:           s.Effort,
 			AllowedTools:     append([]string{}, s.AllowedTools...),
+			ReadOnly:         s.ReadOnly,
 			Color:            s.Color,
 			Invocation:       "/" + s.SlashName(),
 			InvocationMode:   s.Invocation,
@@ -6499,10 +6697,6 @@ func (a *App) mcpServersView() []ServerView {
 		}
 	}
 	if h := ctrl.Host(); h != nil {
-		securityByName := map[string]plugin.SecurityStatus{}
-		for _, status := range h.SecurityStatuses() {
-			securityByName[status.Name] = status
-		}
 		for _, s := range h.Servers() {
 			if disabledView, ok := disabled[s.Name]; ok {
 				disabledView.Status = "disabled"
@@ -6526,7 +6720,6 @@ func (a *App) mcpServersView() []ServerView {
 				HasTools: s.HasTools,
 				ToolList: pluginToolsToView(s.ToolList),
 			}
-			applyMCPTrustStatus(&view, securityByName[s.Name])
 			if p, ok := configured[s.Name]; ok {
 				view = withPluginConfig(view, p)
 			}
@@ -6536,8 +6729,8 @@ func (a *App) mcpServersView() []ServerView {
 			seen[f.Name] = true
 			view := ServerView{
 				Name: f.Name, Transport: f.Transport, Status: "failed", RuntimeState: "issue", Error: f.Error,
+				RequiresLaunchApproval: f.RequiresLaunchApproval,
 			}
-			applyMCPTrustStatus(&view, securityByName[f.Name])
 			if p, ok := configured[f.Name]; ok {
 				view = withPluginConfig(view, p)
 			}
@@ -6587,24 +6780,6 @@ func (a *App) mcpServersView() []ServerView {
 	out = orderServerViews(out, order)
 	for i := range out {
 		out[i].ManagedByPlugin = managedByPlugin[out[i].Name]
-		if out[i].TrustState == "" {
-			out[i].TrustState = string(mcptrust.TrustUntrusted)
-		}
-		if out[i].IsolationState == "" {
-			if out[i].Transport == "http" || out[i].Transport == "streamable-http" || out[i].Transport == "streamable_http" {
-				out[i].IsolationState = string(mcptrust.IsolationNotApplicable)
-			} else if sandbox.Available() {
-				out[i].IsolationState = string(mcptrust.IsolationEnforced)
-			} else {
-				out[i].IsolationState = string(mcptrust.IsolationUnavailableUnconfined)
-			}
-		}
-		if out[i].ChangedTools == nil {
-			out[i].ChangedTools = []string{}
-		}
-		if out[i].ToolChanges == nil {
-			out[i].ToolChanges = []MCPToolTrustChangeView{}
-		}
 	}
 
 	a.mu.Lock()
@@ -6617,25 +6792,6 @@ func (a *App) mcpServersView() []ServerView {
 	}
 	a.mu.Unlock()
 	return out
-}
-
-func applyMCPTrustStatus(view *ServerView, status plugin.SecurityStatus) {
-	if view == nil || status.Name == "" {
-		return
-	}
-	view.TrustState = string(status.TrustState)
-	view.TrustSource = string(status.TrustSource)
-	view.TrustScope = string(status.TrustScope)
-	view.IsolationState = string(status.IsolationState)
-	view.IsolationReason = status.IsolationReason
-	view.IdentityChanged = status.IdentityChanged
-	view.ChangedTools = append([]string{}, status.ChangedTools...)
-	view.ToolChanges = mcpToolTrustChangeViews(status.ToolChanges)
-	view.CatalogSequence = status.CatalogSequence
-	view.VerifiedVersion = status.VerifiedVersion
-	if status.TrustError != "" && view.Error == "" {
-		view.Error = status.TrustError
-	}
 }
 
 func mcpStartIntent(p config.PluginEntry) string {
@@ -6685,6 +6841,8 @@ func withPluginConfig(v ServerView, p config.PluginEntry) ServerView {
 	v.DefaultToolsApprovalMode = p.DefaultToolsApprovalMode
 	v.ToolPolicies = cloneMCPToolPolicies(p.Tools)
 	v.ApprovalsReviewer = p.ApprovalsReviewer
+	// Only a current project launch-gate failure exposes the authorization action.
+	v.RequiresLaunchApproval = p.Source.RequiresLaunchApproval() && v.RequiresLaunchApproval
 	v.AuthConfigured = mcpdiag.HasAuthConfig(p.Headers, p.Env, p.URL)
 	v.EnvKeys = nil
 	v.HeaderKeys = nil
@@ -7127,7 +7285,9 @@ type MCPServerInput struct {
 // AddMCPServer connects a server live and persists it to config (Customize → MCP →
 // Add). Returns the number of tools it exposed.
 func (a *App) AddMCPServer(in MCPServerInput) (int, error) {
-	ctrl := a.activeCtrl()
+	defer a.lockMCPMutation("add")()
+
+	_, ctrl, root := a.activeMCPRuntime()
 	if ctrl == nil {
 		return 0, fmt.Errorf("no active session")
 	}
@@ -7149,9 +7309,10 @@ func (a *App) AddMCPServer(in MCPServerInput) (int, error) {
 		DefaultToolsApprovalMode: mcpStringValue(in.DefaultToolsApprovalMode),
 		Tools:                    cloneMCPToolPolicies(in.ToolPolicies),
 		ApprovalsReviewer:        mcpStringValue(in.ApprovalsReviewer),
+		Source:                   config.MCPSourceUserConfig,
 	}
 	entry, _ = config.NormalizePluginCommandLine(entry)
-	if err := a.saveDesktopMCPServer(entry); err != nil {
+	if err := a.saveDesktopMCPServer(root, entry); err != nil {
 		return 0, err
 	}
 	return ctrl.ConnectMCPServer(entry)
@@ -7160,17 +7321,22 @@ func (a *App) AddMCPServer(in MCPServerInput) (int, error) {
 // UpdateMCPServer edits a persisted external MCP server. The name is the stable
 // identity; callers must remove + add if they want to rename a server.
 func (a *App) UpdateMCPServer(name string, in MCPServerInput) error {
-	ctrl := a.activeCtrl()
-	if ctrl == nil {
+	defer a.lockMCPMutation("update")()
+
+	tab, ctrl, root := a.activeMCPRuntime()
+	if tab == nil || ctrl == nil {
 		return fmt.Errorf("no active session")
 	}
-	if controllerHasActiveRuntimeWork(ctrl) {
-		return rebuildControllerActiveWorkError("MCP server")
+	host, releaseGates, err := a.lockMCPHostTurnGates("MCP server", ctrl)
+	if err != nil {
+		return err
 	}
+	defer releaseGates()
+	controllers := a.mcpControllersSharingHost(host, name, ctrl)
 	if strings.TrimSpace(in.Name) != "" && strings.TrimSpace(in.Name) != name {
 		return fmt.Errorf("renaming MCP servers is not supported; remove and add a new server")
 	}
-	updated, found, err := a.desktopMCPServerForEdit(name)
+	updated, found, err := a.desktopMCPServerForEdit(root, name)
 	if err != nil {
 		return err
 	}
@@ -7214,23 +7380,35 @@ func (a *App) UpdateMCPServer(name string, in MCPServerInput) error {
 		updated.Command = ""
 		updated.Args = nil
 	}
-	if err := a.saveDesktopMCPServer(updated); err != nil {
+	if err := a.saveDesktopMCPServer(root, updated); err != nil {
 		return err
 	}
 
-	a.mu.RLock()
-	tab := a.activeTabLocked()
-	sessionDisabled := false
-	if tab != nil {
-		_, sessionDisabled = tab.disabledMCP[name]
+	enabled := false
+	for _, target := range controllers {
+		enabled = enabled || target.enabled
 	}
-	a.mu.RUnlock()
-	wasConnected := mcpConnected(ctrl, name)
+	wasConnected := host != nil && host.HasClient(name)
 	if wasConnected {
-		ctrl.DisconnectMCPServer(name)
+		disconnectMCPServerControllers(name, ctrl, controllers)
 	}
-	if !sessionDisabled {
-		if _, err := ctrl.ConnectMCPServer(updated); err != nil {
+	if enabled {
+		spec, specErr := a.mcpLaunchSpec(root, name)
+		if specErr != nil {
+			return specErr
+		}
+		if spec.RequireLaunchApproval {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			// Editing project-owned configuration is an explicit user action.
+			// Record the exact launch grant without starting a temporary process
+			// process; reconnectMCPServerControllers performs the single real start.
+			if err := plugin.AuthorizeProjectSpecLaunch(ctx, spec); err != nil {
+				recordMCPFailure(ctrl, updated, err)
+				return nil
+			}
+		}
+		if err := reconnectMCPServerControllers(updated, controllers); err != nil {
 			recordMCPFailure(ctrl, updated, err)
 			return nil
 		}
@@ -7240,31 +7418,33 @@ func (a *App) UpdateMCPServer(name string, in MCPServerInput) error {
 
 // RemoveMCPServer disconnects a live server and drops it from config (the row's ✕).
 func (a *App) RemoveMCPServer(name string) error {
-	tab, ctrl := a.activeTabAndCtrl()
+	defer a.lockMCPMutation("remove")()
+
+	tab, ctrl, root := a.activeMCPRuntime()
 	if tab == nil || ctrl == nil {
 		return fmt.Errorf("no active session")
 	}
-	if controllerHasActiveRuntimeWork(ctrl) {
-		return rebuildControllerActiveWorkError("MCP server")
-	}
-	if err := ensureMCPServerDirectlyWritable(tab.WorkspaceRoot, name); err != nil {
+	host, releaseGates, err := a.lockMCPHostTurnGates("MCP server", ctrl)
+	if err != nil {
 		return err
 	}
-	removed, err := a.removeDesktopMCPServer(tab.WorkspaceRoot, name)
+	defer releaseGates()
+	controllers := a.mcpControllersSharingHost(host, name, ctrl)
+	if err := ensureMCPServerDirectlyWritable(root, name); err != nil {
+		return err
+	}
+	removed, err := a.removeDesktopMCPServer(root, name)
 	if err != nil {
 		return err
 	}
 	if !removed {
 		return fmt.Errorf("no removable MCP server named %q", name)
 	}
-	ctrl.DisconnectMCPServer(name)
-	if h := ctrl.Host(); h != nil {
-		h.ClearFailure(name)
+	disconnectMCPServerControllers(name, ctrl, controllers)
+	if host != nil {
+		host.ClearFailure(name)
 	}
-	a.mu.Lock()
-	delete(tab.disabledMCP, name)
-	tab.mcpOrder = removeServerOrder(tab.mcpOrder, name)
-	a.mu.Unlock()
+	a.clearMCPServerTabState(name, controllers)
 	return nil
 }
 
@@ -7272,29 +7452,35 @@ func (a *App) RemoveMCPServer(name string) error {
 // a fresh handshake and tool re-registration), then reconnects.  Failures are
 // recorded on the Host so the UI can render them.
 func (a *App) ReconnectMCPServer(name string) error {
-	tab, ctrl := a.activeTabAndCtrl()
+	defer a.lockMCPMutation("reconnect")()
+
+	tab, ctrl, root := a.activeMCPRuntime()
 	if tab == nil || ctrl == nil {
 		return fmt.Errorf("no active session")
 	}
-	if controllerHasActiveRuntimeWork(ctrl) {
-		return rebuildControllerActiveWorkError("MCP server")
-	}
-	ctrl.DisconnectMCPServer(name)
-	if h := ctrl.Host(); h != nil {
-		h.ClearFailure(name)
-	}
-	_, err := a.connectConfiguredMCPServerForTab(tab, name)
+	host, releaseGates, err := a.lockMCPHostTurnGates("MCP server", ctrl)
 	if err != nil {
-		if plugin.IsServerAlreadyConnected(err) {
-			a.mu.Lock()
-			delete(tab.disabledMCP, name)
-			a.mu.Unlock()
-			return nil
+		return err
+	}
+	defer releaseGates()
+	entry, found, err := desktopEffectiveMCPServer(root, name)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("no configured MCP server named %q", name)
+	}
+	controllers := a.mcpControllersSharingHost(host, name, ctrl)
+	for i := range controllers {
+		if controllers[i].ctrl == ctrl {
+			controllers[i].enabled = true
 		}
-		entry := config.PluginEntry{Name: name}
-		if p, found, cfgErr := a.desktopMCPServerForEdit(name); cfgErr == nil && found {
-			entry = p
-		}
+	}
+	disconnectMCPServerControllers(name, ctrl, controllers)
+	if host != nil {
+		host.ClearFailure(name)
+	}
+	if err := reconnectMCPServerControllers(entry, controllers); err != nil {
 		recordMCPFailure(ctrl, entry, err)
 		return err
 	}
@@ -7308,22 +7494,27 @@ func (a *App) ReconnectMCPServer(name string) error {
 // clears the current session's cached connection failure. It does not remove the
 // server itself or try to sign the user out of the third-party browser session.
 func (a *App) ClearMCPServerAuthentication(name string) error {
-	tab, ctrl := a.activeTabAndCtrl()
+	defer a.lockMCPMutation("clear-auth")()
+
+	tab, ctrl, root := a.activeMCPRuntime()
 	if tab == nil || ctrl == nil {
 		return fmt.Errorf("no active session")
 	}
-	if controllerHasActiveRuntimeWork(ctrl) {
-		return rebuildControllerActiveWorkError("MCP server")
-	}
-	if err := ensureMCPServerDirectlyWritable(tab.WorkspaceRoot, name); err != nil {
+	host, releaseGates, err := a.lockMCPHostTurnGates("MCP server", ctrl)
+	if err != nil {
 		return err
 	}
-	if _, _, _, err := config.ClearPluginAuthenticationInSource(name); err != nil {
+	defer releaseGates()
+	controllers := a.mcpControllersSharingHost(host, name, ctrl)
+	if err := ensureMCPServerDirectlyWritable(root, name); err != nil {
 		return err
 	}
-	ctrl.DisconnectMCPServer(name)
-	if h := ctrl.Host(); h != nil {
-		h.ClearFailure(name)
+	if _, _, _, err := config.ClearPluginAuthenticationInSourceForRoot(root, name); err != nil {
+		return err
+	}
+	disconnectMCPServerControllers(name, ctrl, controllers)
+	if host != nil {
+		host.ClearFailure(name)
 	}
 	return nil
 }
@@ -7332,22 +7523,19 @@ func (a *App) ClearMCPServerAuthentication(name string) error {
 // for this session, off disconnects it (config untouched either way — like Claude
 // Code's per-conversation enable/disable, it resets on the next session start).
 func (a *App) SetMCPServerEnabled(name string, enabled bool) error {
-	a.mu.RLock()
-	tab := a.activeTabLocked()
-	var ctrl control.SessionAPI
-	hostKey := ""
-	if tab != nil {
-		ctrl = tab.Ctrl
-		hostKey = tab.SharedHostKey
-	}
-	a.mu.RUnlock()
+	defer a.lockMCPMutation("set-enabled")()
+
+	tab, ctrl, root := a.activeMCPRuntime()
 	if tab == nil || ctrl == nil {
 		return fmt.Errorf("no active session")
 	}
+	a.mu.RLock()
+	hostKey := tab.SharedHostKey
+	a.mu.RUnlock()
 	if controllerHasActiveRuntimeWork(ctrl) {
 		return rebuildControllerActiveWorkError("MCP server")
 	}
-	configuredEntry, hasConfiguredEntry, err := a.desktopMCPServerForEdit(name)
+	configuredEntry, hasConfiguredEntry, err := desktopEffectiveMCPServer(root, name)
 	if err != nil {
 		return err
 	}
@@ -7415,12 +7603,14 @@ func (a *App) connectConfiguredMCPServerForTab(tab *WorkspaceTab, name string) (
 // SetMCPServerTier is kept for old desktop bindings. New config writes drop the
 // retired tier field.
 func (a *App) SetMCPServerTier(name, tier string) error {
+	defer a.lockMCPMutation("set-tier")()
+
 	tier = normalizeMCPTier(tier)
-	tab, ctrl := a.activeTabAndCtrl()
+	tab, ctrl, root := a.activeMCPRuntime()
 	if tab != nil && controllerHasActiveRuntimeWork(ctrl) {
 		return rebuildControllerActiveWorkError("MCP server")
 	}
-	updated, found, err := a.desktopMCPServerForEdit(name)
+	updated, found, err := a.desktopMCPServerForEdit(root, name)
 	if err != nil {
 		return err
 	}
@@ -7432,7 +7622,7 @@ func (a *App) SetMCPServerTier(name, tier string) error {
 		on := true
 		updated.AutoStart = &on
 	}
-	if err := a.saveDesktopMCPServer(updated); err != nil {
+	if err := a.saveDesktopMCPServer(root, updated); err != nil {
 		return err
 	}
 	if tab != nil && ctrl != nil && !mcpConnected(ctrl, name) {
@@ -7447,19 +7637,19 @@ func (a *App) SetMCPServerTier(name, tier string) error {
 	return nil
 }
 
-func (a *App) desktopMCPServerForEdit(name string) (config.PluginEntry, bool, error) {
+func (a *App) desktopMCPServerForEdit(root, name string) (config.PluginEntry, bool, error) {
 	// Read-only lookup of the entry to edit; loads credentials because callers
 	// hand the entry to ConnectMCPServer, which resolves env-based secrets.
 	// The actual config write goes through saveDesktopMCPServer under the
 	// config edit lock.
-	cfg, _, err := a.loadDesktopUserConfigForViewWithCredentials()
+	cfg, _, err := a.loadDesktopUserConfigForViewWithCredentialsForRoot(root)
 	if err != nil {
 		return config.PluginEntry{}, false, err
 	}
 	if p, ok := findPluginEntry(cfg.Plugins, name); ok {
 		return p, true, nil
 	}
-	if merged, err := config.LoadForRoot(a.activeWorkspaceRoot()); err == nil {
+	if merged, err := config.LoadForRoot(root); err == nil {
 		if p, ok := findPluginEntry(merged.Plugins, name); ok {
 			return p, true, nil
 		}
@@ -7467,8 +7657,21 @@ func (a *App) desktopMCPServerForEdit(name string) (config.PluginEntry, bool, er
 	return config.PluginEntry{}, false, nil
 }
 
-func (a *App) saveDesktopMCPServer(entry config.PluginEntry) error {
-	root := a.activeWorkspaceRoot()
+// desktopEffectiveMCPServer returns the same merged entry the runtime starts.
+// Connection lifecycle paths must not use desktopMCPServerForEdit: a project
+// entry intentionally shadows a same-name user entry, while edit paths may
+// promote project configuration into the user config before removing the
+// project override.
+func desktopEffectiveMCPServer(root, name string) (config.PluginEntry, bool, error) {
+	cfg, err := config.LoadForRoot(root)
+	if err != nil {
+		return config.PluginEntry{}, false, err
+	}
+	p, ok := findPluginEntry(cfg.Plugins, name)
+	return p, ok, nil
+}
+
+func (a *App) saveDesktopMCPServer(root string, entry config.PluginEntry) error {
 	if err := ensureMCPServerDirectlyWritable(root, entry.Name); err != nil {
 		return err
 	}
@@ -7481,7 +7684,7 @@ func (a *App) saveDesktopMCPServer(entry config.PluginEntry) error {
 	if err := func() error {
 		unlock := config.LockUserConfigEdits()
 		defer unlock()
-		cfg, path, err := a.loadDesktopUserConfigForEdit()
+		cfg, path, err := a.loadDesktopUserConfigForEditForRoot(root)
 		if err != nil {
 			return err
 		}
@@ -7539,7 +7742,7 @@ func (a *App) desktopMCPServerOwnedByProjectMCPJSON(root, name string) bool {
 	}
 	// Read-only ownership check: only looks for the name in the user config's
 	// plugin list, so no credentials and no config edit lock are needed.
-	cfg, _, err := a.loadDesktopUserConfigForView()
+	cfg, _, err := a.loadDesktopUserConfigForViewForRoot(root)
 	if err == nil {
 		if _, ok := findPluginEntry(cfg.Plugins, name); ok {
 			return false
@@ -7680,22 +7883,18 @@ func findMCPServerView(ctrl control.SessionAPI, name string) (ServerView, bool) 
 			view := ServerView{
 				Name: s.Name, Transport: s.Transport, Status: "connected",
 				Tools: s.Tools, Prompts: s.Prompts, Resources: s.Resources,
-				HasTools:     s.HasTools,
-				ToolList:     pluginToolsToView(s.ToolList),
-				ChangedTools: []string{},
-			}
-			for _, status := range ctrl.Host().SecurityStatuses() {
-				if status.Name == name {
-					applyMCPTrustStatus(&view, status)
-					break
-				}
+				HasTools: s.HasTools,
+				ToolList: pluginToolsToView(s.ToolList),
 			}
 			return view, true
 		}
 	}
 	for _, f := range ctrl.Host().Failures() {
 		if f.Name == name {
-			return ServerView{Name: f.Name, Transport: f.Transport, Status: "failed", Error: f.Error}, true
+			return ServerView{
+				Name: f.Name, Transport: f.Transport, Status: "failed", Error: f.Error,
+				RequiresLaunchApproval: f.RequiresLaunchApproval,
+			}, true
 		}
 	}
 	return ServerView{}, false
@@ -7708,7 +7907,7 @@ func pluginToolsToView(tools []plugin.ToolInfo) []ToolView {
 	out := make([]ToolView, 0, len(tools))
 	for _, t := range tools {
 		out = append(out, ToolView{
-			Name: t.Name, Description: t.Description, ReadOnlyHint: t.ReadOnlyHint, DestructiveHint: t.DestructiveHint, SchemaError: t.SchemaError, TrustedReader: t.TrustedReader,
+			Name: t.Name, Description: t.Description, ReadOnlyHint: t.ReadOnlyHint, DestructiveHint: t.DestructiveHint, SchemaError: t.SchemaError,
 		})
 	}
 	return out
@@ -7858,7 +8057,7 @@ func controllerHasActiveRuntimeWork(ctrl control.SessionAPI) bool {
 type rebuildBusyError struct{ setting string }
 
 func (e *rebuildBusyError) Error() string {
-	return fmt.Sprintf("finish or cancel the current turn, answer pending prompts, and stop background jobs before changing %s", e.setting)
+	return fmt.Sprintf("active work is still running; finish or cancel the current turn, answer pending prompts, and stop background jobs before changing %s", e.setting)
 }
 
 func rebuildControllerActiveWorkError(setting string) error {
@@ -9120,9 +9319,231 @@ func (a *App) SaveExportFile(path, payload string, base64Encoded bool) error {
 		data = []byte(payload)
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return err
+		return exportOperationError("save export file", path, err)
 	}
 	return nil
+}
+
+// SaveExportImageFiles writes one or more base64-encoded image parts. A single
+// image keeps the native save dialog's normal overwrite semantics. Multi-part
+// exports use numbered sibling paths and never overwrite an existing sibling;
+// every payload is staged before any target is committed, and a failed commit
+// removes only files created by this call.
+func (a *App) SaveExportImageFiles(path string, payloads []string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if len(payloads) == 0 {
+		return errors.New("no image payloads to export")
+	}
+	if len(payloads) == 1 {
+		return a.SaveExportFile(path, payloads[0], true)
+	}
+
+	targets := make([]string, len(payloads))
+	for i := range payloads {
+		targets[i] = numberedExportPath(path, i, len(payloads))
+	}
+
+	return saveExclusiveExportPayloads(targets, len(payloads), func(index int) ([]byte, error) {
+		decoded, err := base64.StdEncoding.DecodeString(payloads[index])
+		if err != nil {
+			return nil, fmt.Errorf("decode export image part %d: %w", index+1, err)
+		}
+		return decoded, nil
+	})
+}
+
+type stagedExportFile struct {
+	targetPath string
+	tempPath   string
+}
+
+type committedExportFile struct {
+	path string
+	info os.FileInfo
+}
+
+const exportTempCreateAttempts = 100
+
+func numberedExportPath(path string, partIndex, partCount int) string {
+	if partCount <= 1 {
+		return path
+	}
+	ext := filepath.Ext(path)
+	stem := strings.TrimSuffix(path, ext)
+	return fmt.Sprintf("%s-%d-of-%d%s", stem, partIndex+1, partCount, ext)
+}
+
+func saveExclusiveExportFiles(targets []string, payloads [][]byte) error {
+	return saveExclusiveExportPayloads(targets, len(payloads), func(index int) ([]byte, error) {
+		return payloads[index], nil
+	})
+}
+
+func saveExclusiveExportPayloads(targets []string, payloadCount int, payloadAt func(int) ([]byte, error)) error {
+	if len(targets) == 0 || len(targets) != payloadCount || payloadAt == nil {
+		return errors.New("invalid export image batch")
+	}
+	for _, target := range targets {
+		if _, err := os.Lstat(target); err == nil {
+			return fmt.Errorf("export file already exists: %s", filepath.Base(target))
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return exportOperationError("inspect export target", target, err)
+		}
+	}
+
+	staged := make([]stagedExportFile, 0, len(targets))
+	defer func() {
+		for _, file := range staged {
+			_ = os.Remove(file.tempPath)
+		}
+	}()
+	for i, target := range targets {
+		payload, err := payloadAt(i)
+		if err != nil {
+			return err
+		}
+		file, finalMode, err := createExportTempFile(filepath.Dir(target))
+		if err != nil {
+			return exportOperationError("stage export file", target, err)
+		}
+		tempPath := file.Name()
+		staged = append(staged, stagedExportFile{targetPath: target, tempPath: tempPath})
+		if _, err = file.Write(payload); err == nil {
+			err = file.Sync()
+		}
+		// Keep staged payloads private while they are incomplete, then restore
+		// the same umask-adjusted mode used by SaveExportFile before publishing.
+		if err == nil {
+			err = file.Chmod(finalMode)
+		}
+		if err == nil {
+			err = file.Sync()
+		}
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return exportOperationError("stage export file", target, err)
+		}
+	}
+
+	committed := make([]committedExportFile, 0, len(staged))
+	for _, file := range staged {
+		info, err := commitStagedExportFile(file.tempPath, file.targetPath)
+		if err != nil {
+			rollbackCommittedExportFiles(committed)
+			return exportOperationError("save export file", file.targetPath, err)
+		}
+		committed = append(committed, committedExportFile{path: file.targetPath, info: info})
+	}
+	return nil
+}
+
+// createExportTempFile reserves a cryptographically random sibling path with
+// the same requested mode as a normal export. It immediately narrows the mode
+// while bytes are staged; the caller restores finalMode only after the payload
+// has been completely written and synced.
+func createExportTempFile(dir string) (*os.File, os.FileMode, error) {
+	for attempt := 0; attempt < exportTempCreateAttempts; attempt++ {
+		var suffix [12]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return nil, 0, fmt.Errorf("generate export temp name: %w", err)
+		}
+		path := filepath.Join(dir, ".reasonix-export-"+hex.EncodeToString(suffix[:]))
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		info, err := file.Stat()
+		if err == nil {
+			err = file.Chmod(0o600)
+		}
+		if err != nil {
+			_ = file.Close()
+			_ = os.Remove(path)
+			return nil, 0, err
+		}
+		return file, info.Mode().Perm(), nil
+	}
+	return nil, 0, errors.New("could not reserve a unique export temp file")
+}
+
+func commitStagedExportFile(tempPath, targetPath string) (os.FileInfo, error) {
+	stagedInfo, err := os.Lstat(tempPath)
+	if err != nil {
+		return nil, err
+	}
+	// A hard link publishes a fully written staged file atomically and fails if
+	// the target already exists. Some filesystems do not support hard links, so
+	// fall back to an exclusive create while preserving the no-overwrite rule.
+	if err := os.Link(tempPath, targetPath); err == nil {
+		current, statErr := os.Lstat(targetPath)
+		if statErr != nil {
+			removeExportFileIfSame(targetPath, stagedInfo)
+			return nil, statErr
+		}
+		if !os.SameFile(current, stagedInfo) {
+			return nil, errors.New("export target changed while it was being saved")
+		}
+		return stagedInfo, nil
+	}
+
+	source, err := os.Open(tempPath)
+	if err != nil {
+		return nil, err
+	}
+	defer source.Close()
+	target, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := target.Stat()
+	if statErr == nil {
+		_, err = io.Copy(target, source)
+	}
+	if err == nil && statErr == nil {
+		err = target.Sync()
+	}
+	if closeErr := target.Close(); err == nil && statErr == nil {
+		err = closeErr
+	}
+	if statErr != nil {
+		err = statErr
+	}
+	if err != nil {
+		removeExportFileIfSame(targetPath, info)
+		return nil, err
+	}
+	return info, nil
+}
+
+func rollbackCommittedExportFiles(files []committedExportFile) {
+	for _, file := range files {
+		removeExportFileIfSame(file.path, file.info)
+	}
+}
+
+func removeExportFileIfSame(path string, created os.FileInfo) {
+	if created == nil {
+		return
+	}
+	current, err := os.Lstat(path)
+	if err == nil && os.SameFile(current, created) {
+		_ = os.Remove(path)
+	}
+}
+
+func exportOperationError(operation, path string, err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return fmt.Errorf("%s %s: %v", operation, filepath.Base(path), pathErr.Err)
+	}
+	return fmt.Errorf("%s %s: %w", operation, filepath.Base(path), err)
 }
 
 func safeExportFilename(name string) string {

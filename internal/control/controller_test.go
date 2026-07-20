@@ -740,6 +740,11 @@ func TestSnapshotConflictRecoveryTransplantsInFlightTurnMarker(t *testing.T) {
 	if err := agent.MarkSessionInFlightTurn(path, 2, true); err != nil {
 		t.Fatalf("MarkSessionInFlightTurn: %v", err)
 	}
+	markedMeta, ok, err := agent.LoadBranchMeta(path)
+	if err != nil || !ok || markedMeta.InFlightTurn == nil {
+		t.Fatalf("LoadBranchMeta marked ok=%v err=%v meta=%+v", ok, err, markedMeta)
+	}
+	markedAt := markedMeta.InFlightTurn.StartedAt
 
 	if err := stale.Snapshot(); err != nil {
 		t.Fatalf("Snapshot stale diverged: %v", err)
@@ -765,6 +770,9 @@ func TestSnapshotConflictRecoveryTransplantsInFlightTurnMarker(t *testing.T) {
 	}
 	if recMeta.InFlightTurn.StartMessageIndex != 2 || !recMeta.InFlightTurn.PreserveUser {
 		t.Fatalf("transplanted marker = %+v, want start index 2 with preserve_user", recMeta.InFlightTurn)
+	}
+	if !recMeta.InFlightTurn.StartedAt.Equal(markedAt) {
+		t.Fatalf("transplanted marker time = %v, want original %v", recMeta.InFlightTurn.StartedAt, markedAt)
 	}
 }
 
@@ -815,11 +823,11 @@ func TestRecoverInterruptedTurnSparesTurnContinuedOnRecoveryBranch(t *testing.T)
 	}
 }
 
-// TestRecoverInterruptedTurnStripsGenuineCrash pins the crash-recovery
+// TestRecoverInterruptedTurnPreservesGenuineCrashDisplay pins the crash-recovery
 // behavior the recovery-child guard must not swallow: with no recovery branch
 // in sight, an in-flight marker means the runtime died mid-turn and the
-// partial tail is stripped (preserving the user prompt).
-func TestRecoverInterruptedTurnStripsGenuineCrash(t *testing.T) {
+// partial tail becomes provider-excluded display history.
+func TestRecoverInterruptedTurnPreservesGenuineCrashDisplay(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
 
@@ -841,8 +849,12 @@ func TestRecoverInterruptedTurnStripsGenuineCrash(t *testing.T) {
 	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
 	c.recoverInterruptedTurn(path)
 
-	if got := c.executor.Session().Len(); got != 2 {
-		t.Fatalf("message count after crash recovery = %d, want 2 (sys + preserved user prompt)", got)
+	if got := c.executor.Session().Len(); got != 3 {
+		t.Fatalf("message count after crash recovery = %d, want system + user + local recovery", got)
+	}
+	recovery := c.executor.Session().Snapshot()[2]
+	if !recovery.LocalOnly || recovery.Content != "partial" || recovery.InterruptedTurn == nil || !recovery.InterruptedTurn.Pending {
+		t.Fatalf("crash display/recovery was not retained safely: %+v", recovery)
 	}
 	meta, ok, err := agent.LoadBranchMeta(path)
 	if err != nil || !ok {
@@ -850,6 +862,76 @@ func TestRecoverInterruptedTurnStripsGenuineCrash(t *testing.T) {
 	}
 	if meta.InFlightTurn != nil {
 		t.Fatal("in-flight marker not cleared after crash recovery")
+	}
+}
+
+func TestRecoverInterruptedTurnAfterCompactionRelocatesVisibleTurn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compacted-crash.jsonl")
+
+	orig := agent.NewSession("sys")
+	for i := 0; i < 3; i++ {
+		orig.Add(provider.Message{Role: provider.RoleUser, Content: "old task"})
+		orig.Add(provider.Message{Role: provider.RoleAssistant, Content: "old answer"})
+	}
+	staleStart := orig.Len()
+	if err := orig.Save(path); err != nil {
+		t.Fatalf("Save original: %v", err)
+	}
+	if err := agent.MarkSessionInFlightTurn(path, staleStart, true); err != nil {
+		t.Fatalf("MarkSessionInFlightTurn: %v", err)
+	}
+	meta, ok, err := agent.LoadBranchMeta(path)
+	if err != nil || !ok || meta.InFlightTurn == nil {
+		t.Fatalf("LoadBranchMeta ok=%v err=%v meta=%+v", ok, err, meta)
+	}
+
+	compacted := agent.NewSession("sys")
+	compacted.Add(provider.Message{Role: provider.RoleUser, Content: "<compaction-summary>\nold work\n</compaction-summary>"})
+	compacted.Add(provider.Message{Role: provider.RoleUser, Content: "update a.txt", CreatedAt: meta.InFlightTurn.StartedAt.UnixMilli() + 1})
+	compacted.Add(provider.Message{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{
+		ID: "write-1", Name: "write_file", Arguments: `{"path":"a.txt","content":"ok"}`,
+	}}})
+	compacted.Add(provider.Message{Role: provider.RoleTool, ToolCallID: "write-1", Name: "write_file", Content: "wrote a.txt"})
+	compacted.Add(provider.Message{Role: provider.RoleAssistant, Content: "partial final answer", ReasoningContent: "private partial reasoning"})
+	if compacted.Len() >= staleStart {
+		t.Fatalf("test setup did not stale boundary: compacted=%d start=%d", compacted.Len(), staleStart)
+	}
+	if err := compacted.Save(path); err != nil {
+		t.Fatalf("Save compacted: %v", err)
+	}
+
+	loaded, err := agent.LoadSession(path)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	exec := agent.New(nil, nil, loaded, agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
+	c.recoverInterruptedTurn(path)
+
+	msgs := exec.Session().Snapshot()
+	userCount := 0
+	for _, m := range msgs {
+		if m.Role == provider.RoleUser && StripComposePrefixes(m.Content) == "update a.txt" {
+			userCount++
+		}
+	}
+	if userCount != 1 {
+		t.Fatalf("current user occurrences = %d, want 1: %+v", userCount, msgs)
+	}
+	if len(msgs) != 6 || !agent.IsCompactionSummary(msgs[1]) || msgs[3].Role != provider.RoleAssistant || msgs[4].Role != provider.RoleTool || !msgs[5].LocalOnly {
+		t.Fatalf("crash recovery transcript = %+v", msgs)
+	}
+	recovery := msgs[5].InterruptedTurn
+	if recovery == nil || !recovery.Pending || len(recovery.CompletedTools) != 1 || recovery.CompletedTools[0].Name != "write_file" || !recovery.DroppedPartialText || !recovery.DroppedPartialReasoning {
+		t.Fatalf("crash recovery metadata = %+v", recovery)
+	}
+	meta, ok, err = agent.LoadBranchMeta(path)
+	if err != nil || !ok {
+		t.Fatalf("LoadBranchMeta after recovery ok=%v err=%v", ok, err)
+	}
+	if meta.InFlightTurn != nil {
+		t.Fatalf("in-flight marker survived recovery: %+v", meta.InFlightTurn)
 	}
 }
 
@@ -1111,6 +1193,55 @@ func TestConcurrentSnapshotsShareSingleRecoveryHandoff(t *testing.T) {
 	recoveries := recoveryTranscriptPaths(matches)
 	if len(recoveries) != 1 || recoveries[0] != first.recoveryPath {
 		t.Fatalf("recovery branches = %v err=%v, want only %q", matches, err, first.recoveryPath)
+	}
+}
+
+func TestRecoverShutdownSnapshotPersistsAndReanchorsSession(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	base := agent.NewSession("sys")
+	base.Add(provider.Message{Role: provider.RoleUser, Content: "persisted"})
+	if err := base.SaveSnapshot(path); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	current, err := agent.LoadSession(path)
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	current.Add(provider.Message{Role: provider.RoleAssistant, Content: "shutdown tail"})
+	exec := agent.New(nil, nil, current, agent.Options{}, event.Discard)
+	var handoff SessionRecoveryInfo
+	c := New(Options{
+		Executor:    exec,
+		SessionDir:  dir,
+		SessionPath: path,
+		Label:       "shutdown",
+		OnSessionRecovered: func(info SessionRecoveryInfo) error {
+			handoff = info
+			return nil
+		},
+	})
+
+	recoveryPath, err := c.recoverShutdownSnapshot(path, agent.ErrSessionFileLockHeld)
+	if err != nil {
+		t.Fatalf("recoverShutdownSnapshot: %v", err)
+	}
+	if recoveryPath == "" || recoveryPath == path {
+		t.Fatalf("recovery path = %q, want a distinct session", recoveryPath)
+	}
+	if c.SessionPath() != recoveryPath {
+		t.Fatalf("controller session path = %q, want %q", c.SessionPath(), recoveryPath)
+	}
+	if handoff.OriginalPath != path || handoff.RecoveryPath != recoveryPath || handoff.Reason != "shutdown session file lock timeout" {
+		t.Fatalf("shutdown recovery handoff = %+v", handoff)
+	}
+	recovered, err := agent.LoadSession(recoveryPath)
+	if err != nil {
+		t.Fatalf("load shutdown recovery: %v", err)
+	}
+	if got := recovered.Snapshot(); len(got) != 3 || got[2].Content != "shutdown tail" {
+		t.Fatalf("shutdown recovery transcript = %+v", got)
 	}
 }
 
@@ -2336,6 +2467,21 @@ func TestDisconnectMCPServerRemovesLazyPlaceholder(t *testing.T) {
 	}
 	if _, found := reg.Get("mcp__mock__connect"); found {
 		t.Fatalf("lazy placeholder still registered after disconnect; names=%v", reg.Names())
+	}
+}
+
+func TestAddMCPServerAuthorizesExplicitUserAddBeforeConnecting(t *testing.T) {
+	var configured plugin.Spec
+	c := New(Options{
+		MCPConfigureSpec: func(spec *plugin.Spec) { configured = *spec },
+	})
+
+	if _, err := c.AddMCPServer(config.PluginEntry{Name: "user-added"}); err == nil {
+		t.Fatal("AddMCPServer without a command unexpectedly succeeded")
+	}
+	if configured.ConfigSource != string(config.MCPSourceUserConfig) ||
+		!configured.ImplicitApproval || configured.RequireLaunchApproval {
+		t.Fatalf("configured spec = %+v, want user-authorized add-and-use policy", configured)
 	}
 }
 

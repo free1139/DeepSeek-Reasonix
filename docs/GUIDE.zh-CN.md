@@ -49,7 +49,7 @@ default_model = "deepseek-flash"   # 执行器；设 [agent].planner_model 可�
 
 [ui]
 # shortcut_layout = "desktop"      # classic|desktop；兼容旧配置
-# cursor_shape = "underline"       # block|underline|bar；CLI/TUI 输入光标
+# cursor_shape = "bar"             # block|underline|bar；CLI/TUI 输入光标
 
 [agent]
 reasoning_language = "auto"      # 可见思考过程语言：auto|zh|en
@@ -59,6 +59,8 @@ reasoning_language = "auto"      # 可见思考过程语言：auto|zh|en
 # subagent_model = "deepseek-pro"     # runAs=subagent skill 的默认模型
 # subagent_models = { review = "deepseek-pro", security_review = "deepseek-pro" }
 # max_subagent_depth = 2              # 子代理嵌套委派深度；设为 1 可恢复旧的单层边界
+# max_subagent_concurrency = 6        # 会话级子代理总并发（task/fleet/skills）
+# max_parallel_writers = 3            # 互不重叠 write_paths 时的并行写入上限
 auto_plan = "off"                  # 仅用户级生效；off|on；off 表示计划模式仅手动开启
 # auto_plan_classifier = "deepseek-flash"   # 可选；只在边界任务上调用
 tool_result_snip_ratio = 0.6       # 在摘要 compaction 前先缩短旧工具输出
@@ -125,25 +127,6 @@ bash allowlist 或信任提示。Plan 与常规模式使用相同的 Permissions
 多数日常设置应写在 `config.toml` 或前文提到的 Reasonix 全局 `.env` 中。下面这些变量是进程级高级开关；
 需要在启动 Reasonix 之前设置。项目 `.env` 不是 Reasonix 控制变量的运行时来源。
 
-`REASONIX_MEMORY_COMPILER_LLM_CLASSIFICATION=true` 会为 Memory v5 启用可选的 LLM 任务/聊天分类器。
-默认关闭，此时 Reasonix 使用本地 heuristic classifier，不会产生额外 provider 调用。开启后，分类缓存未命中时，
-Reasonix 可能先通过已配置 provider 发送一个很小的分类请求，再决定用户输入是任务还是普通对话；这会增加少量延迟、
-provider 用量和 token 成本。分类结果会在单个 session 内短时间缓存。只有去掉首尾空白后精确等于 `true`
-才会启用；未设置、`false`、`1`、`TRUE` 都会保持默认 heuristic 路径。
-
-```bash
-REASONIX_MEMORY_COMPILER_LLM_CLASSIFICATION=true reasonix
-```
-
-开发运行时，把变量放在启动进程的命令前，例如：
-
-```bash
-REASONIX_MEMORY_COMPILER_LLM_CLASSIFICATION=true wails dev -forcebuild
-```
-
-从系统图形界面直接启动的打包桌面端通常不会继承交互式终端里的环境变量；如果确实要开启这个高级开关，
-请从受环境变量管理的启动方式打开应用。
-
 ## Serve Web 前端
 
 `reasonix serve` 会用同一个本地 Reasonix 引擎启动浏览器 UI。适合不安装桌面端但想用可视化界面、
@@ -197,6 +180,62 @@ Goal、由 `todo_write` 工具驱动的实时 Todo 面板，以及已配置 prov
 缺少新字段时，工作模式继承 ACP 进程的启动 profile（未传 `--profile` 时为均衡），权限和
 协作方式使用“询问 + 常规”。为兼容旧版混合 mode 列表，`session/set_mode` 仍接受
 `default`（常规 + 询问）和 `auto`（常规 + Yolo），新客户端应使用拆分后的独立选择器。
+
+## 远程 SSH
+
+远程模块让 Reasonix 在远端主机上运行,并通过你自己的 SSH 连接访问它 —— 即 VS Code
+Remote-SSH 式的体验。它在远端主机上引导一个常驻的 headless `reasonix serve`,把本地一个
+回环端口转发过去,再经隧道打开现有的 serve Web 客户端。agent、工具与文件全部原生运行在远端
+主机上,保真度 100%,不经过有损的文件代理。V1 支持 Linux 与 macOS 远端主机。
+
+主机保存在 `config.toml` 的用户级 `[remote]` 段。与 `[secrets]` 一样,项目级
+`reasonix.toml` 无法注入或覆盖远程主机 —— 克隆的仓库永远无法左右 Reasonix 向何处发起 SSH
+连接。凭据沿用 provider 惯例:主机只记录环境变量名(`passphrase_env`、`password_env`),其值
+存放在 Reasonix 全局 `.env` 中;私钥内容本身从不存储 —— `identity_file` 只是路径。
+
+```toml
+[remote]
+[[remote.hosts]]
+name          = "gpu-box"
+host          = "203.0.113.7"
+user          = "dev"
+identity_file = "~/.ssh/id_ed25519"
+workspace     = "~/projects/app"
+serve_install = "auto"            # auto | npm | upload | never
+
+[[remote.hosts.forwards]]
+type   = "local"                  # local (-L) | remote (-R)
+bind   = "127.0.0.1:5432"
+target = "127.0.0.1:5432"
+```
+
+命令行:
+
+```bash
+reasonix remote add gpu-box dev@203.0.113.7 --workspace '~/projects/app'
+reasonix remote import --all              # 从 ~/.ssh/config 导入(跳过 Match 块)
+reasonix remote test gpu-box              # 拨号 + 认证 + 主机密钥确认
+reasonix remote connect gpu-box --open    # 引导 serve、建隧道、打开 URL
+reasonix remote serve status gpu-box
+reasonix remote fs ls gpu-box:'~/projects/app'
+```
+
+`connect` 是前台守护(相当于 `ssh -N` 加上 serve 引导):它保持隧道与已配置的转发存活,断线时
+以指数退避自动重连,并在重连后重新挂载转发。Ctrl-C 只断开本地一侧 —— 远端 serve 继续运行,
+下次 `connect` 会复用它。V1 无后台守护进程。
+
+主机密钥会对照你的 OpenSSH `~/.ssh/known_hosts`(只读)以及 Reasonix 托管的
+`~/.reasonix/remote/known_hosts` 校验。首次见到的密钥会提示 TOFU 确认并记入托管文件;与已记录
+密钥冲突的密钥会硬失败并指明出错的行,绝不自动接受。
+
+远端侧状态位于远端主机的 `~/.reasonix/remote/`:`serve-<工作区 slug>.json`(pid、绑定的回环
+地址、工作区)、`serve-<slug>.token`(0600;认证 token,经 `--token-file` 传给 serve,因此不会
+出现在 `ps` 中)、`serve-<slug>.log`。
+
+在桌面端,于 **设置 -> 远程 SSH** 管理主机,再通过状态栏徽标或主机行的 **远程浏览器** 按钮经
+SFTP 浏览与编辑文件、管理端口转发、启动/打开远程工作区。打开工作区时会创建一个类似 VS Code
+Remote SSH 的独立 Reasonix 原生窗口。主窗口持有 SSH 隧道；远程窗口是隔离的轻量外壳，不会恢复
+或抢占本地对话会话。
 
 ## 自定义 OpenAI-compatible provider
 
@@ -255,7 +294,14 @@ Anthropic-compatible 网关需要的 Bearer 认证、Ollama Cloud max-effort 支
 | 模型能力模式 | 指定 Reasonix 对该 provider 使用哪种 reasoning 请求协议。 | 默认用“自动识别”。只有网关被误判，或模型文档要求特定 reasoning 格式时再切换。 |
 | Thinking 覆盖 | provider 专用的 `thinking.type` 覆盖项。 | 默认用 Auto。只有后端文档明确支持 `enabled`、`disabled` 或 `adaptive` 时再手动指定；不支持的值可能让中转站拒绝请求。 |
 | 余额查询 URL | 可选的钱包余额查询接口。 | 服务商提供余额接口，且希望桌面端状态栏显示余额时填写。 |
-| 上下文窗口 | 该 provider 可保留的最大上下文 token 数。`0` 表示使用模型服务默认值。 | 模型实际上下文大小和 Reasonix 默认值或内置元数据不一致时填写。 |
+| 上下文窗口 | Reasonix 用于自动清理上下文的 provider 级 token 预算。`0` 表示禁用自动 compaction。 | 按该 provider 的模型上下文上限填写；所选模型规格不同时使用下方的逐模型覆盖。 |
+
+每个已选模型还提供一个可选的 **上下文窗口** 输入框。留空时继承 provider
+级设置；填写正整数时只覆盖该模型。这样，同一端点下的长上下文模型不会过早
+compaction，短上下文模型也不会在 Reasonix 清理前被服务端拒绝。
+这里应填写模型文档标注的上下文窗口，而不是最大输出 token。例如 128K 通常填
+`128000`；如果服务商明确标注 `131072`，则按该精确值填写。小于 16384 时界面会
+显示非阻断警告，因为过小的窗口可能导致频繁 compaction 并降低缓存命中率。
 
 模型能力模式选项：
 
@@ -279,14 +325,15 @@ Thinking 覆盖选项：
 
 这里按使用端来写，因为用户通常是先知道“我现在在桌面端/CLI”，再找对应按键。
 桌面端仍用 `Shift+Tab` 切换 Plan；CLI 则用它在 Ask、Auto、Plan 之间循环。
-`Ctrl/Cmd+Y` 只管 YOLO，粘贴继续走系统粘贴快捷键。
+`Ctrl/Cmd+Y` 只管 YOLO。桌面端粘贴继续走系统快捷键；CLI 则把终端原生文本粘贴
+和应用接管的图片粘贴拆成不同快捷键。
 
 `[ui].shortcut_layout` 仍被接受以兼容旧配置，但下面的快捷键行为已经跨布局统一。
 
 CLI/TUI 文本输入可通过 `[ui].cursor_shape` 设置光标形状，支持 `underline`、`block`
-和 `bar`。默认值是 `underline`，因为部分终端中的 block 光标会在中英混排输入时覆盖
-CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设为 `block`，想使用细插入线可设为
-`bar`。该设置不影响桌面端或 Web 输入框。
+和 `bar`。默认值是 `bar`：位置清晰，同时不会在中英混排输入时覆盖 CJK 双宽字符。
+想使用传统终端块状光标可设为 `block`，偏好更弱的下划线光标可设为 `underline`。
+该设置不影响桌面端或 Web 输入框。
 
 ### 桌面端 GUI
 
@@ -334,6 +381,18 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 
 ### CLI / TUI
 
+输入框上下边线使用当前主题强调色，默认光标为细竖线。长草稿会增长到可用的最大高度；
+超过后，在输入框内滚轮只滚动草稿视图，不移动插入光标，在 transcript 区域滚轮仍滚动
+对话。使用 `/theme auto|light|dark` 选择背景模式，也可运行不带参数的 `/theme` 查看
+命名配色，再用 `/theme <style>` 选择强调色。
+
+响应式底栏左侧保留当前 Ask/Auto/Plan 或 YOLO 姿态和交互状态；终端较宽时，模型、推理
+强度和工作模式作为一组靠右显示，第二行按可用性显示 Git 标识、缓存命中率、上下文占用、
+压缩余量、后台任务和余额。“就绪”只表示输入框空闲，并不是模型健康检查；选择器、审批、
+图片粘贴、shell 模式等活动会替换这个状态。窄终端会按完整信息组移动、换行或压缩。
+标签和展示用的工作模式值跟随 `/language`，但 `/work-mode` 的命令参数继续使用稳定的
+英文标识。
+
 聊天与 transcript：
 
 | 按键或命令 | 作用 | 说明 |
@@ -346,11 +405,15 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 | `Ctrl+L` 或 `/cls` | 只清空可见 transcript | LLM 上下文、session 文件、工具、记忆和插件都保持加载；想丢弃对话上下文时用 `/clear`。 |
 | `Esc` | 退出当前最具体的动作 | 可在无回复前撤回刚提交的 turn、取消运行中的 turn，或清空非空输入。 |
 | 空闲且输入为空时双击 `Esc` | 打开 rewind 选择器 | 和 `/rewind` 是同一个入口。 |
-| 终端原生选择 | 复制 transcript 文本 | Reasonix 默认不启用鼠标报告，因此终端自己的选择/复制仍可使用。 |
-| `Ctrl+C` | 取消、清空或退出 | 取消运行中的 turn、清空非空输入；空输入下连按两次退出。 |
+| transcript 文本选择 | 复制 transcript 文本 | 应用内拖选松开后，本地会话通过可验证的系统剪贴板路径写入（macOS `pbcopy`、Linux 可用的 Wayland/X11 工具、Windows 系统剪贴板）；SSH 才回退到 OSC 52，并明确标记为回退而不是宣称原生复制成功。`Ctrl+C`/`Super+C`/`Meta+C` 或右键当前选区可再次复制。 |
+| 输入框文本选择 | 选中、复制或替换草稿文本 | 应用内拖选松开后，会通过与 transcript 相同的可验证剪贴板路径复制；输入或粘贴会替换选区，方向键会收起选区。 |
+| 没有活动选区时右键 | 在本地会话粘贴剪贴板文本 | 本地会话开启鼠标接管时，Reasonix 只读取文本并交给正常的 bracketed-paste 处理。SSH 下远端进程无法读取本机剪贴板，请使用终端粘贴快捷键；`/mouse` 可恢复终端原生右键菜单。存在活动选区时，右键仍优先复制该选区。 |
+| `/mouse` | 切换应用内鼠标接管 | 关闭后由终端处理原生拖选和右键菜单，但会失去应用内选区、滚动条和滚轮。可用 `REASONIX_DISABLE_MOUSE=1` 让每次会话默认关闭。 |
+| `Ctrl+C` | 复制、取消、清空或退出 | 有 transcript 或输入框活动选区时优先复制；否则取消运行中的 turn、清空非空输入，或在空输入下连按两次退出。 |
 | `Ctrl+D` | 退出 TUI | 立即退出。 |
-| `Ctrl+V`、`Ctrl+Shift+V`、`Meta+V` 或 `Super+V` | 粘贴剪贴板内容 | CLI 会先尝试图片，再回退到文本或文件引用。 |
-| `/paste-image` | 粘贴剪贴板图片 | 适合只想贴图片，或终端应用自己接管文本粘贴的场景。 |
+| 终端的文本粘贴快捷键 | 粘贴文本 | 文本保持终端原生 bracketed-paste 路径：macOS 通常是 `Cmd+V`，Linux 通常是 `Ctrl+Shift+V`，其它环境使用终端自身配置。Reasonix 只消费收到的文本粘贴事件，不会先探测图片。 |
+| macOS/Linux `Ctrl+V`；Windows `Alt+V` | 粘贴剪贴板图片 | 图片粘贴是独立的应用动作。读取期间底栏显示“正在粘贴图片…”，完成后在光标处插入可编辑的 `[image #N]` 标记。 |
+| `/paste-image` | 粘贴剪贴板图片 | 与图片快捷键相同的纯图片命令入口。 |
 | 以 `!` 开头的一行 | 直接运行 shell 命令 | 命令在本地执行，不经过模型。 |
 
 模式与显示：
@@ -361,8 +424,9 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 | `Ctrl+Y` | 切换 YOLO 开/关 | 关闭 YOLO 时会尽量恢复之前的 Ask/Auto 基底。终端若能转发 Command/Super，也可能识别 `Cmd+Y`，但稳定可用的是 `Ctrl+Y`。 |
 | `--yolo`、`--dangerously-skip-permissions` | 启动时进入 YOLO | 和 `Ctrl+Y` 是同一个运行时模式。 |
 | `/work-mode [economy|balanced|delivery]` | 查看或切换当前会话的工作模式 | `/profile` 是兼容别名。切换会原子重建运行时，保留对话和审批姿态；有工作正在进行时会拒绝切换。 |
+| `/theme [auto|light|dark|style]` | 查看或切换 CLI 主题 | 不带参数会列出背景模式和命名配色。选择会保存到用户配置；单次运行可用 `REASONIX_THEME` 和 `REASONIX_THEME_STYLE` 覆盖。 |
 | `Ctrl+O` | 切换详细 reasoning 显示 | 也可通过 `/verbose` 使用。 |
-| `Ctrl+B` | 展开或收起较长 shell 输出 | TUI 默认不启用鼠标报告，因此可和终端原生文本选择共存。 |
+| `Ctrl+B` | 展开或收起较长 shell 输出 | 较长 shell 输出的提示行也可点击；全屏 TUI 开启鼠标接管时，文本选区由应用内处理。 |
 | `/goal <目标>`、`/goal --research <目标>`、`/goal --simple <目标>`、`/goal status`、`/goal clear` | 启动、查看或清除 Goal | Goal 不进入任何快捷键循环；明显长周期目标会自动启用 AutoResearch。普通输入命中强 AutoResearch 信号时也会自动升级为 Goal。 |
 | `/migrate`、`/migrate --from <旧目录>` | 重试旧数据迁移，或从指定 v0.x 来源导入 sessions | Windows v0.52 自定义安装/数据目录用 `--from`；该形式只导入 sessions。详见[配置路径](./CONFIG_PATHS.zh-CN.md)。 |
 
@@ -459,17 +523,33 @@ reasonix doctor capabilities --live --timeout 5s
 
 Reasonix 是一个 MCP 客户端。`[[plugins]]` 的 `type` 选择传输：`stdio`（默认）启动本地子进
 程（`command`/`args`/`env`）；`http`（Streamable HTTP）连接远程 `url`，可带静态
-`headers`（`${VAR}` / `${VAR:-default}` 从环境展开，密钥不入文件）。工具以
-`mcp__<server>__<tool>` 暴露给模型，与 Claude Code 一致；声明 MCP `readOnlyHint: true`
+`headers`（`${VAR}` / `${VAR:-default}` 从环境展开，密钥不入文件）。
+
+普通配置流程现在只有一步：使用桌面端的“添加并连接”、`/mcp add`，或直接让 Reasonix
+安装一个 package、URL 或 `.mcp.json`。这次明确安装本身就是授权：server 会保存并在当前
+会话连接，现在和下次启动都不会再弹出第二套信任步骤。显式 deny 仍然优先；未配置高级审批
+覆盖时，包括声明 `destructiveHint` 的工具在内都直接执行。如需保留新鲜审查，可主动设置
+`auto`、`prompt` 或 `writes`。Plan 与只读 subagent 仍只暴露符合条件的工具身份。只有被动从仓库
+`reasonix.toml` 或 `.mcp.json` 发现的 server 会在第一次启动前，请用户确认一次精确命令或
+地址；Reasonix 会先记录该决定而不启动临时检查进程，然后只启动一次正式连接。内容不变时
+以后自动连接，发生变化时才重新确认。
+
+stdio server 从初始化到读写都复用同一个进程，因此浏览器等有状态 MCP 能保留会话和
+已打开页面。由于进程启动后无法按调用切换 OS 沙箱，这个共享进程始终使用该 server 的普通
+writer 沙箱；`readOnlyHint` 与只读 subagent 过滤属于调用分发策略，不再对应第二个按调用隔离
+的进程沙箱。
+
+工具以 `mcp__<server>__<tool>` 暴露给模型，与 Claude Code 一致；声明 MCP `readOnlyHint: true`
 的工具会参与并行调度并命中普通权限层的只读默认放行。这个标注来自第三方 server，主 Plan 只把它
 当作普通权限分类；它不会让工具进入独立 planner 或只读研究 subagent。已审计的 reader 应写入本地
 `trusted_read_only_tools`。没有 `readOnlyHint` 的工具仍按写工具处理。计划期间，内置 writer 仍走
 Permissions/Sandbox；已安装 MCP 与代理解析后的 MCP writer、destructive 目标和未信任
 reader 在任何审批前硬阻断，退出 Plan 后才恢复正常审批流程。
 
-MCP `destructiveHint: true` 的约束更严格。即使工具同时声明 `readOnlyHint`、当前是 Auto/YOLO，
-或已经存在 allow 规则，每次调用都需要全新的人工审批——Guardian、`auto_review`、自动/YOLO
-与会话授权都不能代替用户批准破坏性调用。
+MCP `destructiveHint: true` 比只读分类更严格。在 `auto`、`prompt` 或 `writes` 下，即使工具
+同时声明 `readOnlyHint`、当前是 Auto/YOLO，或已经存在 allow 规则，每次破坏性调用仍需要
+全新的人工审批——Guardian、`auto_review`、自动/YOLO 与会话授权都不能代答。最终策略为
+`approve` 表示用户已经授权该 server 或工具，因此调用直接执行。
 
 `approvals_reviewer = "auto_review"` 只把真正需要审查的调用——`prompt` 模式、`writes`
 命中的写调用、以及全局策略本会 Ask 的 `auto` 调用——交给当前会话的 Guardian；成功给出的
@@ -489,17 +569,19 @@ approvals_reviewer = "auto_review"     # user|auto_review
 trusted_read_only_tools = ["issue_read", "pull_request_read"]
 ```
 
-`auto` 交给全局 Ask/Auto/YOLO；`prompt` 每次调用都审查；`writes` 只审查写工具；`approve`
-放行普通调用。显式 deny 永远优先，`destructiveHint` 永远强制一次新审查，`tools` 中的 raw tool
-配置覆盖 server 默认值。`trusted_read_only_tools` 继续作为兼容字段和本地信任声明，用于已审计、
-但没有可靠 annotation 的 reader。
+用户已授权的 server 若省略这些高级审批字段，所有调用都会直接放行。显式配置后，`auto`
+交给全局 Ask/Auto/YOLO；`prompt` 每次调用都审查；`writes` 只审查写工具；`approve`
+直接放行所有调用，包括 destructive 调用。显式 deny 永远优先；除 `approve` 外，
+`destructiveHint` 会在其余模式下强制一次新审查。`tools` 中的 raw tool 配置覆盖 server 默认值。
+`trusted_read_only_tools` 继续作为兼容字段和显式本地声明，用于已审计、但没有可靠 annotation
+的 reader。
 
 两条边界值得注意：`writes` 信任 server 自己的只读分类，把写工具谎报成 `readOnlyHint`
 的 server 会绕过这层审查——对不可信的 server 请用 `prompt`。启用 Guardian 且未配置
 `approvals_reviewer` 时，`prompt`/`writes` 的审查保留 legacy 路由：Guardian 预审通过即可放行、
 不再弹人工提示；要求每次都由人决定时请显式配置 `approvals_reviewer = "user"`。项目
 `.mcp.json` 会把这些字段并入会话，所以像审代码一样审查别人仓库里的 `approve`/`writes`
-策略——显式 deny 规则和 `destructiveHint` 审查仍然生效。
+策略——显式 deny 规则仍然生效；最终策略不是 `approve` 时，`destructiveHint` 审查仍然生效。
 
 服务器的 **prompts** 会暴露成 `/mcp__<server>__<prompt>` 斜杠命令（命令后空格分隔参
 数）；**resources** 通过在消息里写 `@<server>:<uri>` 拉入；`/mcp` 列出已连接服务器及
@@ -546,7 +628,7 @@ headers = { Authorization = "Bearer ${STRIPE_KEY}" }
 
 ## 斜杠命令
 
-交互式 `reasonix` 会话里，内置命令（`/compact`、`/new`、`/clear`、`/rewind`、`/tree`、`/branch`、`/switch`、`/todo`、`/model`、`/work-mode`、`/mcp`、`/skills`、`/hooks`、`/memory`、`/memory-v5`、`/goal`、`/output-style`、`/sandbox`、`/language`、`/auto-plan`、`/reasoning-language`、`/help`）在本地执行——`/help` 可列出全部。
+交互式 `reasonix` 会话里，内置命令（`/compact`、`/new`、`/clear`、`/rewind`、`/tree`、`/branch`、`/switch`、`/todo`、`/model`、`/work-mode`、`/mcp`、`/skills`、`/hooks`、`/memory`、`/goal`、`/output-style`、`/sandbox`、`/language`、`/auto-plan`、`/reasoning-language`、`/help`）在本地执行——`/help` 可列出全部。
 内置 **Skill**（如 `/init`、`/explore`、`/test`、`/reasonix-guide`）也会出现在斜杠菜单，
 并可通过 `run_skill` 调用（正文按需加载；只有索引行进入缓存稳定前缀）。配置或能力排障时
 用 `/reasonix-guide`，它会引导运行 `reasonix doctor capabilities`（见
@@ -594,36 +676,11 @@ compaction archive 和已保存事实；这些动态内容不会被塞进稳定�
 agent 发起的 `remember` 和 `forget` 每次都会要求新的人工确认，并在执行前展示将保存或归档的记忆摘要；
 Guardian 审查不能代替用户批准，非交互运行会拒绝这类工具而不是自动批准。
 0 结果会提示 agent 改用更少、更有区分度的词继续查。
-Memory v5 在 CLI/TUI、`reasonix serve` 和桌面端默认开启，因为这些入口共用同一套本地
-controller。它会把本地、按项目隔离的执行轨迹和编译器状态写在 Reasonix home 下，并且只有
-历史结果产生可行动约束时，才把下一轮用户输入编译成精简 execution contract。早期轮次可能
-只写入轨迹而不注入任何内容。默认的 `verbosity = "observe"` 只做本地学习和内容无关指标，
-不会把 `<memory-compiler-execution>` 发送到 provider 可见的用户轮次；只有显式切到
-`verbosity = "compact"`（或旧的 `on` 命令别名）时才恢复精简 execution contract 注入，
-并把选中的精简 memory reference 放进 provider 可见的用户轮次。Memory v5 不会绕过
-memory 审批，也不会修改 cache-stable system prompt、Provider 前缀或工具 schema。
-
-交互式会话里可用 `/memory-v5 off|observe|compact|on|status` 控制后续轮次，也可在 shell/脚本里用
-`reasonix config memory-v5 off|observe|compact|on|status`。桌面端还可以在设置 → 通用 → Memory v5 中控制。
-设置 → 更新 → 共享聚合质量指标控制可选的聚合上报；开启后只会上报匿名计数/大小桶，例如是否
-注入、编译后 token 大小桶、IR overhead 大小桶、memory reference 数量、constraint/risk/step
-数量，以及记忆图规模桶。它不会包含记忆正文、提示词、工具输出、文件路径、ID、密钥、base URL
-或文件内容。
-
-CLI/TUI 和 `reasonix serve` 使用同一个 user/global 配置。项目内的 `reasonix.toml` 不能覆盖
-这个 user/global 设置。CLI 命令会更新底层配置；高级用户也可以手动编辑 Reasonix home 下的
-用户配置：
-
-```toml
-[agent]
-memory_compiler = { enabled = true, verbosity = "observe" }
-```
-
-CLI 可以在本地轮次使用 Memory v5，但不会运行桌面端的聚合指标上传管线。使用
-`reasonix run --metrics <path>` 时，JSON 还会输出内容无关的 `memory_compiler_*` 汇总字段，
-以及 `memory_compiler_turn_details` 逐轮明细数组，包含是否注入、编译后 token 和 IR overhead
-估算、引用记忆/constraint/risk/step 数量，以及当前记忆图计数。
-技术实现细节见 [`SESSION_MEMORY_RETRIEVAL.md`](SESSION_MEMORY_RETRIEVAL.md)。
+Memory v5 执行编译器已经移除。早期版本（至 v1.17.x）可能把用户轮次编译成
+`<memory-compiler-execution>` contract 并写入本地编译器状态；当前版本不再有这两种行为，
+`[agent].memory_compiler` 配置键已退役（一次性迁移会从既有配置中清除），那些旧版本录制的
+会话转写仍能正常显示——预览和历史会从 legacy contract 块中恢复原始提示词。
+会话记忆检索的技术实现细节见 [`SESSION_MEMORY_RETRIEVAL.md`](SESSION_MEMORY_RETRIEVAL.md)。
 
 ```markdown
 ---
@@ -723,23 +780,24 @@ source 也可在 Plan 中加载，后续 writer 调用仍通过 Permissions/Sand
 所有严格只读子会话都经过同一对共享构造入口——批处理子会话用
 `RunReadOnlySubAgentWithSession`，交互式双模型 planner 用 `NewReadOnlyAgent`——
 两者都会把子会话标记为永久只读并做最终 registry 过滤：移除 writer、destructive MCP
-目标、外部自报但未信任的 reader、没有正向信任背书的 MCP reader（分类必须有 receipt
-存储支撑，server hint 不算），以及一切会改变 host capability 的工具；会启动 host 的
-目标同样被移除，唯一例外是 receipt 匹配的受信 reader 仍可按需启动。严格只读入口一览：
+目标、只有第三方 server hint 的 reader，以及一切会改变 host capability 的工具。MCP reader
+只有在本地配置中显式声明，或由当前已验证的官方签名 package 声明时才符合条件；符合条件的
+reader 仍可按需启动。严格只读入口一览：
 
 | 入口 | 用途 |
 | --- | --- |
 | `read_only_task` | 主会话派生的隔离只读调研子会话 |
 | `parallel_tasks`（只读） | 并发只读调研子会话 |
+| `fleet` 且 `read_only: true` | 可带 Profile 的并行批量（单项强制只读） |
 | `read_only_skill` | 以既有 skill 驱动的同等隔离 |
 | `reasonix review`（CLI） | 只读评审 diff 或分支 |
 | 桌面端 preview/review 子代理 | 桌面端只读分析面 |
 | 双模型 planner | 独立 planner 的只读 registry |
 
 在严格只读子会话内：`use_capability` 在 Commit/permission/hook/执行前会对解析出的
-真实目标再次校验；未连接的受信 MCP reader 只有在 receipt、identity 与缓存 capability
-指纹全部匹配时才能按需启动一次（子会话不能创建、升级或重新验证 trust）；
-initialize/tools-list 之后发现 live 指纹漂移则零执行，并提示交回父会话重新验证。
+真实目标再次校验；未连接且符合条件的 MCP reader 可从当前 schema cache 按需启动，
+initialize/tools-list 后会在 `tools/call` 前核对缓存与 live security 指纹；发现 schema 或
+safety 漂移则零执行，普通重试会使用当前策略。
 `auto_review` 在这里不能提升权限；需要本地人工审批的 reader 直接 fail-closed。
 这一层比主 Plan 更严格：Plan 在整个规划阶段硬阻断 MCP writer/destructive 目标——
 审批也不能放行，退出 Plan 后才恢复——内置 writer 仍走 Permissions/Sandbox，
@@ -777,8 +835,7 @@ system contract 和工具 Schema 在后续轮次保持稳定；轻量模式下�
 `reasonix config auto-plan off|on`。Auto-plan 只认用户级设置；项目
 `reasonix.toml` 里的 `agent.auto_plan` 会被忽略。可见思考语言也采用类似形态：
 会话里用 `/reasoning-language auto|zh|en`，shell/脚本里用
-`reasonix config reasoning-language auto|zh|en`。Memory v5 使用 `/memory-v5 off|observe|compact|on|status`
-或 `reasonix config memory-v5 off|observe|compact|on|status`，并且只认用户级设置。只有明确想为
+`reasonix config reasoning-language auto|zh|en`。只有明确想为
 reasoning-language 写项目级覆盖时，才给 shell 命令加 `--local`。
 
 桌面端“协作方式”菜单里的计划模式、目标模式和“轻量 / 均衡 / 交付优先”三档运行模式的使用方法与注意事项，

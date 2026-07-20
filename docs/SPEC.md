@@ -44,12 +44,20 @@ reasonix/
     ├── permission/          # per-call Policy: allow/ask/deny rules → Decision
     ├── command/             # custom slash commands loaded from .reasonix/commands/*.md
     ├── plugin/              # stdio JSON-RPC (MCP) client; adapts remote tools
+    ├── remote/              # SSH transport for the Remote-SSH module
+    │   ├── forward/         # -L / -R port-forward lifecycle
+    │   ├── sftpfs/          # SFTP file layer (quarantines pkg/sftp)
+    │   └── bootstrap/       # detached `reasonix serve` bootstrap over SSH
     └── agent/               # Session + harness loop
 ```
 
 Dependency direction (acyclic): `cli → {agent, plugin, config} → {tool, provider}`.
 Built-in subpackages (`provider/openai`, `tool/builtin`) import their parent to
-self-register; parents never import children.
+self-register; parents never import children. The Remote-SSH module layers
+`cli → remote/bootstrap → remote → {remote/forward, remote/sftpfs, config,
+netclient}`; `remote` and its subpackages never import `cli`, `agent`, or
+`serve`, and all interactivity flows through callbacks (host-key / secret
+prompts) so the desktop module consumes the same surface. See §Remote below.
 
 ## 3. Core Abstractions
 
@@ -91,9 +99,9 @@ type Config struct {
   one vendor expose several models without re-declaring the endpoint/key. A
   **model reference** (`default_model`, the `--model` flag, the desktop switcher)
   resolves via `Config.ResolveModel`, which accepts a provider name (→ its default
-  model), a bare model name, or an explicit `provider/model`. `context_window` /
-  `price` are per-provider, so models that need distinct values stay separate
-  single-`model` entries.
+  model), a bare model name, or an explicit `provider/model`. `context_window` is
+  the provider-wide fallback; `model_overrides.<model>.context_window` can replace
+  it for one model. Per-model `prices` use model IDs as keys.
 - Streaming tool-call deltas are accumulated by index inside the provider; only
   complete `ToolCall`s are emitted.
 
@@ -141,6 +149,24 @@ interface (`call` / `notify` / `close`) abstracts that, so the MCP-level logic
   and `headers` so secrets come from the environment, not the config file.
 - Lifecycle: `initialize` → `notifications/initialized` → `tools/list`;
   invocation via `tools/call {name, arguments}`.
+- A stdio server uses one persistent transport for initialize, reads, and
+  writes, preserving state such as browser sessions across tool calls. The
+  process uses the server's writer sandbox because process confinement cannot
+  change per RPC; read-only eligibility and destructive approval remain local
+  dispatch gates rather than separate process sandboxes.
+- Configuration provenance is runtime metadata. Explicit installation from the
+  user config, Desktop, `/mcp add`, or `install_source` is authorization: the
+  host connects the server immediately when installation happens in a live
+  session, records a durable exact command/endpoint launch grant for
+  project-scoped installs, and calls default to direct approval.
+  Project `reasonix.toml` and `.mcp.json` servers that are only
+  discovered from the repository require one durable launch confirmation before
+  any process or network transport is created. Confirmation records the exact
+  identity without a temporary initialize/tools-list preflight, so the normal
+  runtime starts the server only once; matching grants reconnect automatically
+  and identity changes require confirmation again. During the compatibility
+  window, an exact old workspace receipt may migrate only into this launch
+  grant; its former tool-level authority is ignored.
 - Each remote tool is adapted to the `Tool` interface and injected into the run
   registry, namespaced `mcp__<server>__<tool>` (spaces normalised to `_`) to
   match Claude Code and avoid clashes.
@@ -196,6 +222,9 @@ Long tasks eventually fill the model's context window. Reasonix manages this wit
   pruning still leaves the prompt above the threshold does summary compaction
   run. At `agent.compact_force_ratio` (default `0.9`), the existing forced fold
   may proceed even when the fold economics would normally skip it.
+- A positive `model_overrides.<model>.context_window` replaces the provider-wide
+  value after model resolution. Missing or zero model overrides inherit the
+  provider value; provider-level `context_window = 0` disables compaction.
 - Tool-result snip/prune never removes messages, so assistant `tool_calls` and
   tool results stay paired. `KeepErrors` preserves error/blocked tool outputs,
   and the recent tail is not rewritten. Snipped results can later be upgraded to
@@ -303,19 +332,26 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   hard block in *every* mode: the tool never executes and the model receives a
   "blocked" result it can adapt to (the same shape as a plan-mode refusal).
 - **MCP approval policy.** Installed MCP tools may set a server default and raw
-  tool overrides using `auto|prompt|writes|approve`. Precedence is explicit deny,
-  `destructiveHint`, raw-tool mode, server default, then global Ask/Auto/YOLO.
-  `auto` delegates to the ordinary permission decision; `prompt` reviews every
-  call; `writes` reviews writers only; and `approve` allows ordinary calls.
+  tool overrides using `auto|prompt|writes|approve`. A raw-tool mode overrides
+  the server or source-aware default; explicit deny still wins, `approve`
+  permits the call directly, and `destructiveHint` requires a fresh review for
+  every remaining mode before global Ask/Auto/YOLO is considered.
+  A user-authorized server with no explicit MCP approval fields defaults to
+  `approve`; repository-provided servers retain `auto` until their exact launch
+  is authorized, then the same source-aware default applies. `auto` delegates
+  to the ordinary permission decision; `prompt` reviews every call; `writes`
+  reviews writers only; and `approve` allows all calls directly.
   `approvals_reviewer = "user"` uses the interactive user, while `auto_review`
   sends the calls that need review (`prompt`, writer hits under `writes`, and
   `auto` calls the global posture would Ask about) to the session Guardian; a
   successful allow/deny verdict is final. A missing, timed-out, failed, or
   indeterminate reviewer degrades to fresh human approval — a prompt that
   Auto/YOLO, the approved-plan window, and session grants cannot answer — and
-  non-interactive sessions fail closed. A destructive call always requires a
-  fresh human approval on every invocation: no reviewer, session grant, or
-  Auto/YOLO posture can authorize it. All of this is local metadata and is
+  non-interactive sessions fail closed. For `auto`, `prompt`, and `writes`, a
+  destructive call requires fresh human approval on every invocation: no
+  reviewer, session grant, or Auto/YOLO posture can authorize it. An effective
+  `approve` mode represents the user's install/authorization decision and
+  permits destructive calls directly. All of this is local metadata and is
   absent from provider-visible tool schemas.
 - **Relationship to plan mode.** Plan mode (§3.4) is a plan-first collaboration
   workflow, not an all-tools read-only mode. Before Permissions/Sandbox, the
@@ -327,11 +363,11 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   Ordinary built-in and Bash calls then use the same Ask/Auto/YOLO, explicit
   `ask`/`deny`, and Sandbox path as Standard mode; blocked MCP writers regain
   their normal approval flow after Plan exits. A third-party MCP `readOnlyHint` affects ordinary permission and dispatch
-  classification, but it does not grant trust to the dedicated planner or
+  classification, but it does not grant access to the dedicated planner or
   read-only sub-agent registries; use a locally audited
   `trusted_read_only_tools` entry for those. The legacy
   `[agent].plan_mode_allowed_tools` field is still decoded and can act as a
-  concrete MCP read-only trust alias, while `plan_mode_read_only_commands` is
+  concrete MCP read-only compatibility alias, while `plan_mode_read_only_commands` is
   retained for config/session round trips. Neither field grants or revokes calls
   in the main Plan workflow. `read_only_task` and `read_only_skill` remain strict
   read-only capabilities with their own tool registry and safe foreground Bash;
@@ -501,10 +537,19 @@ refused so an editor cannot silently flatten or discard rich Skill content.
 Built-in profiles support configuration overrides but have no writable file.
 
 Effective model and effort precedence is: per-profile
-`agent.subagent_models` / `agent.subagent_efforts`, profile frontmatter,
-`agent.subagent_model` / `agent.subagent_effort`, then executor/default model
-configuration. See [Subagent profiles](./SUBAGENT_PROFILES.md) for the user-facing
-command and file-format contract.
+`agent.subagent_models` / `agent.subagent_efforts`, this call's `model` /
+`effort` on `task`/`fleet`, profile frontmatter, `agent.subagent_model` /
+`agent.subagent_effort`, then executor/default model configuration.
+
+`task` accepts optional `profile` and `write_paths`. `fleet` dispatches 2–64
+profile-aware tasks under a session scheduler
+(`agent.max_subagent_concurrency`, default 6; `agent.max_parallel_writers`,
+default 3). Profile names are resolved at runtime from the Skill store and
+must never enter tool schemas or the parent system prompt. Custom and named
+built-in profile bodies are the full child system prompt (no implicit
+concise default). `parallel_tasks` remains the compatible read-only batch
+API on the same scheduler. See [Subagent profiles](./SUBAGENT_PROFILES.md)
+for the user-facing command and file-format contract.
 
 ## 4. Data Types (`internal/provider`)
 
@@ -549,8 +594,7 @@ Reasonix's global `<Reasonix home>/.env`, shared by CLI and desktop. Project
 `.env`, home `.env`, inherited shell environment variables, legacy credentials,
 and the OS keyring are not provider-key runtime fallbacks. Project `.env` still
 feeds workspace-scoped, non-provider `${VAR}` expansion for MCP/plugin settings
-without importing provider keys or Reasonix control variables. Project
-`reasonix.toml` does not override the user-level Memory v5 compiler switch.
+without importing provider keys or Reasonix control variables.
 
 ```toml
 default_model = "deepseek"   # provider name (→ its default model) or "provider/model"
@@ -558,14 +602,13 @@ default_model = "deepseek"   # provider name (→ its default model) or "provide
 
 [ui]
 # shortcut_layout = "desktop"       # classic|desktop; compatibility setting
-# cursor_shape = "underline"        # CLI/TUI textarea cursor: underline|block|bar
+# cursor_shape = "bar"              # CLI/TUI textarea cursor: underline|block|bar
 
 [agent]
 system_prompt = "You are Reasonix, a coding agent..."  # or system_prompt_file = "..."
 temperature       = 0.0
-memory_compiler = { enabled = true, verbosity = "observe" }   # user/global only; observe|compact; CLI: reasonix config memory-v5 off|observe|compact|on|status
 reasoning_language = "auto"       # visible reasoning text: auto|zh|en
-# plan_mode_allowed_tools = ["mcp__legacy__reader"]   # legacy MCP read-only trust alias; does not change Plan availability
+# plan_mode_allowed_tools = ["mcp__legacy__reader"]   # legacy MCP read-only alias; does not change Plan availability
 # plan_mode_read_only_commands = ["gh issue view"]   # legacy compatibility only; Plan bash uses Permissions
 # planner_model = "deepseek-pro"   # optional: two-model collaboration (low-frequency planner)
 # subagent_model = "deepseek-pro"   # optional default for runAs=subagent skills
@@ -584,6 +627,7 @@ models         = ["deepseek-v4-flash", "deepseek-v4-pro"]
 default        = "deepseek-v4-flash"   # optional; defaults to models[0]
 api_key_env    = "DEEPSEEK_API_KEY"
 context_window = 1000000   # tokens; harness compacts older history near this limit (0 disables)
+# model_overrides = { "deepseek-v4-flash" = { context_window = 1000000 } }
 
 # A single-model entry still works for custom OpenAI-compatible endpoints.
 
@@ -637,7 +681,6 @@ args    = []
 # default_tools_approval_mode = "auto"   # auto|prompt|writes|approve
 # tools = { "delete_all" = { approval_mode = "prompt" } }
 # approvals_reviewer = "user"            # user|auto_review
-
 # [[plugins]]                   # a remote MCP server over Streamable HTTP
 # name    = "stripe"
 # type    = "http"             # "stdio" (default) | "http" | "sse"
@@ -662,7 +705,7 @@ explicit controls for one-off and unattended execution.
 `reasonix setup` writes this default config so the CLI is usable out of the box.
 
 `[ui].cursor_shape` is normalized to `underline`, `block`, or `bar`; empty or
-unknown values fall back to `underline`. It applies to the Bubble Tea CLI/TUI
+unknown values fall back to `bar`. It applies to the Bubble Tea CLI/TUI
 textarea only, while desktop and browser inputs keep their platform-native
 cursor behavior.
 

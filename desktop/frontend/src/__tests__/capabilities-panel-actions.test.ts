@@ -43,6 +43,16 @@ try {
   unsupportedMCPFieldRejected = error instanceof Error && error.message === "unsupported";
 }
 ok(unsupportedMCPFieldRejected, "unsupported advanced JSON fields should fail explicitly");
+const incompleteMCPJSON = JSON.stringify({ admin: { type: "stdio", command: "" } });
+let incompleteMCPRejected = false;
+try {
+  parseMCPServerJSON(incompleteMCPJSON);
+} catch (error) {
+  incompleteMCPRejected = error instanceof Error && error.message === "required";
+}
+ok(incompleteMCPRejected, "submitting incomplete MCP JSON must still require a command or URL");
+const incompleteMCPDraft = parseMCPServerJSON(incompleteMCPJSON, undefined, { allowIncomplete: true });
+ok(incompleteMCPDraft.draft.name === "admin" && incompleteMCPDraft.draft.command === "", "mode switching may recover an incomplete MCP draft for form editing");
 const clearedMCPPolicy = parseMCPServerJSON(JSON.stringify({ admin: { command: "admin-mcp", default_tools_approval_mode: "", approvals_reviewer: "" } }));
 ok(clearedMCPPolicy.input.defaultToolsApprovalMode === "" && clearedMCPPolicy.input.approvalsReviewer === "", "empty advanced policy values should clear saved overrides");
 let nullToolTimeoutRejected = false;
@@ -338,15 +348,15 @@ console.log("capabilities panel MCP actions");
   const rootEl = document.getElementById("root");
   if (!rootEl) throw new Error("missing root");
   const root = createRoot(rootEl);
-  const meta: Meta = { label: "test", ready: true, eventChannel: "trust-mcp-channel", cwd: "/tmp/reasonix-test", workspaceRoot: "/tmp/reasonix-test" };
+  const meta: Meta = { label: "test", ready: true, eventChannel: "authorize-mcp-channel", cwd: "/tmp/reasonix-test", workspaceRoot: "/tmp/reasonix-test" };
   const tabs: TabMeta[] = [{
-    id: "tab-trust-mcp",
+    id: "tab-authorize-mcp",
     scope: "project",
     workspaceRoot: "/tmp/reasonix-test",
     workspaceName: "reasonix-test",
-    topicId: "topic-trust-mcp",
-    topicTitle: "Trust MCP",
-    label: "Trust MCP",
+    topicId: "topic-authorize-mcp",
+    topicTitle: "Authorize MCP",
+    label: "Authorize MCP",
     ready: true,
     running: false,
     mode: "normal",
@@ -354,22 +364,19 @@ console.log("capabilities panel MCP actions");
     active: true,
     cwd: "/tmp/reasonix-test",
   }];
-  let trustDecision = "";
+  let projectAuthorizationCount = 0;
   let servers: ServerView[] = [{
     name: "github",
     transport: "stdio",
-    status: "connected",
+    status: "failed",
+    runtimeState: "issue",
     configured: true,
     autoStart: true,
-    tools: 3,
+    tools: 0,
     prompts: 0,
     resources: 0,
-    trustState: "changed",
-    identityChanged: true,
-    changedTools: ["issue_read"],
-    toolChanges: [{ name: "issue_read", kind: "reader_to_writer" }],
-    isolationState: "unavailable_unconfined",
-    isolationReason: "sandbox-exec is unavailable on PATH",
+    error: "project-provided MCP server is blocked until the user authorizes it",
+    requiresLaunchApproval: true,
     toolList: [
       { name: "issue_read", description: "Read issues.", readOnlyHint: true },
       { name: "issue_write", description: "Write issues." },
@@ -382,25 +389,16 @@ console.log("capabilities panel MCP actions");
         Meta: async () => meta,
         ListTabs: async () => tabs,
         MCPServers: async () => servers,
-        InspectMCPTrust: async () => ({
-          name: "github",
-          trustState: "changed",
-          trustSource: "user",
-          trustScope: "workspace",
-          isolationState: "unavailable_unconfined",
-          isolationReason: "sandbox-exec is unavailable on PATH",
-          identityChanged: true,
-          changedTools: ["issue_read"],
-          toolChanges: [{ name: "issue_read", kind: "reader_to_writer" }],
-          readers: ["issue_read"],
-          writers: ["issue_write"],
-          destructive: ["wipe"],
-        }),
-        SetMCPTrust: async (_name: string, decision: string) => {
-          trustDecision = decision;
-          servers = servers.map((item) => ({ ...item, trustState: decision, identityChanged: false, changedTools: [], toolChanges: [] }));
+        AuthorizeAndConnectMCPServer: async () => {
+          projectAuthorizationCount += 1;
+          servers = servers.map((item) => ({
+            ...item,
+            status: "connected",
+            runtimeState: "ready",
+            requiresLaunchApproval: false,
+            error: "",
+          }));
         },
-        RefreshMCPCatalog: async () => ({ source: "cached", sequence: 3, offline: true, stale: true }),
       } as Partial<AppBindings> as AppBindings,
     },
   };
@@ -409,42 +407,65 @@ console.log("capabilities panel MCP actions");
     root.render(React.createElement(LocaleProvider, null, React.createElement(MCPServersSettingsPage)));
     await flush();
   });
-  await waitFor("changed MCP trust badge", () => Boolean(document.body.textContent?.includes("Security changed")));
-  ok(document.body.textContent?.includes("Unisolated") ?? false, "server list keeps an unisolated warning visible");
-  const refreshCatalog = findButton("Refresh catalog");
-  if (!refreshCatalog) throw new Error("missing catalog refresh action");
+  const refreshStatus = async () => {
+    const refresh = document.querySelector<HTMLButtonElement>('button[aria-label="Refresh MCP status"]');
+    if (!refresh) throw new Error("missing MCP status refresh action");
+    await act(async () => {
+      refresh.click();
+      await flush();
+    });
+  };
+  await waitFor("project MCP authorization action", () => Boolean(findButton("Authorize and connect")));
+  ok(!findButton("Review changes"), "project MCP launch approval has no separate change-review workflow");
+  ok(!findButton("Refresh catalog"), "catalog maintenance is not part of the normal MCP workflow");
+  ok(!document.querySelector('[role="dialog"]'), "project authorization does not open a second modal");
   await act(async () => {
-    refreshCatalog.click();
+    findButton("Authorize and connect")?.click();
     await flush();
   });
-  await waitFor("offline catalog result", () => Boolean(document.body.textContent?.includes("Catalog sequence 3")));
-  ok(document.body.textContent?.includes("Offline verified snapshot") && document.body.textContent?.includes("older than 30 days"), "catalog refresh reports verified LKG fallback and staleness without disabling plugins");
-  const openServer = document.querySelector<HTMLButtonElement>(".cap-mcp-list-row__main");
-  if (!openServer) throw new Error("missing changed MCP details button");
+  await waitFor("durable project launch authorization", () => projectAuthorizationCount === 1 && Boolean(document.querySelector('[data-status="connected"]')));
+  ok(!document.querySelector('[role="dialog"]'), "project confirmation connects directly without a second modal");
+
+  servers = servers.map((item) => ({
+    ...item,
+    status: "failed",
+    runtimeState: "issue",
+    error: "authentication required",
+    authStatus: "required",
+    authUrl: "https://mcp.example.test/authorize",
+  }));
+  await refreshStatus();
+  await waitFor("sign-in action", () => Boolean(findButton("Sign in")));
+  ok(!findButton("Review changes"), "OAuth failure does not expose a removed change-review action");
+
+  servers = servers.map((item) => ({
+    ...item,
+    status: "failed",
+    runtimeState: "issue",
+    error: "connection refused",
+    authStatus: "none",
+    authUrl: "",
+  }));
+  await refreshStatus();
+  await waitFor("ordinary retry action", () => Boolean(findButton("Retry")));
+  ok(!findButton("Review changes"), "ordinary startup failures keep only the retry action");
+
+  servers = servers.map((item) => ({
+    ...item,
+    status: "connected",
+    runtimeState: "ready",
+    error: "",
+    requiresLaunchApproval: false,
+  }));
+  await refreshStatus();
+  await waitFor("authorized project server row", () => Boolean(document.querySelector('[data-status="connected"]')));
   await act(async () => {
-    openServer.click();
+    (document.querySelector(".cap-mcp-list-row__main") as HTMLButtonElement | null)?.click();
     await flush();
   });
-  const reverify = findButton("Reverify");
-  if (!reverify) throw new Error("missing MCP reverify action");
-  await act(async () => {
-    reverify.click();
-    await flush();
-  });
-  await waitFor("MCP trust modal", () => Boolean(document.querySelector('[role="dialog"]')));
-  ok(document.body.textContent?.includes("Trust github?") ?? false, "trust modal identifies the server");
-  ok(document.body.textContent?.includes("may have startup side effects") ?? false, "trust modal explains the unisolated startup risk");
-  ok(document.body.textContent?.includes("sandbox-exec is unavailable on PATH") ?? false, "trust modal includes the backend diagnostic without requiring configuration");
-  ok(document.body.textContent?.includes("Reader became writer: issue_read") ?? false, "trust modal explains the exact safety transition");
-  ok(document.body.textContent?.includes("issue_read") && document.body.textContent?.includes("issue_write") && document.body.textContent?.includes("wipe"), "trust modal separates reader, writer, and destructive tools");
-  const trustWorkspace = findButton("Trust this workspace");
-  if (!trustWorkspace) throw new Error("missing workspace trust action");
-  await act(async () => {
-    trustWorkspace.click();
-    await flush();
-  });
-  await waitFor("workspace trust decision", () => trustDecision === "workspace");
-  ok(!document.querySelector('[role="dialog"]'), "successful trust closes the combined confirmation modal");
+  await waitFor("connected project server detail", () => Boolean(document.querySelector(".cap-mcp-subpage")));
+  ok(!findButton("Review changes"), "an authorized connected project server does not show a change alarm");
+  ok(!findButton("Revoke trust"), "normal MCP details do not expose a second authorization-management workflow");
 
   await act(async () => {
     root.unmount();
@@ -696,11 +717,39 @@ console.log("capabilities panel MCP actions");
   const initialJSONEditor = document.querySelector<HTMLTextAreaElement>(".cap-mcp-json-editor__input");
   if (!initialJSONEditor) throw new Error("missing MCP JSON editor");
   await act(async () => {
-    setTextareaValue(initialJSONEditor, "{");
+    findButton("Form")?.click();
+    await flush();
+  });
+  ok(Boolean(document.querySelector(".cap-mcp-form-grid")), "the untouched empty MCP template can switch back to the form editor");
+  ok(document.querySelector<HTMLInputElement>(".cap-mcp-field--name input")?.value === "", "returning from the untouched template preserves the empty server name");
+  await act(async () => {
+    findButton("JSON")?.click();
+    await flush();
+  });
+  const incompleteJSONEditor = document.querySelector<HTMLTextAreaElement>(".cap-mcp-json-editor__input");
+  if (!incompleteJSONEditor) throw new Error("missing MCP JSON editor after returning from the empty form");
+  await act(async () => {
+    setTextareaValue(incompleteJSONEditor, JSON.stringify({ "yakit-next": { type: "stdio", command: "" } }, null, 2));
     await flush();
   });
   await act(async () => {
-    findButton("Add")?.click();
+    findButton("Form")?.click();
+    await flush();
+  });
+  ok(Boolean(document.querySelector(".cap-mcp-form-grid")), "an incomplete but structured MCP draft can switch back to the form editor");
+  ok(document.querySelector<HTMLInputElement>(".cap-mcp-field--name input")?.value === "yakit-next", "switching an incomplete JSON draft preserves its server name");
+  await act(async () => {
+    findButton("JSON")?.click();
+    await flush();
+  });
+  const invalidJSONEditor = document.querySelector<HTMLTextAreaElement>(".cap-mcp-json-editor__input");
+  if (!invalidJSONEditor) throw new Error("missing MCP JSON editor after incomplete draft round trip");
+  await act(async () => {
+    setTextareaValue(invalidJSONEditor, "{");
+    await flush();
+  });
+  await act(async () => {
+    findButton("Add and connect")?.click();
     await flush();
   });
   ok(document.querySelector('[role="alert"]')?.textContent?.includes("Enter valid JSON") ?? false, "invalid MCP JSON shows a focused validation error");
@@ -716,7 +765,7 @@ console.log("capabilities panel MCP actions");
     },
   }, null, 2);
   await act(async () => {
-    setTextareaValue(initialJSONEditor, validJSON);
+    setTextareaValue(invalidJSONEditor, validJSON);
     await flush();
   });
   await act(async () => {
@@ -733,7 +782,7 @@ console.log("capabilities panel MCP actions");
   const roundTripped = JSON.parse(roundTripJSONEditor.value) as Record<string, { args?: string[] }>;
   ok(roundTripped["yakit-next"]?.args?.[2] === "hello world", "form and JSON mode round trip preserves structured MCP arguments");
   await act(async () => {
-    findButton("Add")?.click();
+    findButton("Add and connect")?.click();
     await flush();
   });
   await waitFor("AddMCPServer call", () => Boolean(addedInput));
@@ -741,6 +790,7 @@ console.log("capabilities panel MCP actions");
   ok(addedInput?.command === "npx", "valid MCP JSON keeps the executable separate from its arguments");
   ok(addedInput?.args?.[2] === "hello world", "valid MCP JSON passes structured arguments to AddMCPServer");
   ok(addedInput?.env?.TOKEN === "test-token", "valid MCP JSON passes environment variables to AddMCPServer");
+  ok(!document.querySelector('[role="dialog"]'), "adding a user MCP server does not open a second authorization prompt");
 
   await act(async () => {
     root.unmount();

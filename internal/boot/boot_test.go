@@ -30,6 +30,7 @@ import (
 	"reasonix/internal/provider"
 	"reasonix/internal/sandbox"
 	"reasonix/internal/secrets"
+	"reasonix/internal/skill"
 	"reasonix/internal/tool"
 	"reasonix/internal/tool/builtin"
 
@@ -484,8 +485,8 @@ model = "x"
 		t.Fatalf("LoadSession: %v", err)
 	}
 	msgs := sess.Snapshot()
-	if len(msgs) != 4 || !strings.HasSuffix(msgs[1].Content, "first skill task") || msgs[2].Content != "first skill answer" || msgs[3].Content != "second skill task" {
-		t.Fatalf("failed skill transcript = %+v, want first task/answer plus second task", msgs)
+	if len(msgs) != 5 || !strings.HasSuffix(msgs[1].Content, "first skill task") || msgs[2].Content != "first skill answer" || msgs[3].Content != "second skill task" || !msgs[4].LocalOnly {
+		t.Fatalf("failed skill transcript = %+v, want tasks plus provider-excluded failure recovery", msgs)
 	}
 }
 
@@ -1812,6 +1813,7 @@ func defaultFullBootToolNames() []string {
 		"delete_symbol",
 		"edit_file",
 		"explore",
+		"fleet",
 		"forget",
 		"glob",
 		"grep",
@@ -2267,7 +2269,7 @@ model = "x"
 		t.Fatalf("read_only_task child bash schema should not advertise run_in_background")
 	}
 	for _, forbidden := range []string{
-		"connect_tool_source", "task", "parallel_tasks",
+		"connect_tool_source", "task", "parallel_tasks", "fleet",
 		"install_source", "run_skill", "install_skill", "remember", "forget",
 		"write_file", "edit_file", "multi_edit", "move_file", "complete_step",
 	} {
@@ -2349,7 +2351,7 @@ READ ONLY SKILL BODY`)
 		t.Fatalf("read_only_skill child bash schema should not advertise run_in_background")
 	}
 	for _, forbidden := range []string{
-		"connect_tool_source", "task", "read_only_task", "parallel_tasks",
+		"connect_tool_source", "task", "read_only_task", "parallel_tasks", "fleet",
 		"install_source", "run_skill", "install_skill", "remember", "forget",
 		"write_file", "edit_file", "multi_edit", "move_file", "complete_step",
 	} {
@@ -2384,7 +2386,7 @@ func TestBuildTokenEconomyPlanModeCanConnectInstalledMCPSource(t *testing.T) {
 		testutil.Turn{Text: "done"},
 	)
 	setBootTokenProfileTestProvider(t, prov)
-	writeFile(t, dir, "reasonix.toml", fmt.Sprintf(`
+	writeFile(t, dir, "reasonix.toml", `
 default_model = "test-model"
 
 [agent]
@@ -2394,6 +2396,9 @@ system_prompt = "BASE"
 name = "test-model"
 kind = "boot-token-profile-test"
 model = "x"
+	`)
+	userConfig := config.UserConfigPath()
+	writeFile(t, filepath.Dir(userConfig), filepath.Base(userConfig), fmt.Sprintf(`
 
 [[plugins]]
 name = "mockmcp"
@@ -2444,7 +2449,7 @@ func TestBuildTokenEconomyPlanModeKeepsLegacyMCPReadOnlyOverride(t *testing.T) {
 		testutil.Turn{Text: "done"},
 	)
 	setBootTokenProfileTestProvider(t, prov)
-	writeFile(t, dir, "reasonix.toml", fmt.Sprintf(`
+	writeFile(t, dir, "reasonix.toml", `
 default_model = "test-model"
 
 [agent]
@@ -2454,6 +2459,9 @@ system_prompt = "BASE"
 name = "test-model"
 kind = "boot-token-profile-test"
 model = "x"
+	`)
+	userConfig := config.UserConfigPath()
+	writeFile(t, filepath.Dir(userConfig), filepath.Base(userConfig), fmt.Sprintf(`
 
 [[plugins]]
 name = "mockmcp"
@@ -2469,7 +2477,7 @@ trusted_read_only_tools = ["echo"]
 	}
 	defer ctrl.Close()
 	ctrl.SetPlanMode(true)
-	if err := ctrl.Run(context.Background(), "connect trusted mcp while planning"); err != nil {
+	if err := ctrl.Run(context.Background(), "connect declared mcp reader while planning"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -3542,6 +3550,70 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 	}
 }
 
+func TestBuildMigratesDeprecatedRedactToolOutputWithOneNotice(t *testing.T) {
+	home := isolateConfigHome(t)
+	t.Setenv("REASONIX_HOME", filepath.Join(home, "reasonix-home"))
+	project := robustTempDir(t)
+	configPath := filepath.Join(project, "reasonix.toml")
+	writeFile(t, project, "reasonix.toml", `
+default_model = "test-model"
+
+[secrets]
+redact_tool_output = true
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`)
+
+	var notices []event.Event
+	sink := event.FuncSink(func(e event.Event) {
+		if e.Kind == event.Notice {
+			notices = append(notices, e)
+		}
+	})
+	build := func() {
+		t.Helper()
+		ctrl, err := Build(context.Background(), Options{Sink: sink, WorkspaceRoot: project})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		ctrl.Close()
+	}
+
+	build()
+	migrationNotices := 0
+	for _, notice := range notices {
+		if notice.Text == "Deprecated redact_tool_output setting was removed." {
+			migrationNotices++
+			if notice.Level != event.LevelInfo || !strings.Contains(notice.Detail, "doctor redact-sessions") {
+				t.Fatalf("migration notice = %+v", notice)
+			}
+		}
+	}
+	if migrationNotices != 1 {
+		t.Fatalf("migration notices = %d, want 1; got %+v", migrationNotices, notices)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "redact_tool_output") {
+		t.Fatalf("deprecated redact_tool_output remains after boot:\n%s", raw)
+	}
+
+	notices = nil
+	build()
+	for _, notice := range notices {
+		if strings.Contains(notice.Text, "redact_tool_output") {
+			t.Fatalf("second boot repeated migration notice: %+v", notice)
+		}
+	}
+}
+
 func TestBuildMigratesLegacySessionsFromConfigSessionDir(t *testing.T) {
 	home := robustTempDir(t)
 	t.Setenv("HOME", home)
@@ -3680,7 +3752,7 @@ func TestPartitionByTier(t *testing.T) {
 	}
 }
 
-func TestPluginSpecsTrustKnownCodeGraphReadTools(t *testing.T) {
+func TestPluginSpecsDeclareKnownCodeGraphReadTools(t *testing.T) {
 	specs := PluginSpecs([]config.PluginEntry{{Name: "codegraph"}})
 	if len(specs) != 1 {
 		t.Fatalf("PluginSpecs returned %d specs, want 1", len(specs))
@@ -3692,7 +3764,7 @@ func TestPluginSpecsTrustKnownCodeGraphReadTools(t *testing.T) {
 	}
 }
 
-func TestPluginSpecsTrustConfiguredReadOnlyTools(t *testing.T) {
+func TestPluginSpecsDeclareConfiguredReadOnlyTools(t *testing.T) {
 	specs := PluginSpecs([]config.PluginEntry{{
 		Name:                 "github",
 		TrustedReadOnlyTools: []string{"issue_read", " pull_request_read ", ""},
@@ -3756,20 +3828,76 @@ func TestPluginSpecsMapMCPApprovalPolicy(t *testing.T) {
 	}
 }
 
-func TestOfficialMCPTrustRequiresMatchingTransport(t *testing.T) {
+func TestPluginSpecsMapMCPSourceDefaults(t *testing.T) {
+	specs := PluginSpecsForRootWithOptions([]config.PluginEntry{
+		{Name: "user", Source: config.MCPSourceUserConfig},
+		{Name: "project", Source: config.MCPSourceProjectConfig},
+	}, "/workspace", PluginSpecOptions{ConfigSource: "workspace_config"})
+	if len(specs) != 2 {
+		t.Fatalf("spec count = %d", len(specs))
+	}
+	if !specs[0].ImplicitApproval || specs[0].RequireLaunchApproval || specs[0].ConfigSource != string(config.MCPSourceUserConfig) {
+		t.Fatalf("user source defaults = %+v", specs[0])
+	}
+	if specs[1].ImplicitApproval || !specs[1].RequireLaunchApproval || specs[1].ConfigSource != string(config.MCPSourceProjectConfig) {
+		t.Fatalf("project source defaults = %+v", specs[1])
+	}
+}
+
+func TestPluginSpecsCarryPluginPackageProvenance(t *testing.T) {
+	specs := PluginSpecsForRootWithOptions([]config.PluginEntry{{Name: "figma"}}, "/workspace", PluginSpecOptions{
+		PackageOwners: map[string]string{"figma": "design-plugin"},
+	})
+	if len(specs) != 1 || specs[0].Package != "design-plugin" {
+		t.Fatalf("plugin package provenance = %+v, want design-plugin", specs)
+	}
+}
+
+func TestSkillMCPBindingsUseOnlyValidOwnedCache(t *testing.T) {
+	specs := []plugin.Spec{
+		{Name: "figma", Package: "design-plugin", StripRawPrefix: "figma_"},
+		{Name: "other", Package: "other-plugin"},
+	}
+	cached := map[string][]plugin.CachedTool{
+		"figma": {{Name: "figma_get_design_context"}},
+		"other": {{Name: "search"}},
+	}
+	got := skillMCPBindings(skill.Skill{Plugin: "design-plugin"}, nil, specs, cached, map[string]bool{"figma": true, "other": true})
+	if len(got) != 1 || got[0].VisibleName != "get_design_context" || got[0].CallableName != plugin.ModelToolName("figma", "get_design_context") || got[0].CapabilityID != "mcp-tool:figma/figma_get_design_context" {
+		t.Fatalf("cached skill bindings = %+v", got)
+	}
+	if stale := skillMCPBindings(skill.Skill{Plugin: "design-plugin"}, nil, specs, cached, map[string]bool{"figma": false}); len(stale) != 0 {
+		t.Fatalf("stale cache supplied skill bindings: %+v", stale)
+	}
+
+	reg := tool.NewRegistry()
+	host := plugin.NewHost()
+	t.Cleanup(host.Close)
+	liveTools := plugin.LazyToolset(specs[0], &plugin.CachedSchema{Tools: []plugin.CachedTool{{Name: "figma_current_tool"}}}, host, reg, context.Background(), false)
+	for _, live := range liveTools {
+		reg.Add(live)
+	}
+	oldCache := map[string][]plugin.CachedTool{"figma": {{Name: "figma_removed_tool"}}}
+	got = skillMCPBindings(skill.Skill{Plugin: "design-plugin"}, reg, specs, oldCache, map[string]bool{"figma": true})
+	if len(got) != 1 || got[0].RawName != "figma_current_tool" {
+		t.Fatalf("live registry did not supersede stale boot cache: %+v", got)
+	}
+}
+
+func TestVerifiedMCPPackageRequiresMatchingTransport(t *testing.T) {
 	entry := config.PluginEntry{Name: "official", Type: "http", URL: "https://example.com/mcp"}
-	official := OfficialMCPTrust{
+	official := VerifiedMCPPackage{
 		CatalogEntryID: "official@1", PackageDigest: "digest", Readers: []string{"read"}, Transport: "stdio",
 	}
 	specs := PluginSpecsForRootWithOptions([]config.PluginEntry{entry}, "/workspace", PluginSpecOptions{
-		OfficialServers: map[string]OfficialMCPTrust{"official": official},
+		OfficialServers: map[string]VerifiedMCPPackage{"official": official},
 	})
 	if len(specs) != 1 || specs[0].OfficialCatalogEntryID != "" {
 		t.Fatalf("mismatched transport received official trust: %+v", specs)
 	}
 	official.Transport = "streamable-http"
 	specs = PluginSpecsForRootWithOptions([]config.PluginEntry{entry}, "/workspace", PluginSpecOptions{
-		OfficialServers: map[string]OfficialMCPTrust{"official": official},
+		OfficialServers: map[string]VerifiedMCPPackage{"official": official},
 	})
 	if len(specs) != 1 || specs[0].OfficialCatalogEntryID != "official@1" {
 		t.Fatalf("equivalent HTTP transport did not receive official trust: %+v", specs)
@@ -3789,7 +3917,7 @@ func TestApplyDefaultMCPCallTimeoutPreservesConfiguredDefault(t *testing.T) {
 	}
 }
 
-func TestPluginSpecsTrustPlanModeAllowedMCPTools(t *testing.T) {
+func TestPluginSpecsApplyPlanModeAllowedMCPReaders(t *testing.T) {
 	specs := PluginSpecsForRootWithPlanModeAllowedTools(
 		[]config.PluginEntry{{Name: "github"}, {Name: "linear"}},
 		"",
@@ -3805,13 +3933,13 @@ func TestPluginSpecsTrustPlanModeAllowedMCPTools(t *testing.T) {
 		t.Fatalf("PluginSpecsForRootWithPlanModeAllowedTools returned %d specs, want 2", len(specs))
 	}
 	if !specs[0].ReadOnlyModelToolNames["mcp__github__issue_read"] {
-		t.Fatalf("github allowed MCP tool missing from model trust map: %+v", specs[0].ReadOnlyModelToolNames)
+		t.Fatalf("github allowed MCP tool missing from model reader map: %+v", specs[0].ReadOnlyModelToolNames)
 	}
 	if specs[0].ReadOnlyModelToolNames["mcp__github__"] || specs[0].ReadOnlyModelToolNames["mcp__other__issue_read"] {
 		t.Fatalf("github trust map accepted non-concrete or other-server tools: %+v", specs[0].ReadOnlyModelToolNames)
 	}
 	if !specs[1].ReadOnlyModelToolNames["mcp__linear__issue_read"] {
-		t.Fatalf("linear allowed MCP tool missing from model trust map: %+v", specs[1].ReadOnlyModelToolNames)
+		t.Fatalf("linear allowed MCP tool missing from model reader map: %+v", specs[1].ReadOnlyModelToolNames)
 	}
 }
 

@@ -34,17 +34,11 @@ func (f *fakeAutoPlanClassifier) NeedsPlan(ctx context.Context, input string, sc
 }
 
 type fakeTurnRunner struct {
-	inputs               []string
-	memoryCompilerInputs []string
-	memoryCompilerSkips  []bool
+	inputs []string
 }
 
 func (f *fakeTurnRunner) Run(ctx context.Context, input string) error {
 	f.inputs = append(f.inputs, input)
-	f.memoryCompilerSkips = append(f.memoryCompilerSkips, agent.MemoryCompilerSkipFromContext(ctx))
-	if source, ok := agent.MemoryCompilerSourceInputFromContext(ctx); ok {
-		f.memoryCompilerInputs = append(f.memoryCompilerInputs, source)
-	}
 	return nil
 }
 
@@ -236,6 +230,77 @@ func TestSubmitInvocationDisplayExecutesStructuredEntitiesInVisualOrder(t *testi
 	msgs := c.History()
 	if len(msgs) != 4 || msgs[1].Role != provider.RoleUser || msgs[2].Content != "first answer" || msgs[3].Content != "second answer" {
 		t.Fatalf("parent history = %+v", msgs)
+	}
+}
+
+func TestSubmitInvocationDisplayPreparesPluginSubagentBindings(t *testing.T) {
+	home := t.TempDir()
+	pluginRoot := t.TempDir()
+	writeControlSkill(t, pluginRoot, "helper/SKILL.md", "---\ndescription: Plugin helper\nrunAs: subagent\n---\nCall search.")
+	store := skill.New(skill.Options{
+		HomeDir: home, CustomPaths: []string{pluginRoot},
+		PluginPaths: map[string][]string{pluginRoot: {"search-plugin"}}, DisableBuiltins: true,
+	})
+	store.ConfigureToolBindings(func(skill.Skill) []tool.MCPBinding {
+		return []tool.MCPBinding{{
+			Package: "search-plugin", Server: "search", RawName: "search",
+			VisibleName: "search", CallableName: "mcp__search__search", CapabilityID: "mcp-tool:search/search",
+		}}
+	})
+
+	sess := agent.NewSession("parent system")
+	exec := agent.New(nil, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
+	events := make(chan event.Event, 12)
+	var got skill.Skill
+	c := New(Options{
+		Executor: exec, SkillStore: store, Skills: store.List(),
+		Sink: event.FuncSink(func(e event.Event) { events <- e }),
+		SkillRunner: func(_ context.Context, sk skill.Skill, _ string, _ skill.SubagentRunOptions) (string, error) {
+			got = sk
+			return "done", nil
+		},
+	})
+	defer c.Close()
+
+	c.SubmitInvocationDisplay("inspect", "inspect", []InvocationRequest{{Name: "search-plugin:helper", Kind: "subagent"}})
+	waitForTurnEvents(t, events)
+	waitIdle(t, c)
+	if !strings.Contains(got.Body, "## Runtime MCP tool bindings") || !strings.Contains(got.Body, "`mcp__search__search`") {
+		t.Fatalf("structured plugin subagent was not prepared: %q", got.Body)
+	}
+}
+
+func TestRunSubagentProfilePreparesPluginBindings(t *testing.T) {
+	home := t.TempDir()
+	pluginRoot := t.TempDir()
+	writeControlSkill(t, pluginRoot, "helper/SKILL.md", "---\ndescription: Plugin helper\nrunAs: subagent\n---\nCall search.")
+	store := skill.New(skill.Options{
+		HomeDir: home, CustomPaths: []string{pluginRoot},
+		PluginPaths: map[string][]string{pluginRoot: {"search-plugin"}}, DisableBuiltins: true,
+	})
+	store.ConfigureToolBindings(func(skill.Skill) []tool.MCPBinding {
+		return []tool.MCPBinding{{
+			Package: "search-plugin", Server: "search", RawName: "search",
+			VisibleName: "search", CallableName: "mcp__search__search", CapabilityID: "mcp-tool:search/search",
+		}}
+	})
+
+	var got skill.Skill
+	c := New(Options{
+		SkillStore: store, Skills: store.List(),
+		SkillRunner: func(_ context.Context, sk skill.Skill, _ string, _ skill.SubagentRunOptions) (string, error) {
+			got = sk
+			return "done", nil
+		},
+	})
+	defer c.Close()
+
+	answer, err := c.RunSubagentProfile(context.Background(), "search-plugin:helper", "inspect", false)
+	if err != nil || answer != "done" {
+		t.Fatalf("RunSubagentProfile() = %q, %v", answer, err)
+	}
+	if !strings.Contains(got.Body, "## Runtime MCP tool bindings") || !strings.Contains(got.Body, "`mcp__search__search`") {
+		t.Fatalf("headless plugin subagent was not prepared: %q", got.Body)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"reasonix/internal/agent"
 	"reasonix/internal/autoresearch"
@@ -49,7 +50,7 @@ func (o *turnOrchestrator) runSyntheticTurnWithRawDisplay(ctx context.Context, i
 
 func (o *turnOrchestrator) runComposedSyntheticTurn(ctx context.Context, text string) error {
 	c := o.c
-	return c.runner.Run(agent.WithMemoryCompilerSkip(ctx), c.ComposeSynthetic(text))
+	return c.runner.Run(ctx, c.ComposeSynthetic(text))
 }
 
 // runSubagentSkillGoalLoop executes a slash-invoked runAs=subagent skill as a
@@ -114,9 +115,10 @@ func (o *turnOrchestrator) runSubagentSkillTurns(ctx context.Context, skills []s
 	if c.executor == nil {
 		return fmt.Errorf("subagent slash invocation requires an active session")
 	}
-	c.executor.Session().Add(provider.Message{Role: provider.RoleUser, Content: input, Images: images})
+	c.executor.Session().Add(provider.Message{Role: provider.RoleUser, Content: input, Images: images, CreatedAt: time.Now().UnixMilli()})
 
 	for _, sk := range skills {
+		sk = c.skills.prepare(sk)
 		callID := fmt.Sprintf("slash-skill-%d", c.slashSkillSeq.Add(1))
 		args, _ := json.Marshal(map[string]string{"name": sk.Name, "arguments": task})
 		toolEvent := event.Tool{
@@ -159,16 +161,8 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	parentSession := c.parentSessionID()
 	ctx = agent.WithParentSession(ctx, parentSession)
 	ctx = jobs.WithSession(ctx, parentSession)
-	ctx = agent.WithUserImages(ctx, c.inputImages(turn.input))
-	// Synthetic, controller-injected turns (goal-loop continuation,
-	// plan-approved execution, …) must not be Memory v5-compiled: compiling them
-	// re-injects a contract the model echoes back, which spins the goal loop
-	// forever (#5342, #5329). Only genuine user turns supply a compiler source.
-	if turn.synthetic || IsSyntheticUserMessage(turn.raw) {
-		ctx = agent.WithMemoryCompilerSkip(ctx)
-	} else {
-		ctx = agent.WithMemoryCompilerSourceInput(ctx, turn.raw)
-	}
+	userImages := c.inputImages(turn.input)
+	ctx = agent.WithUserImages(ctx, userImages)
 	input := c.compose(turn.input, turn.raw, !turn.synthetic)
 	startMessages := c.messageCount()
 	defer c.snapshotActivityIfChanged(startMessages)
@@ -220,18 +214,33 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 		c.clearInFlightTurn()
 	} else {
 		c.appendAutoResearchHeartbeat(autoResearchTaskID, autoresearch.HeartbeatWarning, err.Error())
-		// When the user explicitly cancels (Ctrl+C), the incomplete turn's
-		// assistant messages and tool results are already saved to the
-		// session. If they stay, the next turn's model sees leftover
-		// in-progress todo items and partial tool calls and may re-execute
-		// the interrupted work. Keep the real user prompt for visible turns so
-		// follow-up questions and resumes do not lose the user's context (#5499).
+		// When the user explicitly cancels, keep the real prompt and any fully
+		// paired tool work. Partial reasoning/output remains durable for display
+		// but is marked local-only, and a bounded recovery summary is folded into
+		// the next real user turn (#5499, #6680).
 		if errors.Is(err, context.Canceled) && c.CancelRequested() {
 			if turn.synthetic || IsSyntheticUserMessage(turn.raw) {
-				c.stripTurnMessagesAfter(startMessages)
+				c.stripInterruptedSyntheticTurnMessagesAfter(startMessages)
 			} else {
-				c.stripCancelledVisibleTurnMessagesAfter(startMessages)
+				c.stripCancelledVisibleTurnMessagesAfterWithFallback(startMessages, provider.Message{
+					Role:      provider.RoleUser,
+					Content:   input,
+					Images:    append([]string(nil), userImages...),
+					CreatedAt: time.Now().UnixMilli(),
+				})
 			}
+		} else if !turn.synthetic && !IsSyntheticUserMessage(turn.raw) && c.hasInterruptedDisplayAfter(startMessages, provider.Message{
+			Role: provider.RoleUser, Content: input,
+		}) {
+			// Provider/API failures use the same safe recovery path as an explicit
+			// stop once the agent has recorded a partial stream. Completed tool
+			// pairs survive; unsafe stream fragments stay local-only.
+			c.stripCancelledVisibleTurnMessagesAfterWithFallback(startMessages, provider.Message{
+				Role:      provider.RoleUser,
+				Content:   input,
+				Images:    append([]string(nil), userImages...),
+				CreatedAt: time.Now().UnixMilli(),
+			})
 		}
 		c.clearInFlightTurn()
 		return err
@@ -278,7 +287,7 @@ func (o *turnOrchestrator) runOrchestratedTurn(ctx context.Context, turn orchest
 	}()
 	if err != nil {
 		if errors.Is(err, context.Canceled) && c.CancelRequested() {
-			c.stripTurnMessagesAfter(execStart)
+			c.stripInterruptedSyntheticTurnMessagesAfter(execStart)
 		}
 		return err
 	}

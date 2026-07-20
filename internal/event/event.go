@@ -88,9 +88,6 @@ const (
 	// wrapper prefix), so a frontend can display it to the user as confirmation.
 	// Frontends use Steer to know a queued message has been delivered.
 	Steer
-	// MemoryCompilerStatsEvent carries content-free Memory v5 participation metrics
-	// for the current turn. Appended last to keep earlier Kind values stable.
-	MemoryCompilerStatsEvent
 	// GuardianAssessment reports the outcome of a guardian sub-agent safety review.
 	// Carries GuardianResult payload (Outcome, RiskLevel, Rationale, etc.).
 	GuardianAssessment
@@ -162,34 +159,11 @@ type FileDiff struct {
 // Approval identifies a pending tool-call approval for an ApprovalRequest
 // event. ID correlates the request with the controller's Approve(ID, …) reply.
 type Approval struct {
-	ID       string
-	Tool     string
-	Subject  string
-	Reason   string    // optional annotation explaining why approval is needed
-	Fresh    bool      // current human decision required; do not offer remembered grants
-	MCPTrust *MCPTrust // host-local MCP safety summary; nil for non-MCP approvals
-}
-
-// MCPTrust is the credential-free safety snapshot attached to an MCP tool
-// approval. It is a local UI/event payload only: provider requests never see it.
-type MCPTrust struct {
-	Server          string
-	TrustState      string
-	TrustSource     string
-	TrustScope      string
-	IsolationState  string
-	IsolationReason string
-	IdentityChanged bool
-	ChangedTools    []string
-	ToolChanges     []MCPToolChange
-	Readers         []string
-	Writers         []string
-	Destructive     []string
-}
-
-type MCPToolChange struct {
-	Name string
-	Kind string
+	ID      string
+	Tool    string
+	Subject string
+	Reason  string // optional annotation explaining why approval is needed
+	Fresh   bool   // current human decision required; do not offer remembered grants
 }
 
 // AskOption is one choice the user can pick for an AskQuestion.
@@ -295,6 +269,7 @@ const (
 	NoticeCodeToolBudget      = "tool_budget"
 	NoticeCodeLoopGuard       = "loop_guard"
 	NoticeCodeWorkspaceLease  = "workspace_lease"
+	NoticeCodeCancelledTurn   = "cancelled_turn_display"
 )
 
 type Event struct {
@@ -304,7 +279,6 @@ type Event struct {
 	Code             string                    // Notice: stable id for frontend localization; empty = unmapped
 	Reasoning        string                    // Message: the full reasoning chain
 	MemoryCitations  []provider.MemoryCitation // Message: local memory references displayed by rich frontends
-	MemoryCompiler   *MemoryCompilerStats      // MemoryCompilerStats: content-free Memory v5 usage counters
 	Tool             Tool                      // ToolDispatch / ToolResult
 	Usage            *provider.Usage           // Usage
 	Pricing          *provider.Pricing         // Usage: for cost display (nil = omit cost)
@@ -321,31 +295,13 @@ type Event struct {
 	Approval     Approval        // ApprovalRequest
 	Ask          Ask             // AskRequest
 	Err          error           // TurnDone: non-nil on failure
+	Cancelled    bool            // TurnDone: Cancel was requested while the turn was active
 	Outcome      string          // TurnDone: optional machine-readable recoverable outcome
 	Readiness    *FinalReadiness // TurnDone: structured final-readiness recovery state
 	Compaction   Compaction      // Compaction
 	Guardian     GuardianResult
 	RetryAttempt int // Retrying: 1-based attempt about to be made
 	RetryMax     int // Retrying: total attempts before giving up
-}
-
-// MemoryCompilerStats is intentionally limited to counts and estimated token
-// sizes. It must never carry memory text, prompts, tool output, paths, or IDs.
-type MemoryCompilerStats struct {
-	Injected         bool
-	UsefulIR         bool
-	CompiledTokens   int
-	IROverheadTokens int
-	MemoryReferences int
-	Constraints      int
-	RiskNotes        int
-	ExecutionSteps   int
-	TotalNodes       int
-	HighSignalNodes  int
-	ToolResultNodes  int
-	DecisionNodes    int
-	StrategyCount    int
-	LearningCount    int
 }
 
 // ReadinessAuditSink is an optional sink capability. Sinks that do not care

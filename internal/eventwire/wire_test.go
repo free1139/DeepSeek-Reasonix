@@ -81,8 +81,6 @@ func TestDesktopWireEventTypeCoversSharedPayloadFields(t *testing.T) {
 		"retryMax?: number;",
 		"memoryCitations?: MemoryCitation[];",
 		"export interface MemoryCitation",
-		"memoryCompiler?: MemoryCompilerStats;",
-		"export interface MemoryCompilerStats",
 		"cacheDiagnostics?: WireCacheDiagnostics;",
 		"export interface WireCacheDiagnostics",
 		"prefixHash: string;",
@@ -136,41 +134,6 @@ func TestToWireTurnOutcomeIsOptionalAndMachineReadable(t *testing.T) {
 	}
 	if strings.Contains(string(ordinary), `"outcome"`) {
 		t.Fatalf("ordinary error JSON must omit outcome: %s", ordinary)
-	}
-}
-
-func TestToWireMemoryCompilerStats(t *testing.T) {
-	w := ToWire(event.Event{
-		Kind: event.MemoryCompilerStatsEvent,
-		MemoryCompiler: &event.MemoryCompilerStats{
-			Injected:         true,
-			UsefulIR:         true,
-			CompiledTokens:   1200,
-			IROverheadTokens: 300,
-			MemoryReferences: 3,
-			Constraints:      2,
-			RiskNotes:        1,
-			ExecutionSteps:   4,
-			TotalNodes:       42,
-			HighSignalNodes:  11,
-			ToolResultNodes:  7,
-			DecisionNodes:    5,
-			StrategyCount:    3,
-			LearningCount:    6,
-		},
-	})
-	if w.Kind != "memory_compiler_stats" || w.MemoryCompiler == nil {
-		t.Fatalf("wire memory compiler stats = %+v", w)
-	}
-	if !w.MemoryCompiler.Injected || w.MemoryCompiler.TotalNodes != 42 || w.MemoryCompiler.CompiledTokens != 1200 {
-		t.Fatalf("wire memory compiler payload = %+v", w.MemoryCompiler)
-	}
-	b, err := json.Marshal(w)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if strings.Contains(string(b), "secret") || !strings.Contains(string(b), `"memoryCompiler":`) {
-		t.Fatalf("memory compiler stats JSON should contain only metrics payload: %s", string(b))
 	}
 }
 
@@ -292,22 +255,6 @@ func TestToWireInteractionAndLifecyclePayloads(t *testing.T) {
 			name: "fresh approval",
 			in:   event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{ID: "a2", Tool: "mcp__srv__wipe", Subject: "srv/wipe", Fresh: true}},
 			want: []string{`"kind":"approval_request"`, `"tool":"mcp__srv__wipe"`, `"fresh":true`},
-		},
-		{
-			name: "MCP trust approval payload",
-			in: event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{
-				ID: "a3", Tool: "mcp__srv__write", Subject: "srv/write",
-				MCPTrust: &event.MCPTrust{
-					Server: "srv", TrustState: "workspace", TrustSource: "user", TrustScope: "workspace",
-					IsolationState: "unavailable_unconfined", IsolationReason: "sandbox backend unavailable",
-					ChangedTools: []string{"write"}, ToolChanges: []event.MCPToolChange{{Name: "write", Kind: "schema_changed"}},
-					Readers: []string{"search"}, Writers: []string{"write"}, Destructive: []string{},
-				},
-			}},
-			want: []string{`"mcpTrust":{"server":"srv"`, `"trustState":"workspace"`, `"trustSource":"user"`,
-				`"isolationState":"unavailable_unconfined"`, `"changedTools":["write"]`,
-				`"toolChanges":[{"name":"write","kind":"schema_changed"}]`, `"readers":["search"]`,
-				`"writers":["write"]`, `"destructive":[]`},
 		},
 		{
 			name: "ask",
