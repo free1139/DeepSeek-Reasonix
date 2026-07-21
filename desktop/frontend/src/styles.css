@@ -9277,6 +9277,96 @@ body > .mermaid-diagram--fullscreen {
   flex-direction: column;
   gap: 12px;
 }
+.workspace-current-change {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.workspace-current-change__head {
+  min-height: 46px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-soft);
+}
+.workspace-current-change__head > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.workspace-current-change__head strong {
+  color: var(--fg);
+  font-size: 12.5px;
+  font-weight: 620;
+}
+.workspace-current-change__head > div > span {
+  overflow: hidden;
+  color: var(--fg-faint);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-current-change__head small {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.workspace-current-change__added {
+  color: var(--ok);
+}
+.workspace-current-change__removed {
+  color: var(--danger);
+}
+.workspace-current-change__body {
+  min-width: 0;
+  overflow: auto;
+}
+.workspace-current-change__body .diff,
+.workspace-current-change__body .code {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
+.workspace-commit-history {
+  border-top: 1px solid var(--border-soft);
+}
+.workspace-commit-history__toggle {
+  --wails-draggable: no-drag;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg-faint);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+.workspace-commit-history__toggle:hover,
+.workspace-commit-history__toggle:focus-visible {
+  background: var(--sidebar-hover);
+  color: var(--fg);
+}
+.workspace-commit-history__toggle small {
+  margin-left: auto;
+  color: var(--fg-faint);
+  font-size: 11px;
+}
+.workspace-commit-history--open .workspace-git-history__list {
+  padding-top: 8px;
+}
 .workspace-git-history__list {
   display: flex;
   flex-direction: column;
@@ -15204,14 +15294,14 @@ body > .mermaid-diagram--fullscreen {
   gap: 6px;
   max-height: 220px;
   overflow: auto;
-  padding-right: 2px;
+  padding: 0 2px 6px 0;
+  grid-auto-rows: min-content;
 }
 .provider-model-draft__option {
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  min-height: 32px;
   padding: 5px 7px;
   border: 1px solid var(--border-soft);
   border-radius: 7px;
@@ -15219,6 +15309,7 @@ body > .mermaid-diagram--fullscreen {
   color: var(--fg);
   font-family: var(--mono);
   font-size: var(--text-2xs);
+  overflow: hidden;
 }
 .provider-model-draft__model,
 .provider-model-draft__vision {
@@ -32222,6 +32313,8 @@ body > .mermaid-diagram--fullscreen {
 
 /* Align topicbar (replaces app-chrome in Creation mode) with Windows controls */
 .app--windows.app--creation .topicbar {
+  position: relative;
+  z-index: var(--z-app-chrome);
   transform: translateY(-4px) !important;
 }
 
@@ -34229,6 +34322,7 @@ body > .mermaid-diagram--fullscreen {
 }
 .remote-chip--reconnecting,
 .remote-chip--pending_hostkey,
+.remote-chip--pending_secret,
 .remote-chip--degraded {
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 50%, var(--border));
@@ -34268,6 +34362,22 @@ body > .mermaid-diagram--fullscreen {
   gap: 8px;
   flex-wrap: wrap;
   align-items: center;
+}
+.remote-host-form__credential {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.remote-host-form__credential-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+}
+.remote-host-form__credential-meta .btn {
+  flex-shrink: 0;
 }
 .remote-host-form__error,
 .remote-panel__error {
@@ -34508,6 +34618,21 @@ body > .mermaid-diagram--fullscreen {
   gap: 8px;
   margin-top: 12px;
 }
+.remote-secret-dialog__input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+  padding: 8px 10px;
+  color: var(--fg);
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+}
+.remote-secret-dialog__input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
 .remote-connection-error-dialog__summary {
   margin: 0;
   color: var(--fg-dim);
@@ -34739,6 +34864,7 @@ body > .mermaid-diagram--fullscreen {
 .remote-switcher__state--connecting,
 .remote-switcher__state--reconnecting,
 .remote-switcher__state--pending_hostkey,
+.remote-switcher__state--pending_secret,
 .remote-switcher__state--degraded { background: var(--warn); }
 .remote-switcher__state--error { background: var(--danger); }
 .remote-switcher__manage {

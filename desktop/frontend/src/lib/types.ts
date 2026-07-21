@@ -653,6 +653,15 @@ export interface WorkspaceChangesView {
   gitBranch?: string;
 }
 
+export interface WorkspaceChangeDetailView {
+  diff?: string;
+  source?: "git" | "session";
+  added?: number;
+  removed?: number;
+  binary?: boolean;
+  truncated?: boolean;
+}
+
 export interface GitCommitView {
   hash: string;
   author: string;
@@ -983,6 +992,7 @@ export type RemoteConnState =
   | "reconnecting"
   | "degraded"
   | "pending_hostkey"
+  | "pending_secret"
   | "stopped";
 
 export type RemoteServerState =
@@ -1008,6 +1018,8 @@ export interface RemoteHostView {
   defaultWorkspace: string;
   serveInstall: string;
   useSSHConfig: boolean;
+  passwordSet?: boolean;
+  keyPassphraseSet?: boolean;
 }
 
 export interface RemoteHostInput {
@@ -1020,6 +1032,11 @@ export interface RemoteHostInput {
   defaultWorkspace: string;
   serveInstall: string;
   useSSHConfig: boolean;
+  password?: string;
+  keyPassphrase?: string;
+  clearPassword?: boolean;
+  clearPassphrase?: boolean;
+  preserveExistingSettings?: boolean;
 }
 
 export interface RemoteFingerprintView {
@@ -1027,6 +1044,14 @@ export interface RemoteFingerprintView {
   address: string;
   keyType: string;
   sha256: string;
+}
+
+export interface RemoteSecretPromptView {
+  promptId: string;
+  hostId: string;
+  host: string;
+  kind: "password" | "passphrase";
+  identity?: string;
 }
 
 export interface RemoteKnownHostLocation {
@@ -1046,6 +1071,7 @@ export interface RemoteConnectionStatus {
   error?: string;
   errorDetails?: RemoteConnectionErrorDetails;
   fingerprint?: RemoteFingerprintView;
+  secretPrompt?: RemoteSecretPromptView;
   attempt?: number;
 }
 
