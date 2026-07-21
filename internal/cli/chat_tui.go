@@ -826,12 +826,6 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if cm.width != prevWidth && resizeAnchor.valid {
 			cm.viewport.SetYOffset(resizeAnchor.yOffset(cm.transcript, contentW))
 		}
-	} else if wasAtBottom || cm.forceGotoBottom {
-		// Viewport shrunk (e.g. a bottom panel like todo appeared) without
-		// content change.  Re-pin to bottom so the user doesn't lose sight
-		// of the latest output.
-		cm.viewport.GotoBottom()
-		cm.forceGotoBottom = false
 	}
 	if cm.forceGotoBottom {
 		cm.viewport.GotoBottom()
