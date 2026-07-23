@@ -2470,9 +2470,84 @@ func TestDisconnectMCPServerRemovesLazyPlaceholder(t *testing.T) {
 	}
 }
 
+func TestRegisterMCPServerOnDemandDefersConnectionUntilFirstUse(t *testing.T) {
+	t.Setenv("REASONIX_CACHE_HOME", t.TempDir())
+	var requests atomic.Int32
+	var initializes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if len(req.ID) == 0 || string(req.ID) == "null" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		var result any
+		switch req.Method {
+		case "initialize":
+			initializes.Add(1)
+			result = map[string]any{
+				"protocolVersion": "2025-03-26",
+				"serverInfo":      map[string]any{"name": "on-demand", "version": "1"},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []map[string]any{{
+				"name":        "echo",
+				"description": "Echo a value.",
+				"inputSchema": map[string]any{"type": "object"},
+			}}}
+		default:
+			result = map[string]any{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result":  result,
+		})
+	}))
+	defer server.Close()
+
+	host := plugin.NewHost()
+	defer host.Close()
+	reg := tool.NewRegistry()
+	ctrl := New(Options{Host: host, Registry: reg, PluginCtx: context.Background()})
+	entry := config.PluginEntry{Name: "on-demand", Type: "http", URL: server.URL, Source: config.MCPSourceUserConfig}
+	if _, err := ctrl.RegisterMCPServerOnDemand(entry); err != nil {
+		t.Fatalf("RegisterMCPServerOnDemand: %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("enable-time HTTP requests = %d, want zero", got)
+	}
+	connect, ok := reg.Get("mcp__on-demand__connect")
+	if !ok {
+		t.Fatalf("cache-miss connect stub missing; names=%v", reg.Names())
+	}
+	if _, err := connect.Execute(context.Background(), json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "initializing on first use") {
+		t.Fatalf("first-use connect result = %v, want initializing guidance", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !host.HasClient("on-demand") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !host.HasClient("on-demand") {
+		t.Fatal("first tool use did not start the MCP connection")
+	}
+	if got := initializes.Load(); got != 1 {
+		t.Fatalf("initialize calls = %d, want exactly one on-demand start", got)
+	}
+}
+
 func TestAddMCPServerAuthorizesExplicitUserAddBeforeConnecting(t *testing.T) {
 	var configured plugin.Spec
 	c := New(Options{
+		WorkspaceRoot:    "/workspace",
 		MCPConfigureSpec: func(spec *plugin.Spec) { configured = *spec },
 	})
 
@@ -2480,7 +2555,7 @@ func TestAddMCPServerAuthorizesExplicitUserAddBeforeConnecting(t *testing.T) {
 		t.Fatal("AddMCPServer without a command unexpectedly succeeded")
 	}
 	if configured.ConfigSource != string(config.MCPSourceUserConfig) ||
-		!configured.ImplicitApproval || configured.RequireLaunchApproval {
+		!configured.Authorized || configured.RequireLaunchApproval || configured.WorkspaceRoot != "/workspace" {
 		t.Fatalf("configured spec = %+v, want user-authorized add-and-use policy", configured)
 	}
 }
@@ -3135,140 +3210,6 @@ func TestSessionGrantShortCircuitsGuardianReview(t *testing.T) {
 	}
 }
 
-func TestMCPAutoReviewerIsFinalAndDoesNotPromptHuman(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		outcome string
-		risk    string
-		allow   bool
-	}{
-		{name: "allow", outcome: "allow", risk: "low", allow: true},
-		{name: "deny", outcome: "deny", risk: "high", allow: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			guardianProv := &recordingProvider{
-				name:    "guardian",
-				streams: [][]provider.Chunk{textTurn(fmt.Sprintf(`{"risk_level":%q,"user_authorization":"unknown","outcome":%q,"rationale":"reviewed"}`, tc.risk, tc.outcome))},
-			}
-			guardianSess := guardian.NewSession(guardianProv, tool.NewRegistry(), guardian.PolicyPrompt(), "guardian-test", 0, nil, event.Discard)
-			exec := agent.New(&recordingProvider{name: "executor"}, tool.NewRegistry(), agent.NewSession("sys"), agent.Options{}, event.Discard)
-			prompts := 0
-			c := New(Options{
-				Executor: exec,
-				Guardian: guardianSess,
-				Sink: event.FuncSink(func(e event.Event) {
-					if e.Kind == event.ApprovalRequest {
-						prompts++
-					}
-				}),
-			})
-			gate := permission.NewGate(permission.New("allow", nil, nil, nil), gateApprover{c})
-			allow, _, err := gate.CheckMCP(context.Background(), "mcp__srv__write", "srv/write", json.RawMessage(`{"target":"one"}`), false, false, "prompt", "auto_review")
-			if err != nil || allow != tc.allow || prompts != 0 || len(guardianProv.requests) != 1 {
-				t.Fatalf("auto reviewer result allow=%v err=%v prompts=%d reviews=%d", allow, err, prompts, len(guardianProv.requests))
-			}
-		})
-	}
-}
-
-// TestMCPAutoModeGlobalAllowSkipsMissingReviewer: approval_mode=auto inherits
-// the global posture. When the global policy already allows the call, no
-// reviewer runs at all — this is mode inheritance, not a reviewer fallback.
-func TestMCPAutoModeGlobalAllowSkipsMissingReviewer(t *testing.T) {
-	prompts := 0
-	c := New(Options{Sink: event.FuncSink(func(e event.Event) {
-		if e.Kind == event.ApprovalRequest {
-			prompts++
-		}
-	})})
-	c.SetToolApprovalMode(ToolApprovalAuto)
-	gate := permission.NewGate(permission.New("allow", nil, nil, nil), gateApprover{c})
-	allow, reason, err := gate.CheckMCP(context.Background(), "mcp__srv__write", "srv/write", nil, false, false, "auto", "auto_review")
-	if err != nil || !allow || reason != "" || prompts != 0 {
-		t.Fatalf("globally allowed auto call = (%v,%q,%v), prompts=%d", allow, reason, err, prompts)
-	}
-}
-
-type erroringProvider struct{ requests int }
-
-func (p *erroringProvider) Name() string { return "guardian-down" }
-
-func (p *erroringProvider) Stream(context.Context, provider.Request) (<-chan provider.Chunk, error) {
-	p.requests++
-	return nil, fmt.Errorf("guardian transport down")
-}
-
-// TestMCPAutoReviewerUnavailableDegradesToStrictFreshHuman: when auto_review is
-// configured but the reviewer errors out, the call degrades to a fresh human
-// decision. Session grants must neither answer it nor be minted by it, so a
-// second identical call prompts again.
-func TestMCPAutoReviewerUnavailableDegradesToStrictFreshHuman(t *testing.T) {
-	guardianProv := &erroringProvider{}
-	guardianSess := guardian.NewSession(guardianProv, tool.NewRegistry(), guardian.PolicyPrompt(), "guardian-test", 0, nil, event.Discard)
-	exec := agent.New(&recordingProvider{name: "executor"}, tool.NewRegistry(), agent.NewSession("sys"), agent.Options{}, event.Discard)
-	approvals := make(chan event.Approval, 2)
-	c := New(Options{
-		Executor: exec,
-		Guardian: guardianSess,
-		Sink: event.FuncSink(func(e event.Event) {
-			if e.Kind == event.ApprovalRequest {
-				approvals <- e.Approval
-			}
-		}),
-	})
-	gate := permission.NewGate(permission.New("ask", nil, nil, nil), gateApprover{c})
-	type result struct {
-		allow  bool
-		reason string
-		err    error
-	}
-	run := func() chan result {
-		done := make(chan result, 1)
-		go func() {
-			allow, reason, err := gate.CheckMCP(context.Background(), "mcp__srv__write", "srv/write", json.RawMessage(`{"target":"one"}`), false, false, "auto", "auto_review")
-			done <- result{allow: allow, reason: reason, err: err}
-		}()
-		return done
-	}
-
-	done := run()
-	var approval event.Approval
-	select {
-	case approval = <-approvals:
-	case <-time.After(30 * time.Second):
-		t.Fatal("reviewer failure did not degrade to a human prompt")
-	}
-	// Answer with a session grant: the strict decision must not persist it.
-	c.Approve(approval.ID, true, true, false)
-	select {
-	case got := <-done:
-		if got.err != nil || !got.allow {
-			t.Fatalf("approved degraded call = %+v", got)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("degraded approval never completed")
-	}
-
-	done = run()
-	select {
-	case approval = <-approvals:
-	case <-time.After(30 * time.Second):
-		t.Fatal("second call reused a grant; strict fresh approval must prompt every time")
-	}
-	c.Approve(approval.ID, false, false, false)
-	select {
-	case got := <-done:
-		if got.err != nil || got.allow || !strings.Contains(got.reason, "reviewer was unavailable") {
-			t.Fatalf("declined degraded call = %+v", got)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("degraded decline never completed")
-	}
-	if guardianProv.requests != 2 {
-		t.Fatalf("guardian consulted %d times, want 2", guardianProv.requests)
-	}
-}
-
 func TestHeadlessGateRefusesFreshHumanApprovalTools(t *testing.T) {
 	gate := NewHeadlessPermissionGate(permission.New("ask", nil, nil, nil))
 
@@ -3579,6 +3520,42 @@ func TestApprovalPersistentBashPrefixRememberRule(t *testing.T) {
 	}
 	if len(notices) != 1 || !strings.Contains(notices[0], "Bash(go test:*)") || !strings.Contains(notices[0], "reasonix.toml") {
 		t.Fatalf("notices = %v, want saved rule notice", notices)
+	}
+}
+
+func TestApprovalPersistenceFailureKeepsSessionGrant(t *testing.T) {
+	ids := make(chan string, 1)
+	var notices []event.Event
+	prompts := 0
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				prompts++
+				ids <- e.Approval.ID
+			}
+			if e.Kind == event.Notice {
+				notices = append(notices, e)
+			}
+		}),
+		OnRemember: func(rule string) RememberResult {
+			return RememberResult{Rule: rule, Path: "reasonix.toml", Err: errors.New("disk unavailable")}
+		},
+	})
+	go func() {
+		c.Approve(<-ids, true, true, true)
+	}()
+
+	for i := 0; i < 2; i++ {
+		allow, remember, err := gateApprover{c}.Approve(context.Background(), "bash", "go test ./...", nil)
+		if err != nil || !allow || remember {
+			t.Fatalf("Approve call %d = (%v,%v,%v), want session-allowed despite persistence failure", i, allow, remember, err)
+		}
+	}
+	if prompts != 1 {
+		t.Fatalf("approval prompts = %d, want one because failed persistence must retain the session grant", prompts)
+	}
+	if len(notices) != 1 || notices[0].Level != event.LevelWarn || !strings.Contains(notices[0].Text, "disk unavailable") {
+		t.Fatalf("notices = %+v, want one persistence failure warning", notices)
 	}
 }
 

@@ -9,10 +9,11 @@
 // typecheck green by falling back to a disabled drift check below.
 import type * as GeneratedApp from "../../wailsjs/go/main/App";
 import type { InvocationRequest } from "./invocationDisplay";
+import type { ProviderTrustPrompt, WorkbenchActiveTarget, WorkbenchRemoteHint } from "./workbenchTarget";
 
 import { addBreadcrumb } from "./breadcrumbs";
 import { t } from "./i18n";
-import { providerRequiresKey } from "./providerModels";
+import { providerIsConfigured, providerRequiresKey } from "./providerModels";
 import { DEFAULT_STATUS_BAR_ITEMS, normalizeStatusBarItems } from "./statusBarItems";
 import { registerTrustedThemeBackgroundURLs } from "./themePack";
 import { modeHasAutoApproveTools, modeWithAutoApproveTools, modeWithPlan, normalizeCollaborationMode, normalizeMode, normalizeTokenMode, normalizeToolApprovalMode } from "./types";
@@ -56,7 +57,10 @@ import type {
   HookConfigView,
   HooksSettingsView,
   JobView,
+  MCPMarketplaceEntry,
   MCPServerInput,
+  MCPInstallResult,
+  MCPMarketplaceView,
   MCPToolView,
   MemorySuggestion,
   MemorySuggestionsView,
@@ -167,6 +171,13 @@ export interface AppBindings {
   CancelTab(tabID: string): Promise<void>;
   Approve(id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
   ApproveTab(tabID: string, id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
+  ResolveRecovery(id: string, action: string, feedback: string): Promise<void>;
+  ResolveRecoveryTab(tabID: string, id: string, action: string, feedback: string): Promise<void>;
+  // Legacy no-ops: Auto Guard is always built into Auto.
+  SetRecoveryCheckpointEnabled(enabled: boolean): Promise<void>;
+  SetRecoveryCheckpointEnabledTab(tabID: string, enabled: boolean): Promise<void>;
+  RecoveryCheckpointEnabled(): Promise<boolean>;
+  RecoveryCheckpointEnabledTab(tabID: string): Promise<boolean>;
   AnswerQuestion(id: string, answers: QuestionAnswer[]): Promise<void>;
   AnswerQuestionForTab(tabID: string, id: string, answers: QuestionAnswer[]): Promise<void>;
   ReplayPendingPrompts(): Promise<void>;
@@ -245,6 +256,8 @@ export interface AppBindings {
   Commands(): Promise<CommandInfo[]>;
   Capabilities(): Promise<CapabilitiesView>;
   MCPServers(): Promise<ServerView[]>;
+  MCPMarketplace(query: string): Promise<MCPMarketplaceView>;
+  MCPMarketplaceResolve(registryName: string): Promise<MCPMarketplaceEntry>;
   SkillsSettings(): Promise<SkillsSettingsView>;
   CapabilityDiagnostics(includeSessionRuntime: boolean): Promise<CapabilityDiagnosticsReport>;
   Plugins(): Promise<PluginView[]>;
@@ -255,6 +268,7 @@ export interface AppBindings {
   UpdatePlugin(name: string): Promise<string>;
   PluginDoctor(name: string): Promise<PluginView>;
   AddMCPServer(input: MCPServerInput): Promise<number>;
+  InstallMCPServer(input: MCPServerInput): Promise<MCPInstallResult>;
   UpdateMCPServer(name: string, input: MCPServerInput): Promise<void>;
   RemoveMCPServer(name: string): Promise<void>;
   AuthorizeAndConnectMCPServer(name: string): Promise<void>;
@@ -347,6 +361,8 @@ export interface AppBindings {
   SetMaxParallelWriters(n: number): Promise<void>;
   SetAutoPlan(mode: string): Promise<void>;
   SetDefaultToolApprovalMode(mode: string): Promise<void>;
+  SetDefaultAutoRecoveryCheckpoint(enabled: boolean): Promise<void>;
+
   SaveProvider(p: ProviderView): Promise<void>;
   SaveProviderWithKey(p: ProviderView, key: string): Promise<string>;
   AddOfficialProviderAccess(kind: string, key: string): Promise<string>;
@@ -474,6 +490,15 @@ export interface AppBindings {
   RemoteServerStatus(hostId: string): Promise<RemoteServerView>;
   RemoteServerLogs(hostId: string, tailLines: number): Promise<string>;
   RemoteLastWorkspace(hostId: string): Promise<string>;
+  // ── Native Remote Workbench (same main window) ──
+  WorkbenchActiveTarget(): Promise<WorkbenchActiveTarget>;
+  WorkbenchLastRemoteHint(): Promise<WorkbenchRemoteHint>;
+  WorkbenchSwitchLocal(): Promise<WorkbenchActiveTarget>;
+  WorkbenchConnectRemote(hostId: string, workspace: string): Promise<void>;
+  WorkbenchDisconnectRemote(): Promise<void>;
+  WorkbenchRemoteRequest(method: string, paramsJSON: string): Promise<string>;
+  WorkbenchResolveProviderTrust(accept: boolean): Promise<void>;
+  WorkbenchPendingProviderTrust(): Promise<ProviderTrustPrompt | null>;
 }
 
 // Compile-time drift check. Exclude<A, B> extracts keys in A that are missing
@@ -731,6 +756,24 @@ export function onRemoteServer(cb: (s: RemoteServerView) => void): () => void {
   return registerMockRemoteListener("server", cb as (v: unknown) => void);
 }
 
+/** Provider authorization is a Desktop-only prompt. The payload is deliberately
+ * secret-free; the one-shot answer returns through the typed Wails binding. */
+export function onProviderTrust(cb: (prompt: ProviderTrustPrompt) => void): () => void {
+  if (realApp() && typeof window !== "undefined" && window.runtime) {
+    return window.runtime.EventsOn("remote:provider-trust", (payload?: unknown) => cb((payload ?? {}) as ProviderTrustPrompt));
+  }
+  return () => {};
+}
+
+/** Committed Local/Remote projection changes. Generation lets consumers drop
+ * stale async hydration when the user switches targets quickly. */
+export function onWorkbenchTarget(cb: (target: WorkbenchActiveTarget) => void): () => void {
+  if (realApp() && typeof window !== "undefined" && window.runtime) {
+    return window.runtime.EventsOn("remote:workbench-target", (payload?: unknown) => cb((payload ?? { kind: "local" }) as WorkbenchActiveTarget));
+  }
+  return () => {};
+}
+
 // Mock event fan-out so browser-dev and tsx tests can drive remote:* events
 // without a Wails runtime.
 type MockRemoteChannel = "status" | "forwards" | "server";
@@ -760,7 +803,7 @@ function bridgeBreadcrumb(method: string): string {
   if (/^(SaveProvider|AddOfficialProviderAccess|AddProviderPresetAccess|ResetProviderPresetAccess|RemoveProviderAccess|DeleteProvider|SaveProviderKey|SetProviderKey|ClearProviderKey|FetchProviderModels|ConnectKey)/.test(method))
     return `provider ${method}`;
   if (/^(CheckUpdate|DownloadUpdate|InstallUpdate|ApplyUpdate|OpenDownloadPage)/.test(method)) return `update ${method}`;
-  if (/^(AddMCPServer|UpdateMCPServer|RemoveMCPServer|AuthorizeAndConnectMCPServer|ReconnectMCPServer|ClearMCPServerAuthentication|SetMCPServer)/.test(method))
+  if (/^(AddMCPServer|InstallMCPServer|UpdateMCPServer|RemoveMCPServer|AuthorizeAndConnectMCPServer|ReconnectMCPServer|ClearMCPServerAuthentication|SetMCPServer)/.test(method))
     return `mcp ${method}`;
   if (/^(AddSkillPath|RemoveSkillPath|RefreshSkills|SetSkillEnabled|AcceptSkillSuggestion|AvailableSubagentTools|CreateSubagentProfile|UpdateSubagentProfile|DeleteSubagentProfile|SetSubagentProfileModel|SetSubagentProfileEffort|TrySubagentProfile|CancelTrySubagentProfile)/.test(method))
     return `skill ${method}`;
@@ -1133,7 +1176,6 @@ function makeMockApp(): AppBindings {
       tools: 4,
       prompts: 2,
       resources: 0,
-      trustedReadOnlyTools: ["pull_request_read"],
       toolList: [
         { name: "issue_read", description: "Read GitHub issue details and comments.", readOnlyHint: true },
         { name: "pull_request_read", description: "Read pull request metadata, files, and review threads.", readOnlyHint: true },
@@ -2035,6 +2077,45 @@ function makeMockApp(): AppBindings {
         });
         return;
       }
+      if (trimmedInput === "/recovery-preview" || trimmedInput === "recovery preview" || trimmedInput === "恢复预览") {
+        pendingApprovalPreview = true;
+        pendingApprovalPreviewPrompt = { id: "mock-recovery-preview", tool: "write_file" };
+        await delay(250);
+        if (cancelled) return;
+        emit({
+          kind: "approval_request",
+          approval: {
+            id: "mock-recovery-preview",
+            tool: "write_file",
+            subject: "internal/recovery/gate.go",
+            reason: "The proposed recovery changes the implementation method after a failing verification.",
+            fresh: true,
+            kind: "recovery",
+            recovery: {
+              source_agent: "root",
+              failed_tool: "bash",
+              failed_summary: "go test ./internal/recovery failed",
+              diagnosis: "The failure is isolated to recovery state persistence.",
+              next_tool: "write_file",
+              next_action: "Update internal/recovery/gate.go",
+              change_kind: "strategy",
+              change_rationale: "The proposed edit changes the recovery method and needs a fresh decision.",
+              plan_before: [
+                "1. Keep the existing Auto execution path [in_progress]",
+                "2. Add execution-risk approval prompts [pending]",
+                "3. Run the recovery regression suite [pending]",
+              ].join("\n"),
+              plan_after: [
+                "1. Keep the existing Auto execution path [in_progress]",
+                "2. Ask only when strategy or scope changes [pending]",
+                "3. Show the old and proposed plan before deciding [pending]",
+                "4. Run the recovery regression suite [pending]",
+              ].join("\n"),
+            },
+          },
+        });
+        return;
+      }
       if (
         trimmedInput === "/sandbox-escape-preview" ||
         trimmedInput === "sandbox escape preview" ||
@@ -2351,6 +2432,29 @@ function makeMockApp(): AppBindings {
         },
         async ApproveTab(_tabID, id, allow, session, persist) {
           await withMockTabScope(_tabID, () => this.Approve(id, allow, session, persist));
+        },
+        async ResolveRecovery(id, action, feedback) {
+          const active = mockTabs.find((tab) => tab.active);
+          await this.ResolveRecoveryTab(active?.id ?? "", id, action, feedback);
+        },
+        async ResolveRecoveryTab(_tabID, id, action, feedback) {
+          void id;
+          void feedback;
+          pendingApprovalPreview = false;
+          pendingApprovalPreviewPrompt = undefined;
+          emit({
+            kind: "message",
+            text: `recovery preview answered: ${action}`,
+          });
+          emitMockTurnDone();
+        },
+        async SetRecoveryCheckpointEnabled(_enabled) {},
+        async SetRecoveryCheckpointEnabledTab(_tabID, _enabled) {},
+        async RecoveryCheckpointEnabled() {
+          return true;
+        },
+        async RecoveryCheckpointEnabledTab(_tabID) {
+          return true;
         },
         async AnswerQuestion(_id, answers) {
       if (!pendingAskPreview) return;
@@ -2825,6 +2929,42 @@ function makeMockApp(): AppBindings {
     async MCPServers() {
       return capServers.map((s) => ({ ...s }));
     },
+    async MCPMarketplace(query: string) {
+      const servers = [
+        {
+          name: "io.modelcontextprotocol/server-filesystem",
+          suggestedName: "server-filesystem",
+          title: "Filesystem",
+          description: "Secure file operations through MCP.",
+          version: "1.0.0",
+          installable: true,
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-filesystem@1.0.0"],
+        },
+        {
+          name: "io.example/manual",
+          suggestedName: "manual",
+          title: "Manual setup example",
+          description: "Requires an API key before installation.",
+          version: "1.0.0",
+          installable: false,
+          unavailableReason: "package requires environment variables or arguments",
+          args: [],
+        },
+      ];
+      const normalized = query.trim().toLowerCase();
+      return {
+        servers: normalized ? servers.filter((entry) => [entry.name, entry.title, entry.description].join(" ").toLowerCase().includes(normalized)) : servers,
+        cached: false,
+      } as MCPMarketplaceView;
+    },
+    async MCPMarketplaceResolve(registryName: string) {
+      const result = await this.MCPMarketplace(registryName);
+      const entry = result.servers.find((candidate) => candidate.name.toLowerCase() === registryName.trim().toLowerCase());
+      if (!entry) throw new Error(`MCP Registry has no server named ${JSON.stringify(registryName)}`);
+      return entry;
+    },
     async SkillsSettings() {
       return {
         skills: capSkills.map((s) => ({ ...s })),
@@ -2987,6 +3127,10 @@ function makeMockApp(): AppBindings {
       });
       return tools;
     },
+    async InstallMCPServer(input: MCPServerInput) {
+      const tools = await this.AddMCPServer(input);
+      return { name: input.name, state: "ready" as const, toolCount: tools, action: "none" as const, message: `${input.name} is ready` };
+    },
     async UpdateMCPServer(name: string, input: MCPServerInput) {
       capServers = capServers.map((s) => {
         if (s.name !== name) return s;
@@ -3002,7 +3146,6 @@ function makeMockApp(): AppBindings {
           url: input.transport === "stdio" ? "" : input.url,
           envKeys: input.env ? Object.keys(input.env).sort() : s.envKeys,
           headerKeys: input.headers ? Object.keys(input.headers).sort() : s.headerKeys,
-          trustedReadOnlyTools: input.trustedReadOnlyTools ?? s.trustedReadOnlyTools,
           tools: nextTools,
           error: undefined,
           authStatus: nextStatus !== "connected" && input.transport !== "stdio" ? "possible" : undefined,
@@ -3601,6 +3744,9 @@ function makeMockApp(): AppBindings {
     async SetDefaultToolApprovalMode(mode: string) {
       settings.defaultToolApprovalMode = normalizeToolApprovalMode(mode);
     },
+    async SetDefaultAutoRecoveryCheckpoint(_enabled: boolean) {
+      // Legacy no-op; Auto Guard is always built into Auto.
+    },
     async SaveProvider(p: ProviderView) {
       p.added = true;
       const i = settings.providers.findIndex((x) => x.name === p.name);
@@ -4054,15 +4200,18 @@ function makeMockApp(): AppBindings {
         window.open("https://reasonix.io/?download=desktop#start", "_blank", "noopener");
       }
     },
-    // Dev seam: drives the overlay flow in the browser until ConnectKey sets the
-    // key. Matches ConnectKey on apiKeyEnv so the two stay in sync.
+    // Dev seam: match the backend's provider-agnostic onboarding predicate.
     async NeedsOnboarding() {
-      return !settings.providers.find((p) => p.apiKeyEnv === "DEEPSEEK_API_KEY")?.keySet;
+      return !settings.providers.some((p) => p.models.length > 0 && providerIsConfigured(p));
     },
     async ConnectKey(apiKey: string) {
       if (!apiKey.trim()) throw new Error("key is required");
       settings.providers.forEach((p) => {
-        if (p.apiKeyEnv === "DEEPSEEK_API_KEY") p.keySet = true;
+        if (p.apiKeyEnv === "DEEPSEEK_API_KEY") {
+          p.added = true;
+          p.keySet = true;
+          p.configured = true;
+        }
       });
       await delay(300);
       return "";
@@ -4513,6 +4662,37 @@ function makeMockApp(): AppBindings {
     async RemoteLastWorkspace() {
       return "~/app";
     },
+    async WorkbenchActiveTarget() {
+      return { ...mockWorkbenchTarget };
+    },
+    async WorkbenchLastRemoteHint() {
+      return mockWorkbenchTarget.kind === "ssh"
+        ? { hostId: mockWorkbenchTarget.hostId, workspace: mockWorkbenchTarget.workspace, label: mockWorkbenchTarget.hostId }
+        : {};
+    },
+    async WorkbenchSwitchLocal() {
+      mockWorkbenchTarget = { kind: "local", identityGen: (mockWorkbenchTarget.identityGen ?? 0) + 1, requestSeq: 1 };
+      return { ...mockWorkbenchTarget };
+    },
+    async WorkbenchConnectRemote(hostId, workspace) {
+      mockWorkbenchTarget = {
+        kind: "ssh",
+        hostId,
+        workspace,
+        identityGen: (mockWorkbenchTarget.identityGen ?? 0) + 1,
+        requestSeq: 1,
+      };
+    },
+    async WorkbenchDisconnectRemote() {
+      mockWorkbenchTarget = { kind: "local", identityGen: (mockWorkbenchTarget.identityGen ?? 0) + 1, requestSeq: 1 };
+    },
+    async WorkbenchRemoteRequest(_method, _paramsJSON) {
+      return "{}";
+    },
+    async WorkbenchResolveProviderTrust() {},
+    async WorkbenchPendingProviderTrust() {
+      return null;
+    },
   };
 }
 
@@ -4539,3 +4719,4 @@ let mockRemoteHosts: RemoteHostView[] = [
 ];
 const mockRemoteConn: Record<string, RemoteConnectionStatus["state"]> = {};
 const mockRemoteForwards: Record<string, RemoteForwardView[]> = {};
+let mockWorkbenchTarget: WorkbenchActiveTarget = { kind: "local", identityGen: 1, requestSeq: 1 };

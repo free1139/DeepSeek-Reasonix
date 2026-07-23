@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"reasonix/internal/event"
@@ -30,6 +31,31 @@ import (
 
 // protocolVersion is the MCP revision Reasonix advertises during initialize.
 const protocolVersion = "2024-11-05"
+
+// MCPProcessMode selects how a local stdio MCP process is launched.
+// It is an internal runtime field, not a user-facing config knob.
+type MCPProcessMode string
+
+const (
+	// MCPProcessHost runs authorized stdio MCP as a trusted host process that
+	// does not inherit the agent Bash command sandbox. This is the product
+	// default so servers such as chrome-devtools-mcp can reach the real browser,
+	// Keychain, LaunchServices, and local app services.
+	MCPProcessHost MCPProcessMode = "host"
+	// MCPProcessConfined wraps the process with sandbox.CommandArgs. Reserved for
+	// internal managed deployments and tests; never auto-selected for user installs.
+	MCPProcessConfined MCPProcessMode = "confined"
+)
+
+// ResolvedProcessMode returns the effective process mode. Empty means host.
+func (s Spec) ResolvedProcessMode() MCPProcessMode {
+	switch s.ProcessMode {
+	case MCPProcessConfined:
+		return MCPProcessConfined
+	default:
+		return MCPProcessHost
+	}
+}
 
 // defaultCallTimeout is the MCP JSON-RPC call deadline applied when neither the
 // caller context nor config provides one. It is intentionally finite so a slow
@@ -65,59 +91,47 @@ type Spec struct {
 	// for cwd-aware servers like CodeGraph, which detect the project from the
 	// directory they are launched in — they must be pinned to the project root.
 	Dir string
+	// WorkspaceRoot is the project root exposed through the MCP roots capability.
+	// It is runtime-only and intentionally separate from Dir: user-installed
+	// stdio servers keep inheriting Reasonix's cwd while still receiving the
+	// explicit workspace root when they ask for roots/list.
+	WorkspaceRoot string
 	// Stderr optionally mirrors plugin subprocess stderr output. Stderr is always
 	// captured in a bounded buffer for failure diagnostics; nil keeps it out of
 	// the terminal so child logs cannot corrupt interactive UIs.
 	Stderr io.Writer
-	// ReadOnlyToolNames marks raw MCP tool names as read-only when the server omits
-	// annotations.readOnlyHint. It preserves known and legacy compatibility
-	// overrides; normal MCP classification should rely on server metadata.
-	ReadOnlyToolNames map[string]bool
-	// ReadOnlyModelToolNames marks explicitly declared model-visible MCP tool names
-	// ("mcp__<server>__<tool>") as read-only. This supports user-level
-	// declarations such as agent.plan_mode_allowed_tools without reverse-parsing
-	// normalized MCP tool names back into raw server-local names.
-	ReadOnlyModelToolNames map[string]bool
-	// DefaultToolsApprovalMode controls MCP approval when no raw-tool override
-	// exists: auto|prompt|writes|approve. Empty uses auto unless the composition
-	// root marks this explicitly user-authorized server for implicit approval.
-	DefaultToolsApprovalMode string
-	// ToolApprovalModes overrides approval behavior by raw server-local tool name.
-	ToolApprovalModes map[string]string
-	// ApprovalsReviewer selects user|auto_review for this server. Empty preserves
-	// legacy behavior: Guardian reviews ordinary Ask decisions, while destructive
-	// calls still require the user.
-	ApprovalsReviewer string
 	// LaunchManager owns exact project launch grants and mutable launcher locks.
-	// It never contributes to SpecFingerprint or provider-visible tool schemas.
+	// It never contributes to SchemaCacheKey or provider-visible tool schemas.
 	LaunchManager *mcplaunch.Manager
 	// ConfigSource disambiguates otherwise identical server names coming from
-	// workspace config, a host transport, or a verified plugin package.
-	ConfigSource           string
-	ImplicitApproval       bool
-	RequireLaunchApproval  bool
-	OfficialCatalogEntryID string
-	OfficialReaderNames    []string
-	PackageDigest          string
-	PackageRoot            string
-	VerifiedVersion        string
-	CatalogSequence        uint64
+	// workspace config, a host transport, or a user-installed plugin package.
+	ConfigSource string
+	// Authorized is the single runtime authorization result for this server.
+	// User-installed and explicit host-session servers set it directly; project
+	// servers set it only after an exact launch grant is resolved.
+	Authorized            bool
+	RequireLaunchApproval bool
 	// LaunchArgs and launcher metadata are host-local immutable resolutions for
 	// mutable package launchers. LauncherIdentityArgs is the same exact package
 	// resolution without an automatically injected offline/no-install flag: that
 	// enforcement-only flag changes process invocation but not the server identity
-	// the user approved. These fields never contribute to SpecFingerprint or the
+	// the user approved. These fields never contribute to SchemaCacheKey or the
 	// provider-visible tool surface; Args remains the user's stable config.
 	LaunchArgs              []string
 	LauncherIdentityArgs    []string
 	LauncherLocator         string
 	LauncherResolvedVersion string
 	LauncherDigest          string
-	// ReaderSandbox and WriterSandbox describe host isolation. The persistent stdio process runs with WriterSandbox
-	// so one stateful session is preserved across reads and writes.
-	ReaderSandbox sandbox.Spec
-	WriterSandbox sandbox.Spec
-	StateDir      string
+	// ProcessMode selects how an authorized stdio MCP process is launched.
+	// Empty defaults to host (trusted host process, no command sandbox).
+	// confined is reserved for internal managed deployments and tests; it is
+	// never exposed in common settings and never used as an automatic fallback.
+	ProcessMode MCPProcessMode
+	// Sandbox is only applied when ProcessMode is confined. Host-mode servers
+	// keep private state/cache/temp dirs without wrapping the process in the
+	// agent command sandbox.
+	Sandbox  sandbox.Spec
+	StateDir string
 	// StripRawPrefix, when non-empty, removes this prefix from each MCP tool's
 	// raw name before namespacing. For example, StripRawPrefix="server_" turns
 	// "server_search" into "search", yielding "mcp__search__search" instead of
@@ -131,9 +145,9 @@ type Spec struct {
 
 // transport carries JSON-RPC messages to and from one MCP server. call sends a
 // request and returns its result (correlating by id internally); notify sends a
-// fire-and-forget notification; close releases resources. Server notifications
-// are ignored. Transports answer ping requests and reject unsupported client
-// capabilities such as roots or sampling with JSON-RPC method-not-found.
+// fire-and-forget notification; close releases resources. Transports route MCP
+// progress notifications to the active tool call and answer the client
+// capabilities Reasonix advertises (currently ping and roots/list).
 type transport interface {
 	call(ctx context.Context, method string, params any) (json.RawMessage, error)
 	notify(ctx context.Context, method string, params any) error
@@ -400,7 +414,7 @@ func Start(ctx context.Context, specs []Spec, p StartPolicy) (*Host, []tool.Tool
 					defer h.bgWrites.Done()
 					_ = RecordStartup(spec.Name, phaseADur)
 					_ = SaveCachedSchema(spec.Name, CachedSchema{
-						SpecHash: SpecFingerprint(spec),
+						CacheKey: SchemaCacheKey(spec),
 						Capabilities: map[string]bool{
 							"tools":     c.hasTools,
 							"prompts":   c.hasPrompts,
@@ -477,6 +491,17 @@ func (h *Host) Close() {
 		c.close()
 	}
 	h.bgWrites.Wait() // drain detached stats/schema writers before returning
+}
+
+// queueBackgroundWrite keeps detached persistence inside the Host lifecycle.
+// Callers must enqueue before their Close-drained startup owner completes, so
+// Close cannot begin waiting before the WaitGroup increment is visible.
+func (h *Host) queueBackgroundWrite(write func()) {
+	h.bgWrites.Add(1)
+	go func() {
+		defer h.bgWrites.Done()
+		write()
+	}()
 }
 
 // StartPhaseB asynchronously fetches the auxiliary surfaces (prompts and
@@ -574,8 +599,6 @@ type Client struct {
 	toolCount int    // tools discovered, for /mcp status
 	transport string // declared transport type, for /mcp status ("stdio"/"http")
 
-	identityFingerprint string
-
 	// Prompts and resources discovered during StartAll, stored here so the
 	// parallel startup can collect them per-client before merging into Host.
 	prompts   []Prompt
@@ -589,6 +612,7 @@ type Client struct {
 	// MCP servers just to rebuild identical schemas.
 	toolsListed  bool
 	toolAdapters []tool.Tool
+	progressID   atomic.Uint64
 }
 
 func (c *Client) auxiliaryClient(ctx context.Context) (*Client, context.Context, context.CancelFunc, error) {
@@ -659,7 +683,7 @@ func authorizeSpecLaunch(ctx context.Context, spec Spec, lockMutableLauncher boo
 	if err != nil {
 		return err
 	}
-	identity, err := specIdentityFingerprint(ctx, prepared)
+	identityDigest, err := projectLaunchIdentityDigest(ctx, prepared)
 	if err != nil {
 		return err
 	}
@@ -670,7 +694,7 @@ func authorizeSpecLaunch(ctx context.Context, spec Spec, lockMutableLauncher boo
 			return err
 		}
 	}
-	return manager.Authorize(prepared.Name, launchConfigSource(prepared), identity)
+	return manager.Authorize(prepared.Name, launchConfigSource(prepared), identityDigest)
 }
 
 // Failure records one MCP server that was configured but could not connect.
@@ -726,31 +750,6 @@ func (h *Host) Servers() []ServerStatus {
 		out = append(out, s)
 	}
 	return out
-}
-
-// ApplyCatalogRevocations immediately removes official reader authority from
-// already-connected servers. Future lazy starts consult the same in-memory
-// revocation set before accepting signed reader declarations.
-func (h *Host) ApplyCatalogRevocations(revoked map[string]bool) {
-	if len(revoked) == 0 {
-		return
-	}
-	h.mu.RLock()
-	clients := append([]*Client(nil), h.clients...)
-	h.mu.RUnlock()
-	for _, client := range clients {
-		entryID := strings.TrimSpace(client.spec.OfficialCatalogEntryID)
-		if entryID == "" || !revoked[entryID] {
-			continue
-		}
-		client.toolsMu.Lock()
-		for _, adapter := range client.toolAdapters {
-			if remote, ok := adapter.(*remoteTool); ok {
-				remote.readOnlyTrusted = false
-			}
-		}
-		client.toolsMu.Unlock()
-	}
 }
 
 // Failures returns configured MCP servers that failed to connect.
@@ -966,11 +965,29 @@ func (h *Host) Add(ctx context.Context, s Spec) ([]tool.Tool, error) {
 	return h.addWithLifecycle(ctx, ctx, s, 0)
 }
 
-// addDeferred connects a lazy/background server only while the generation
-// registered by LazyToolset remains current. Remove invalidates that generation
-// before cancelling startup, so a late handshake cannot resurrect the server.
-func (h *Host) addDeferred(ctx context.Context, s Spec, generation uint64) ([]tool.Tool, error) {
-	return h.addWithLifecycle(ctx, ctx, s, generation)
+// EnsureConnected returns tools for an already-connected server, or starts the
+// shared single-flight handshake and waits for it. Concurrent callers for the
+// same server share one initialize/tools-list; cancelling a waiter only cancels
+// that wait and never kills a process still used by other runtimes.
+func (h *Host) EnsureConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
+	return h.EnsureConnectedWithLifecycle(ctx, ctx, s, 0)
+}
+
+// EnsureConnectedWithLifecycle is EnsureConnected with separate subprocess
+// lifetime (lifeCtx) and startup/call (callCtx) contexts, plus an optional
+// deferred generation for lazy registration.
+func (h *Host) EnsureConnectedWithLifecycle(lifeCtx, callCtx context.Context, s Spec, deferredGeneration uint64) ([]tool.Tool, error) {
+	if deferredGeneration != 0 && !h.deferredGenerationCurrent(s.Name, deferredGeneration) {
+		return nil, ErrDeferredSpawnCancelled
+	}
+	if tools, err := h.ToolsFor(callCtx, s.Name); err == nil {
+		return tools, nil
+	}
+	tools, err := h.addWithLifecycle(lifeCtx, callCtx, s, deferredGeneration)
+	if IsServerAlreadyConnected(err) {
+		return h.ToolsFor(callCtx, s.Name)
+	}
+	return tools, err
 }
 
 // AddWithLifecycle connects one server live, allowing caller to specify separate
@@ -1155,11 +1172,7 @@ func start(lifeCtx, callCtx context.Context, s Spec) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	identity, err := specIdentityFingerprint(callCtx, s)
-	if err != nil {
-		return nil, err
-	}
-	s, err = applyEstablishedLaunchGrant(s, identity)
+	s, err = resolveProjectLaunchAuthorization(callCtx, s)
 	if err != nil {
 		return nil, err
 	}
@@ -1171,7 +1184,7 @@ func start(lifeCtx, callCtx context.Context, s Spec) (*Client, error) {
 	if tt == "" {
 		tt = "stdio"
 	}
-	c := &Client{name: s.Name, t: t, spec: s, transport: tt, identityFingerprint: identity}
+	c := &Client{name: s.Name, t: t, spec: s, transport: tt}
 	if err := c.initialize(callCtx); err != nil {
 		c.close()
 		return nil, err
@@ -1179,14 +1192,29 @@ func start(lifeCtx, callCtx context.Context, s Spec) (*Client, error) {
 	return c, nil
 }
 
-func applyEstablishedLaunchGrant(s Spec, identity string) (Spec, error) {
+// resolveProjectLaunchAuthorization deliberately skips identity resolution for
+// installed and host-session servers. Their explicit installation is already
+// the authorization decision; only repository-declared servers need an exact
+// executable or endpoint digest before startup.
+func resolveProjectLaunchAuthorization(ctx context.Context, s Spec) (Spec, error) {
+	if !s.RequireLaunchApproval {
+		return s, nil
+	}
+	identityDigest, err := projectLaunchIdentityDigest(ctx, s)
+	if err != nil {
+		return s, err
+	}
+	return applyEstablishedLaunchGrant(s, identityDigest)
+}
+
+func applyEstablishedLaunchGrant(s Spec, identityDigest string) (Spec, error) {
 	if !s.RequireLaunchApproval {
 		return s, nil
 	}
 	if s.LaunchManager == nil {
 		return s, fmt.Errorf("MCP launch authorization store is unavailable")
 	}
-	authorized, changed, err := s.LaunchManager.LaunchAuthorized(s.Name, launchConfigSource(s), identity)
+	authorized, changed, err := s.LaunchManager.LaunchAuthorized(s.Name, launchConfigSource(s), identityDigest)
 	if err != nil {
 		return s, err
 	}
@@ -1194,10 +1222,38 @@ func applyEstablishedLaunchGrant(s Spec, identity string) (Spec, error) {
 		return s, &launchApprovalError{server: s.Name, changed: changed}
 	}
 	// A matching exact-identity launch grant is the user's authorization for
-	// this project server. Calls proceed like an explicit install;
-	// explicit policies still override the source-aware approval default.
-	s.ImplicitApproval = true
+	// this project server. Calls proceed like an explicit install, while global
+	// deny rules and execution safety boundaries remain authoritative.
+	s.Authorized = true
 	return s, nil
+}
+
+// ResolveStoredAuthorization applies an existing exact project grant without
+// starting a process or opening a network connection. Cached lazy/on-demand
+// tools use it before strict read-only filtering so every execution path sees
+// the same server-level authorization. Errors fail closed by returning the
+// original unauthorized Spec; a parent connection surfaces the detailed error.
+func ResolveStoredAuthorization(ctx context.Context, s Spec) Spec {
+	if !s.RequireLaunchApproval {
+		return s
+	}
+	locked, err := applyStoredLauncherLock(s)
+	if err != nil {
+		return s
+	}
+	authorized, err := resolveProjectLaunchAuthorization(ctx, locked)
+	if err != nil {
+		return s
+	}
+	return authorized
+}
+
+// ServerAuthorized is the single MCP authorization source. Tools do not carry
+// an independent trust bit: installation or an exact project launch grant
+// authorizes the server, while read-only/destructive classification remains a
+// live per-tool safety fact.
+func (s Spec) ServerAuthorized() bool {
+	return s.Authorized
 }
 
 // newTransport builds the transport for a spec's declared type. Empty / unknown
@@ -1209,17 +1265,16 @@ func newTransport(ctx context.Context, s Spec) (transport, error) {
 	case "http", "streamable-http", "streamable_http":
 		return newHTTPTransport(s)
 	case "sse":
-		// The legacy 2024-11-05 HTTP+SSE transport needs a persistent GET stream
-		// with a background dispatcher — deprecated upstream ("avoid for new
-		// work"). Use type="http" (Streamable HTTP), which most remote servers
-		// now speak. Tracked for later (SPEC §9).
-		return nil, fmt.Errorf("plugin %q: legacy sse transport not yet supported — use type=\"http\" (Streamable HTTP)", s.Name)
+		return newSSETransport(ctx, s)
 	default:
 		return nil, fmt.Errorf("unknown transport type %q (want stdio|http|sse)", s.Type)
 	}
 }
 
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	params, unregisterProgress := c.withProgress(ctx, method, params)
+	defer unregisterProgress()
+
 	callCtx, cancel, timeout := c.contextWithCallTimeout(ctx, method, params)
 	if cancel != nil {
 		defer cancel()
@@ -1232,6 +1287,40 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 		return nil, c.timeoutError(method, params, timeout)
 	}
 	return res, err
+}
+
+func (c *Client) withProgress(ctx context.Context, method string, params any) (any, func()) {
+	if method != "tools/call" {
+		return params, func() {}
+	}
+	sink, ok := tool.ProgressFrom(ctx)
+	if !ok {
+		return params, func() {}
+	}
+	router, ok := c.t.(progressTransport)
+	if !ok {
+		return params, func() {}
+	}
+	callParams, ok := params.(map[string]any)
+	if !ok {
+		return params, func() {}
+	}
+
+	token := fmt.Sprintf("reasonix-%d", c.progressID.Add(1))
+	copyParams := make(map[string]any, len(callParams))
+	for key, value := range callParams {
+		copyParams[key] = value
+	}
+	meta := map[string]any{}
+	if existing, ok := callParams["_meta"].(map[string]any); ok {
+		for key, value := range existing {
+			meta[key] = value
+		}
+	}
+	meta["progressToken"] = token
+	copyParams["_meta"] = meta
+	unregister := router.registerProgress(token, sink)
+	return copyParams, unregister
 }
 
 func (c *Client) callTransport(ctx context.Context, method string, params any) (json.RawMessage, error) {
@@ -1317,9 +1406,13 @@ func (c *Client) initialize(ctx context.Context) error {
 }
 
 func (c *Client) initializeSession(ctx context.Context, recordCapabilities bool) error {
+	capabilities := map[string]any{}
+	if len(mcpRoots(c.spec.WorkspaceRoot)) > 0 {
+		capabilities["roots"] = map[string]any{"listChanged": false}
+	}
 	res, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion": protocolVersion,
-		"capabilities":    map[string]any{},
+		"capabilities":    capabilities,
 		"clientInfo":      map[string]any{"name": "reasonix", "version": "dev"},
 	})
 	if err != nil {
@@ -1356,32 +1449,6 @@ type mcpTool struct {
 		ReadOnlyHint    bool `json:"readOnlyHint"`
 		DestructiveHint bool `json:"destructiveHint"`
 	} `json:"annotations"`
-}
-
-// toolReadOnlyOverride keeps legacy trusted_read_only_tools and first-party
-// overrides useful when an older MCP server omits readOnlyHint.
-func (s Spec) toolReadOnlyOverride(rawName, visibleName string) bool {
-	return s.ReadOnlyToolNames[rawName] || s.ReadOnlyModelToolNames[toolName(s.Name, visibleName)]
-}
-
-// ToolApprovalMode resolves the effective approval mode for one raw tool
-// name: an explicit per-tool override wins, an unset server default becomes
-// direct approval for user-authorized (implicit approval) sources, and the
-// normalized server default applies otherwise. Every approval surface,
-// including proxies outside this package, must use this resolution instead of
-// re-deriving the policy from Spec fields.
-func (s Spec) ToolApprovalMode(rawName string) string {
-	if mode := strings.TrimSpace(s.ToolApprovalModes[rawName]); mode != "" {
-		return tool.NormalizeMCPApprovalMode(mode)
-	}
-	if strings.TrimSpace(s.DefaultToolsApprovalMode) == "" && s.ImplicitApproval {
-		return tool.MCPApprovalApprove
-	}
-	return tool.NormalizeMCPApprovalMode(s.DefaultToolsApprovalMode)
-}
-
-func (s Spec) approvalReviewer() string {
-	return tool.NormalizeMCPApprovalReviewer(s.ApprovalsReviewer)
 }
 
 func (c *Client) listTools(ctx context.Context) ([]tool.Tool, error) {
@@ -1425,23 +1492,19 @@ func (c *Client) listTools(ctx context.Context) ([]tool.Tool, error) {
 		if c.spec.StripRawPrefix != "" {
 			visibleName = strings.TrimPrefix(visibleName, c.spec.StripRawPrefix)
 		}
-		capability := capabilityOf(c.spec, t, schema)
-		readOnly := capability.ReadOnly
-		trusted := trustedReaderForSpec(c.spec, capability)
+		readOnly := readOnlyHint
 		toolInfos = append(toolInfos, info)
 		tools = append(tools, &remoteTool{
-			client:                c,
-			name:                  toolName(c.name, visibleName),
-			rawName:               t.Name,
-			visibleName:           visibleName,
-			desc:                  t.Description,
-			schema:                schema,
-			outputSchema:          t.OutputSchema,
-			capabilityFingerprint: capabilityFingerprint(capability),
-			declaredReadOnly:      capability.ReadOnly,
-			readOnly:              readOnly,
-			readOnlyTrusted:       trusted,
-			destructive:           destructiveHint,
+			client:           c,
+			name:             toolName(c.name, visibleName),
+			rawName:          t.Name,
+			visibleName:      visibleName,
+			desc:             t.Description,
+			schema:           schema,
+			outputSchema:     t.OutputSchema,
+			declaredReadOnly: readOnlyHint,
+			readOnly:         readOnly,
+			destructive:      destructiveHint,
 		})
 	}
 	sort.SliceStable(toolInfos, func(i, j int) bool { return toolInfos[i].Name < toolInfos[j].Name })
@@ -1625,22 +1688,17 @@ func (e *rpcError) Error() string { return fmt.Sprintf("rpc error %d: %s", e.Cod
 // --- remote tool adapter ---
 
 type remoteTool struct {
-	client                *Client
-	name                  string // namespaced "mcp__<server>__<tool>"
-	rawName               string // original name for tools/call
-	visibleName           string // raw name after configured prefix stripping
-	desc                  string
-	schema                json.RawMessage
-	outputSchema          json.RawMessage
-	capabilityFingerprint string
-	declaredReadOnly      bool // server hint/legacy override, independent of local trust
-	readOnly              bool // true only when the host accepts this reader snapshot
-	// readOnlyTrusted is true only when local configuration, not the server hint,
-	// classified the tool as read-only.
-	readOnlyTrusted bool
+	client           *Client
+	name             string // namespaced "mcp__<server>__<tool>"
+	rawName          string // original name for tools/call
+	visibleName      string // raw name after configured prefix stripping
+	desc             string
+	schema           json.RawMessage
+	outputSchema     json.RawMessage
+	declaredReadOnly bool // server hint, independent of server authorization
+	readOnly         bool // effective reader classification for this live snapshot
 	// destructive is the MCP destructiveHint. It takes precedence over a
-	// conflicting readOnlyHint; the effective MCP approval mode decides whether
-	// it needs a fresh review.
+	// conflicting readOnlyHint in Plan and strict read-only execution.
 	destructive bool
 }
 
@@ -1661,57 +1719,30 @@ func (t *remoteTool) MCPPackageName() string {
 	return t.client.spec.Package
 }
 
-// ReadOnlyExecutionAuthority reports whether this adapter's reader
-// classification comes from explicit local or signed package policy. Without a LaunchManager the
-// compatibility path derives readers from server hints, which must never
-// satisfy the strict read-only boundary.
-func (t *remoteTool) ReadOnlyExecutionAuthority() bool {
-	return t.client != nil && t.client.spec.LaunchManager != nil
-}
-
-func (t *remoteTool) MCPCapabilityFingerprint() string {
-	return t.capabilityFingerprint
+func (t *remoteTool) MCPServerAuthorized() bool {
+	return t.client != nil && t.client.spec.ServerAuthorized()
 }
 
 // ReadOnly reflects MCP readOnlyHint plus backward-compatible Spec overrides.
 // It defaults to false, so opaque tools remain write-capable unless the server
 // or local configuration explicitly classifies them as read-only.
-func (t *remoteTool) securitySnapshot() (declaredReadOnly, readOnly, trusted, destructive bool, fingerprint string) {
+func (t *remoteTool) securitySnapshot() (declaredReadOnly, readOnly, destructive bool) {
 	if t.client == nil {
-		return t.declaredReadOnly, t.readOnly, t.readOnlyTrusted, t.destructive, t.capabilityFingerprint
+		return t.declaredReadOnly, t.readOnly, t.destructive
 	}
 	t.client.toolsMu.Lock()
 	defer t.client.toolsMu.Unlock()
-	return t.declaredReadOnly, t.readOnly, t.readOnlyTrusted, t.destructive, t.capabilityFingerprint
+	return t.declaredReadOnly, t.readOnly, t.destructive
 }
 
 func (t *remoteTool) ReadOnly() bool {
-	_, readOnly, _, _, _ := t.securitySnapshot()
+	_, readOnly, _ := t.securitySnapshot()
 	return readOnly
 }
 
-func (t *remoteTool) PlanModeUntrustedReadOnly() bool {
-	_, readOnly, trusted, _, _ := t.securitySnapshot()
-	return readOnly && !trusted
-}
-
 func (t *remoteTool) MCPDestructiveHint() bool {
-	_, _, _, destructive, _ := t.securitySnapshot()
+	_, _, destructive := t.securitySnapshot()
 	return destructive
-}
-
-func (t *remoteTool) MCPApprovalMode() string {
-	if t.client == nil {
-		return tool.MCPApprovalAuto
-	}
-	return t.client.spec.ToolApprovalMode(t.rawName)
-}
-
-func (t *remoteTool) MCPApprovalReviewer() string {
-	if t.client == nil {
-		return ""
-	}
-	return t.client.spec.approvalReviewer()
 }
 
 func (t *remoteTool) Schema() json.RawMessage {
@@ -1736,16 +1767,16 @@ func (t *remoteTool) ExecuteWithImages(ctx context.Context, args json.RawMessage
 			return "", nil, fmt.Errorf("invalid args: %w", err)
 		}
 	}
-	_, readOnly, trusted, destructive, fingerprint := t.securitySnapshot()
-	if intent, ok := tool.ReaderExecutionIntentFrom(ctx); ok {
+	_, readOnly, destructive := t.securitySnapshot()
+	if tool.HasReaderExecutionIntent(ctx) {
 		// Final, linearizable check for a reader-authorized call: the snapshot
-		// above and every authority mutation (catalog revocations, live security
-		// reconciliation) serialize on the owning client's toolsMu. A call that
-		// was approved as a non-destructive reader must never execute after authority
-		// changed — state drift here returns an actionable error instead of
+		// above and every live security reconciliation serialize on the owning
+		// client's toolsMu. A call approved as a non-destructive reader must never
+		// execute after authorization or safety metadata changed — state drift
+		// here returns an actionable error instead of
 		// dispatching.
-		if !readOnly || !trusted || destructive || (intent.CapabilityFingerprint != "" && fingerprint != "" && fingerprint != intent.CapabilityFingerprint) {
-			return "", nil, fmt.Errorf("MCP server %q no longer classifies tool %q as an allowed reader; the call was blocked before dispatch — retry from a parent session or update the explicit read-only policy", t.client.name, t.rawName)
+		if !t.MCPServerAuthorized() || !readOnly || destructive {
+			return "", nil, fmt.Errorf("MCP server %q changed the authorization or security metadata for tool %q; the call was blocked before dispatch — refresh the server from a parent session before retrying", t.client.name, t.rawName)
 		}
 	}
 	res, err := t.client.call(ctx, "tools/call", map[string]any{

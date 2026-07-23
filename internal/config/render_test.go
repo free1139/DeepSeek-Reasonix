@@ -212,6 +212,8 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig.Notifications.TurnDone = true
 	orig.Notifications.ApprovalRequest = true
 	orig.Notifications.AskRequest = true
+	orig.Agent.RecoveryModel = "mimo-pro"
+	orig.Agent.RecoveryTemperature = 0.15
 	orig.Agent.ReasoningLanguage = "zh"
 	orig.Agent.ToolResultSnipRatio = 0.65
 	orig.Agent.SubagentModel = "mimo-pro"
@@ -297,7 +299,7 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 	orig.Plugins = []PluginEntry{
 		{Name: "example", Command: "reasonix-plugin-example"},
-		{Name: "stripe", Type: "http", URL: "https://mcp.stripe.com", Headers: map[string]string{"Authorization": "Bearer x"}, TrustedReadOnlyTools: []string{"customer_read"}, AutoStart: boolPtr(false), Tier: "background"},
+		{Name: "stripe", Type: "http", URL: "https://mcp.stripe.com", Headers: map[string]string{"Authorization": "Bearer x"}, AutoStart: boolPtr(false), Tier: "background"},
 	}
 	mm, _ := orig.Provider("mimo-pro")
 	mm.BaseURL = "http://localhost:8000/v1"
@@ -366,6 +368,9 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 	if got.Desktop.CheckUpdates == nil || *got.Desktop.CheckUpdates {
 		t.Errorf("desktop.check_updates = %+v, want false", got.Desktop.CheckUpdates)
+	}
+	if got.Agent.RecoveryModel != "mimo-pro" || got.Agent.RecoveryTemperature != 0 {
+		t.Errorf("agent recovery settings not preserved: %+v", got.Agent)
 	}
 	if !got.Notifications.Enabled || !got.Notifications.TurnDone || !got.Notifications.ApprovalRequest || !got.Notifications.AskRequest {
 		t.Errorf("notifications not preserved: %+v", got.Notifications)
@@ -513,8 +518,8 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if stripe.Headers["Authorization"] != "Bearer x" {
 		t.Errorf("plugin headers not preserved: %v", stripe.Headers)
 	}
-	if len(stripe.TrustedReadOnlyTools) != 1 || stripe.TrustedReadOnlyTools[0] != "customer_read" {
-		t.Errorf("plugin trusted_read_only_tools not preserved: %+v", stripe.TrustedReadOnlyTools)
+	if strings.Contains(rendered, "trusted_read_only_tools") {
+		t.Errorf("removed plugin reader setting survived render: entry=%+v\n%s", stripe, rendered)
 	}
 	if stripe.AutoStart == nil || *stripe.AutoStart {
 		t.Errorf("auto_start should render and parse as false, got %+v", stripe.AutoStart)
@@ -527,25 +532,14 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 }
 
-func TestRenderTOMLDocumentsPlanModeAllowedTools(t *testing.T) {
+func TestRenderTOMLDocumentsPlanModeReadOnlyCommands(t *testing.T) {
 	cfg := Default()
-	cfg.Agent.PlanModeAllowedTools = []string{"custom_reader"}
 	cfg.Agent.PlanModeReadOnlyCommands = []string{"gh issue view"}
 
 	rendered := RenderTOML(cfg)
-	if !strings.Contains(rendered, `plan_mode_allowed_tools = ["custom_reader"]`) {
-		t.Fatalf("rendered config should preserve plan_mode_allowed_tools:\n%s", rendered)
-	}
-	if !strings.Contains(rendered, "legacy MCP read-only aliases") || !strings.Contains(rendered, "does not change Plan availability") {
-		t.Fatalf("rendered config should document legacy plan_mode_allowed_tools semantics:\n%s", rendered)
-	}
-
 	var got Config
 	if _, err := toml.Decode(rendered, &got); err != nil {
 		t.Fatalf("rendered TOML does not parse: %v\n%s", err, rendered)
-	}
-	if !reflect.DeepEqual(got.Agent.PlanModeAllowedTools, cfg.Agent.PlanModeAllowedTools) {
-		t.Fatalf("PlanModeAllowedTools round trip = %v, want %v", got.Agent.PlanModeAllowedTools, cfg.Agent.PlanModeAllowedTools)
 	}
 	if !strings.Contains(rendered, `plan_mode_read_only_commands = ["gh issue view"]`) {
 		t.Fatalf("rendered config should preserve plan_mode_read_only_commands:\n%s", rendered)
@@ -558,28 +552,31 @@ func TestRenderTOMLDocumentsPlanModeAllowedTools(t *testing.T) {
 	}
 }
 
-func TestRenderTOMLPreservesLegacyPluginReadOnlyOverrides(t *testing.T) {
-	cfg := Default()
-	cfg.Plugins = []PluginEntry{{
-		Name:                 "github",
-		Command:              "github-mcp",
-		TrustedReadOnlyTools: []string{"issue_read", "pull_request_read"},
-	}}
+func TestRenderTOMLDropsRetiredMCPPolicyFields(t *testing.T) {
+	var cfg Config
+	if _, err := toml.Decode(`[[plugins]]
+name = "github"
+command = "github-mcp"
+trusted_read_only_tools = ["issue_read", "pull_request_read"]
+default_tools_approval_mode = "writes"
+approvals_reviewer = "auto_review"
 
-	rendered := RenderTOML(cfg)
-	if !strings.Contains(rendered, `trusted_read_only_tools = ["issue_read", "pull_request_read"]`) {
-		t.Fatalf("rendered config should preserve trusted_read_only_tools:\n%s", rendered)
+[plugins.tools.wipe]
+approval_mode = "prompt"
+`, &cfg); err != nil {
+		t.Fatalf("legacy config should still decode: %v", err)
 	}
-	if !strings.Contains(rendered, "explicit Plan/read-only-research declaration for audited raw MCP reader names") {
-		t.Fatalf("rendered config should document the legacy trusted_read_only_tools semantics:\n%s", rendered)
+
+	rendered := RenderTOML(&cfg)
+	for _, retired := range []string{"trusted_read_only_tools", "default_tools_approval_mode", "approvals_reviewer", "\napproval_mode ="} {
+		if strings.Contains(rendered, retired) {
+			t.Fatalf("rendered config retained retired MCP field %q:\n%s", retired, rendered)
+		}
 	}
 
 	var got Config
 	if _, err := toml.Decode(rendered, &got); err != nil {
 		t.Fatalf("rendered TOML does not parse: %v\n%s", err, rendered)
-	}
-	if !reflect.DeepEqual(got.Plugins[0].TrustedReadOnlyTools, cfg.Plugins[0].TrustedReadOnlyTools) {
-		t.Fatalf("TrustedReadOnlyTools round trip = %v, want %v", got.Plugins[0].TrustedReadOnlyTools, cfg.Plugins[0].TrustedReadOnlyTools)
 	}
 }
 
@@ -620,39 +617,6 @@ func TestRenderTOMLPreservesMCPCallTimeouts(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Plugins[0].ToolTimeoutSeconds, cfg.Plugins[0].ToolTimeoutSeconds) {
 		t.Fatalf("ToolTimeoutSeconds round trip = %v, want %v", got.Plugins[0].ToolTimeoutSeconds, cfg.Plugins[0].ToolTimeoutSeconds)
-	}
-}
-
-func TestRenderTOMLPreservesMCPApprovalPolicy(t *testing.T) {
-	cfg := Default()
-	cfg.Plugins = []PluginEntry{{
-		Name:                     "admin",
-		Command:                  "admin-mcp",
-		DefaultToolsApprovalMode: "writes",
-		Tools: map[string]MCPToolPolicy{
-			"delete/all": {ApprovalMode: "prompt"},
-			"status":     {ApprovalMode: "approve"},
-		},
-		ApprovalsReviewer: "auto_review",
-	}}
-
-	rendered := RenderTOML(cfg)
-	for _, want := range []string{
-		`default_tools_approval_mode = "writes"`,
-		`tools = { "delete/all" = { approval_mode = "prompt" }, status = { approval_mode = "approve" } }`,
-		`approvals_reviewer = "auto_review"`,
-	} {
-		if !strings.Contains(rendered, want) {
-			t.Fatalf("rendered config missing %q:\n%s", want, rendered)
-		}
-	}
-	var got Config
-	if _, err := toml.Decode(rendered, &got); err != nil {
-		t.Fatalf("rendered TOML does not parse: %v\n%s", err, rendered)
-	}
-	if got.Plugins[0].DefaultToolsApprovalMode != "writes" || got.Plugins[0].ApprovalsReviewer != "auto_review" ||
-		!reflect.DeepEqual(got.Plugins[0].Tools, cfg.Plugins[0].Tools) {
-		t.Fatalf("approval policy round trip = %+v", got.Plugins[0])
 	}
 }
 
@@ -798,18 +762,25 @@ func TestScopedRenderSeparatesUserAndProjectConfig(t *testing.T) {
 	c.Desktop.StatusBarStyle = "text"
 	c.Desktop.DefaultToolApprovalMode = "auto"
 	c.Desktop.CheckUpdates = boolPtr(false)
+	c.Agent.RecoveryModel = "deepseek-pro"
+	c.Agent.RecoveryTemperature = 0.2
 
 	user := RenderTOMLForScope(c, RenderScopeUser)
-	for _, want := range []string{"config_version = 5", "[desktop]", `theme = "dark"`, `close_behavior = "background"`, `status_bar_style = "text"`, `default_tool_approval_mode = "auto"`, `check_updates = false`, "[notifications]", "[tools.shell]"} {
+	for _, want := range []string{"config_version = 5", "[desktop]", `theme = "dark"`, `close_behavior = "background"`, `status_bar_style = "text"`, `default_tool_approval_mode = "auto"`, `check_updates = false`, `recovery_model = "deepseek-pro"`, "[notifications]", "[tools.shell]"} {
 		if !strings.Contains(user, want) {
 			t.Fatalf("user render missing %q:\n%s", want, user)
 		}
 	}
 
 	project := RenderTOMLForScope(c, RenderScopeProject)
-	for _, forbidden := range []string{"[desktop]", "[notifications]", "close_behavior =", "default_tool_approval_mode =", "check_updates =", "max_steps", "planner_max_steps"} {
+	for _, forbidden := range []string{"[desktop]", "[notifications]", "close_behavior =", "default_tool_approval_mode =", "default_auto_recovery_checkpoint =", "check_updates =", "max_steps", "planner_max_steps"} {
 		if strings.Contains(project, forbidden) {
 			t.Fatalf("project render should not contain %q:\n%s", forbidden, project)
+		}
+	}
+	for _, retired := range []string{"default_auto_recovery_checkpoint", "auto_recovery_checkpoint"} {
+		if strings.Contains(user, retired) || strings.Contains(project, retired) {
+			t.Fatalf("retired Auto Guard key %q must not be rendered:\nuser:\n%s\nproject:\n%s", retired, user, project)
 		}
 	}
 	if strings.Contains(project, "\nsystem_prompt = \"\"\"") {
@@ -818,8 +789,32 @@ func TestScopedRenderSeparatesUserAndProjectConfig(t *testing.T) {
 	if !strings.Contains(project, "# system_prompt =") {
 		t.Fatalf("project render should leave a system prompt hint:\n%s", project)
 	}
+	for _, want := range []string{`recovery_model = "deepseek-pro"`} {
+		if !strings.Contains(project, want) {
+			t.Fatalf("project render missing %q:\n%s", want, project)
+		}
+	}
 	if strings.Contains(user, "auto_plan") || strings.Contains(project, "auto_plan") {
 		t.Fatalf("retired auto-plan keys must not be rendered:\nuser:\n%s\nproject:\n%s", user, project)
+	}
+	if strings.Contains(user, "recovery_temperature") || strings.Contains(project, "recovery_temperature") {
+		t.Fatalf("deprecated recovery_temperature must not be rendered:\nuser:\n%s\nproject:\n%s", user, project)
+	}
+}
+
+func TestProjectDeltaRendersRecoveryReviewerOverride(t *testing.T) {
+	c := Default()
+	c.Agent.RecoveryModel = "deepseek-pro"
+	c.Agent.RecoveryTemperature = 0.2
+
+	delta := RenderTOMLProjectDelta(c)
+	for _, want := range []string{"[agent]", `recovery_model = "deepseek-pro"`} {
+		if !strings.Contains(delta, want) {
+			t.Fatalf("project delta missing %q:\n%s", want, delta)
+		}
+	}
+	if strings.Contains(delta, "recovery_temperature") {
+		t.Fatalf("deprecated recovery_temperature rendered:\n%s", delta)
 	}
 }
 

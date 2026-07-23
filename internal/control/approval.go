@@ -12,7 +12,6 @@ import (
 	"reasonix/internal/event"
 	"reasonix/internal/i18n"
 	"reasonix/internal/permission"
-	"reasonix/internal/tool"
 )
 
 // approvalManager owns the approval/ask prompt bookkeeping and the runtime
@@ -93,9 +92,7 @@ func BuildHeadlessApprovalGate(policy permission.Policy, mode string) *freshHuma
 	switch normalizeToolApprovalMode(mode) {
 	case ToolApprovalYolo:
 		policy.Mode = permission.Allow
-		gate := NewHeadlessPermissionGate(policy)
-		gate.bypassMCPAuto = true
-		return gate
+		return NewHeadlessPermissionGate(policy)
 	case ToolApprovalAuto:
 		policy.Mode = permission.Allow
 		return &freshHumanHeadlessGate{gate: permission.NewGate(policy, denyPermissionApprover{})}
@@ -151,23 +148,15 @@ func (g *SharedHeadlessGate) Check(ctx context.Context, toolName string, args js
 	return gate.Check(ctx, toolName, args, readOnly)
 }
 
-func (g *SharedHeadlessGate) CheckFresh(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly bool) (bool, string, error) {
+func (g *SharedHeadlessGate) ExplicitlyDenies(toolName string, args json.RawMessage) bool {
 	g.mu.RLock()
 	gate := g.gate
 	g.mu.RUnlock()
-	return gate.CheckFresh(ctx, toolName, subject, args, readOnly)
-}
-
-func (g *SharedHeadlessGate) CheckMCP(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly, destructive bool, mode, reviewer string) (bool, string, error) {
-	g.mu.RLock()
-	gate := g.gate
-	g.mu.RUnlock()
-	return gate.CheckMCP(ctx, toolName, subject, args, readOnly, destructive, mode, reviewer)
+	return gate.ExplicitlyDenies(toolName, args)
 }
 
 type freshHumanHeadlessGate struct {
-	gate          *permission.Gate
-	bypassMCPAuto bool
+	gate *permission.Gate
 }
 
 func (g *freshHumanHeadlessGate) Check(ctx context.Context, toolName string, args json.RawMessage, readOnly bool) (bool, string, error) {
@@ -177,15 +166,8 @@ func (g *freshHumanHeadlessGate) Check(ctx context.Context, toolName string, arg
 	return g.gate.Check(ctx, toolName, args, readOnly)
 }
 
-func (g *freshHumanHeadlessGate) CheckFresh(context.Context, string, string, json.RawMessage, bool) (bool, string, error) {
-	return false, "this tool requires fresh human approval and cannot run in a non-interactive session.", nil
-}
-
-func (g *freshHumanHeadlessGate) CheckMCP(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly, destructive bool, mode, reviewer string) (bool, string, error) {
-	if g.bypassMCPAuto && !destructive && tool.NormalizeMCPApprovalMode(mode) == tool.MCPApprovalAuto {
-		reviewer = ""
-	}
-	return g.gate.CheckMCP(ctx, toolName, subject, args, readOnly, destructive, mode, reviewer)
+func (g *freshHumanHeadlessGate) ExplicitlyDenies(toolName string, args json.RawMessage) bool {
+	return g.gate.Policy.ExplicitlyDenies(toolName, args)
 }
 
 // preApproved reports whether a tool call can skip the prompt — either the
@@ -219,6 +201,12 @@ func (a *approvalManager) register(tool, subject, reason string) (string, chan a
 // permission or a fresh user decision. Fresh decisions are not auto-drained when
 // the user switches to auto/yolo tool approval while the prompt is visible.
 func (a *approvalManager) registerDecision(tool, subject, reason string, fresh bool) (string, chan approvalReply) {
+	return a.registerDecisionKind(tool, subject, reason, fresh, "", nil)
+}
+
+// registerDecisionKind is registerDecision with optional Kind/Recovery payload
+// so Auto Guard cards survive ReplayPendingPrompts.
+func (a *approvalManager) registerDecisionKind(tool, subject, reason string, fresh bool, kind string, rec *event.RecoveryApproval) (string, chan approvalReply) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.nextID++
@@ -228,7 +216,10 @@ func (a *approvalManager) registerDecision(tool, subject, reason string, fresh b
 	if !fresh {
 		autoDrain = a.autoApprovalWouldAllowLocked(tool, subject)
 	}
-	a.approvals[id] = pendingApproval{tool: tool, subject: subject, reason: reason, fresh: fresh, autoDrain: autoDrain, reply: reply}
+	a.approvals[id] = pendingApproval{
+		tool: tool, subject: subject, reason: reason, fresh: fresh,
+		autoDrain: autoDrain, kind: kind, recovery: rec, reply: reply,
+	}
 	return id, reply
 }
 
@@ -348,6 +339,19 @@ func (a *approvalManager) clearAll() {
 	clear(a.asks)
 }
 
+// clearKind drops pending approvals of one specialized kind. Session recovery
+// state uses this during rotations so a card from the previous session cannot
+// be answered against the newly active one.
+func (a *approvalManager) clearKind(kind string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for id, pending := range a.approvals {
+		if pending.kind == kind {
+			delete(a.approvals, id)
+		}
+	}
+}
+
 // hasPending reports whether any prompt is awaiting a user decision.
 func (a *approvalManager) hasPending() bool {
 	a.mu.Lock()
@@ -400,7 +404,10 @@ func (a *approvalManager) snapshotPrompts() ([]event.Approval, []event.Ask) {
 	defer a.mu.Unlock()
 	approvals := make([]event.Approval, 0, len(a.approvals))
 	for id, p := range a.approvals {
-		approvals = append(approvals, event.Approval{ID: id, Tool: p.tool, Subject: p.subject, Reason: p.reason, Fresh: p.fresh})
+		approvals = append(approvals, event.Approval{
+			ID: id, Tool: p.tool, Subject: p.subject, Reason: p.reason, Fresh: p.fresh,
+			Kind: p.kind, Recovery: p.recovery,
+		})
 	}
 	asks := make([]event.Ask, 0, len(a.asks))
 	for id, p := range a.asks {

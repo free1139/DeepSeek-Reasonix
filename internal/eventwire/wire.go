@@ -7,12 +7,14 @@ import (
 )
 
 // Event is the JSON-friendly form shared by event frontends.
+// externalizable:"true" marks large string payloads the Remote protocol may
+// offload via content refs without changing provider-visible semantics.
 type Event struct {
 	Kind            string           `json:"kind"`
-	Text            string           `json:"text,omitempty"`
-	Detail          string           `json:"detail,omitempty"`
+	Text            string           `json:"text,omitempty" externalizable:"true"`
+	Detail          string           `json:"detail,omitempty" externalizable:"true"`
 	Code            string           `json:"code,omitempty"`
-	Reasoning       string           `json:"reasoning,omitempty"`
+	Reasoning       string           `json:"reasoning,omitempty" externalizable:"true"`
 	MemoryCitations []MemoryCitation `json:"memoryCitations,omitempty"`
 	Level           string           `json:"level,omitempty"`
 	Tool            *Tool            `json:"tool,omitempty"`
@@ -21,7 +23,7 @@ type Event struct {
 	Ask             *Ask             `json:"ask,omitempty"`
 	Compaction      *Compaction      `json:"compaction,omitempty"`
 	Guardian        *Guardian        `json:"guardian,omitempty"`
-	Err             string           `json:"err,omitempty"`
+	Err             string           `json:"err,omitempty" externalizable:"true"`
 	Outcome         string           `json:"outcome,omitempty"`
 	Readiness       *FinalReadiness  `json:"readiness,omitempty"`
 	RetryAttempt    int              `json:"retryAttempt,omitempty"`
@@ -76,7 +78,28 @@ func ToWire(e event.Event) Event {
 			}
 		}
 	case event.ApprovalRequest:
-		w.Approval = &Approval{ID: e.Approval.ID, Tool: e.Approval.Tool, Subject: e.Approval.Subject, Reason: e.Approval.Reason, Fresh: e.Approval.Fresh}
+		w.Approval = &Approval{
+			ID: e.Approval.ID, Tool: e.Approval.Tool, Subject: e.Approval.Subject,
+			Reason: e.Approval.Reason, Fresh: e.Approval.Fresh, Kind: e.Approval.Kind,
+		}
+		if e.Approval.Recovery != nil {
+			r := e.Approval.Recovery
+			w.Approval.Recovery = &RecoveryApproval{
+				SourceAgent:     r.SourceAgent,
+				FailedTool:      r.FailedTool,
+				FailedSummary:   r.FailedSummary,
+				Diagnosis:       r.Diagnosis,
+				NextTool:        r.NextTool,
+				NextAction:      r.NextAction,
+				ChangeKind:      r.ChangeKind,
+				ChangeRationale: r.ChangeRationale,
+				ReviewRationale: r.ReviewRationale,
+				PlanBefore:      r.PlanBefore,
+				PlanAfter:       r.PlanAfter,
+				CanGrantTask:    r.CanGrantTask,
+				TaskGrantScope:  r.TaskGrantScope,
+			}
+		}
 	case event.AskRequest:
 		w.Ask = ToWireAsk(e.Ask)
 	case event.CompactionStarted, event.CompactionDone:
@@ -139,21 +162,21 @@ func ToWireMemoryCitations(in []provider.MemoryCitation) []MemoryCitation {
 type Compaction struct {
 	Trigger  string `json:"trigger,omitempty"`
 	Messages int    `json:"messages,omitempty"`
-	Summary  string `json:"summary,omitempty"`
-	Archive  string `json:"archive,omitempty"`
+	Summary  string `json:"summary,omitempty" externalizable:"true"`
+	Archive  string `json:"archive,omitempty" externalizable:"true"`
 }
 
 // AskOption is one JSON-formatted choice in a structured ask request.
 type AskOption struct {
 	Label       string `json:"label"`
-	Description string `json:"description,omitempty"`
+	Description string `json:"description,omitempty" externalizable:"true"`
 }
 
 // AskQuestion is one JSON-formatted structured ask question.
 type AskQuestion struct {
 	ID      string      `json:"id"`
 	Header  string      `json:"header,omitempty"`
-	Prompt  string      `json:"prompt"`
+	Prompt  string      `json:"prompt" externalizable:"true"`
 	Options []AskOption `json:"options"`
 	Multi   bool        `json:"multi,omitempty"`
 }
@@ -174,9 +197,9 @@ type Profile struct {
 type Tool struct {
 	ID         string   `json:"id,omitempty"`
 	Name       string   `json:"name"`
-	Args       string   `json:"args,omitempty"`
-	Output     string   `json:"output,omitempty"`
-	Err        string   `json:"err,omitempty"`
+	Args       string   `json:"args,omitempty" externalizable:"true"`
+	Output     string   `json:"output,omitempty" externalizable:"true"`
+	Err        string   `json:"err,omitempty" externalizable:"true"`
 	ReadOnly   bool     `json:"readOnly"`
 	Truncated  bool     `json:"truncated,omitempty"`
 	DurationMs int64    `json:"durationMs,omitempty"`
@@ -184,7 +207,7 @@ type Tool struct {
 	ArgChars   int      `json:"argChars,omitempty"`
 	Refreshed  bool     `json:"refreshed,omitempty"`
 	ParentID   string   `json:"parentId,omitempty"`
-	Diff       string   `json:"diff,omitempty"`
+	Diff       string   `json:"diff,omitempty" externalizable:"true"`
 	Added      int      `json:"added,omitempty"`
 	Removed    int      `json:"removed,omitempty"`
 	Profile    *Profile `json:"profile,omitempty"`
@@ -224,11 +247,30 @@ type CacheDiagnostics struct {
 
 // Approval is the JSON form of an event.Approval.
 type Approval struct {
-	ID      string `json:"id"`
-	Tool    string `json:"tool"`
-	Subject string `json:"subject"`
-	Reason  string `json:"reason,omitempty"`
-	Fresh   bool   `json:"fresh,omitempty"`
+	ID       string            `json:"id"`
+	Tool     string            `json:"tool"`
+	Subject  string            `json:"subject" externalizable:"true"`
+	Reason   string            `json:"reason,omitempty" externalizable:"true"`
+	Fresh    bool              `json:"fresh,omitempty"`
+	Kind     string            `json:"kind,omitempty"` // tool | plan | recovery
+	Recovery *RecoveryApproval `json:"recovery,omitempty"`
+}
+
+// RecoveryApproval is the JSON form of an event.RecoveryApproval.
+type RecoveryApproval struct {
+	SourceAgent     string `json:"source_agent,omitempty"`
+	FailedTool      string `json:"failed_tool,omitempty"`
+	FailedSummary   string `json:"failed_summary,omitempty"`
+	Diagnosis       string `json:"diagnosis,omitempty"`
+	NextTool        string `json:"next_tool,omitempty"`
+	NextAction      string `json:"next_action,omitempty"`
+	ChangeKind      string `json:"change_kind,omitempty"`
+	ChangeRationale string `json:"change_rationale,omitempty"`
+	ReviewRationale string `json:"review_rationale,omitempty"`
+	PlanBefore      string `json:"plan_before,omitempty"`
+	PlanAfter       string `json:"plan_after,omitempty"`
+	CanGrantTask    bool   `json:"can_grant_task,omitempty"`
+	TaskGrantScope  string `json:"task_grant_scope,omitempty"`
 }
 
 // Guardian is the JSON form of an event.GuardianResult.
@@ -239,7 +281,7 @@ type Guardian struct {
 	Outcome           string `json:"outcome"`
 	RiskLevel         string `json:"risk_level,omitempty"`
 	UserAuthorization string `json:"user_authorization,omitempty"`
-	Rationale         string `json:"rationale,omitempty"`
+	Rationale         string `json:"rationale,omitempty" externalizable:"true"`
 	DurationMs        int64  `json:"duration_ms,omitempty"`
 	Usage             *Usage `json:"usage,omitempty"`
 }
@@ -298,6 +340,19 @@ func ToWireCacheDiagnostics(d *event.CacheDiagnostics) *CacheDiagnostics {
 		CacheMissTokens:     d.CacheMissTokens,
 		CacheHitTokens:      d.CacheHitTokens,
 	}
+}
+
+// KindNames returns every stable frontend event kind in event.Kind order. It is
+// the protocol-neutral source used by consumers such as the Remote schema
+// generator; callers receive a copy and may sort it without mutating eventwire.
+func KindNames() []string {
+	names := make([]string, 0, int(event.KindCount))
+	for kind := event.Kind(0); kind < event.KindCount; kind++ {
+		if name, ok := kindNames[kind]; ok {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 var kindNames = map[event.Kind]string{

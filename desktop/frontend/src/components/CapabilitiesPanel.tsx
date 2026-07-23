@@ -4,7 +4,7 @@ import { asArray } from "../lib/array";
 import { app, openExternal } from "../lib/bridge";
 import { useT } from "../lib/i18n";
 import { mcpServerLifecycleActions, mcpServerRetryableFromAvailableList } from "../lib/mcpServerLifecycle";
-import type { CapabilitiesView, MCPApprovalMode, MCPApprovalsReviewer, MCPServerInput, MCPToolPolicy, PluginAgentView, PluginCommandView, PluginCompatibilityIssue, PluginHookView, PluginInstallOptions, PluginMCPServerView, PluginSkillView, PluginView, ServerView, SkillRootSkillView, SkillRootView, SkillsSettingsView, SkillView, TabMeta } from "../lib/types";
+import type { CapabilitiesView, MCPInstallResult, MCPMarketplaceEntry, MCPMarketplaceView, MCPServerInput, PluginAgentView, PluginCommandView, PluginCompatibilityIssue, PluginHookView, PluginInstallOptions, PluginMCPServerView, PluginSkillView, PluginView, ServerView, SkillRootSkillView, SkillRootView, SkillsSettingsView, SkillView, TabMeta } from "../lib/types";
 import { InlineConfirmButton } from "./InlineConfirmButton";
 import { ResizableDrawer } from "./ResizableDrawer";
 import { Tooltip } from "./Tooltip";
@@ -17,6 +17,12 @@ import { ModalCloseButton } from "./ModalCloseButton";
 type CapTab = "servers" | "skills";
 
 type SettingsSnapshot<T> = { key: string; value: T };
+
+async function installMCPServer(input: MCPServerInput): Promise<MCPInstallResult> {
+  const result = await app.InstallMCPServer(input);
+  if (result.state === "issue") throw new Error(result.message);
+  return result;
+}
 
 let mcpSettingsSnapshot: SettingsSnapshot<ServerView[]> | null = null;
 let skillsSettingsSnapshot: SettingsSnapshot<SkillsSettingsView> | null = null;
@@ -253,7 +259,11 @@ export function CapabilitiesPanel({
                   </div>
                 )}
                 {adding ? (
-                  <AddServerForm busy={busy} onCancel={() => setAdding(false)} onAdd={async (input) => (await mutate(() => app.AddMCPServer(input))) && setAdding(false)} />
+                  <MCPServerSettingsEditor
+                    busy={busy}
+                    onCancel={() => setAdding(false)}
+                    onSubmit={(input) => void mutate(() => installMCPServer(input)).then((ok) => { if (ok) setAdding(false); })}
+                  />
                 ) : null}
               </section>
             ) : (
@@ -325,7 +335,6 @@ function normalizeServerViews(servers: ServerView[] | null | undefined): ServerV
       envKeys: asArray(server.envKeys),
       headerKeys: asArray(server.headerKeys),
       toolList: asArray(server.toolList),
-      trustedReadOnlyTools: asArray(server.trustedReadOnlyTools),
     })),
   );
 }
@@ -1159,9 +1168,6 @@ function EditServerForm({
       url: isStdio ? "" : url.trim(),
       env: envText === "" ? null : parseKeyValueText(envText),
       headers: isStdio || headerText === "" ? null : parseKeyValueText(headerText),
-      // Preserve an existing local reader declaration in the backend. The
-      // basic settings form does not expose this advanced compatibility field.
-      trustedReadOnlyTools: undefined,
     });
   };
 
@@ -1253,20 +1259,50 @@ function parseKeyValueText(text: string): Record<string, string> {
 }
 
 function serverStatusLabel(s: ServerView, t: ReturnType<typeof useT>): string {
-  switch (s.status) {
+  // Prefer product availability so idle enabled servers are not shown as disconnected.
+  const availability = s.availability
+    || (s.enabled === false || s.status === "disabled"
+      ? "disabled"
+      : s.status === "connected"
+        ? "connected"
+        : s.status === "initializing"
+          ? "starting"
+          : s.status === "failed"
+            ? (s.authStatus === "required" ? "auth_required" : "start_failed")
+            : s.status === "deferred"
+              ? "available_on_demand"
+              : s.status);
+  switch (availability) {
     case "connected":
       return t("caps.connected");
-    case "deferred":
+    case "available_on_demand":
       return t("caps.deferred");
-    case "initializing":
+    case "starting":
       return t("caps.initializing");
     case "disabled":
-      return s.configured && !s.autoStart ? t("caps.disabledAutoStart") : t("caps.disabled");
-    case "failed":
-      if (s.authStatus === "required") return t("caps.authRequired");
+      return t("caps.disabled");
+    case "auth_required":
+      return t("caps.authRequired");
+    case "project_auth_changed":
+      return t("caps.projectAuthChanged");
+    case "start_failed":
       return t("caps.failed");
     default:
-      return s.status;
+      switch (s.status) {
+        case "connected":
+          return t("caps.connected");
+        case "deferred":
+          return t("caps.deferred");
+        case "initializing":
+          return t("caps.initializing");
+        case "disabled":
+          return t("caps.disabled");
+        case "failed":
+          if (s.authStatus === "required") return t("caps.authRequired");
+          return t("caps.failed");
+        default:
+          return s.status;
+      }
   }
 }
 
@@ -1497,72 +1533,98 @@ function summarizeSkillDescription(description: string): string {
   return `${normalized.slice(0, 128).trim()}…`;
 }
 
-function AddServerForm({
-  busy,
-  onCancel,
-  onAdd,
-}: {
-  busy: boolean;
-  onCancel: () => void;
-  onAdd: (input: MCPServerInput) => void;
-}) {
-  const t = useT();
-  const [name, setName] = useState("");
-  const [transport, setTransport] = useState("stdio");
-  const [command, setCommand] = useState("");
-  const [url, setUrl] = useState("");
-  const [headers, setHeaders] = useState("");
-  const [env, setEnv] = useState("");
+function tokenizeMCPCommand(raw: string): string[] {
+	const tokens: string[] = [];
+	let token = "";
+	let quote = "";
+	for (let i = 0; i < raw.length; i += 1) {
+		const ch = raw[i];
+		if (quote) {
+			if (ch === quote) {
+				quote = "";
+				continue;
+			}
+			if (ch === "\\" && quote === '"' && i + 1 < raw.length && /["\\]/.test(raw[i + 1])) {
+				token += raw[i + 1];
+				i += 1;
+				continue;
+			}
+			token += ch;
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < raw.length && /\s/.test(raw[i + 1])) {
+			token += raw[i + 1];
+			i += 1;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (token) tokens.push(token);
+			token = "";
+			continue;
+		}
+		token += ch;
+	}
+	if (token) tokens.push(token);
+	return tokens;
+}
 
-  const isStdio = transport === "stdio";
-  const ready = name.trim() !== "" && (isStdio ? command.trim() !== "" : url.trim() !== "");
+function firstMCPCommandOperand(args: string[]): string {
+	const valueFlags = new Set(["-p", "--package", "-c", "--call", "--node-options", "--python"]);
+	let options = true;
+	for (let i = 0; i < args.length; i += 1) {
+		const arg = args[i];
+		if (options && arg === "--") {
+			options = false;
+			continue;
+		}
+		if (options && arg.startsWith("-")) {
+			if (valueFlags.has(arg)) i += 1;
+			continue;
+		}
+		return arg;
+	}
+	return "";
+}
 
-  const submit = () => {
-    const envText = env.trim();
-    const headerText = headers.trim();
-    onAdd({
-      name: name.trim(),
-      transport,
-      command: isStdio ? command.trim() : "",
-      args: [],
-      url: isStdio ? "" : url.trim(),
-      env: envText === "" ? null : parseKeyValueText(envText),
-      headers: isStdio || headerText === "" ? null : parseKeyValueText(headerText),
-    });
-  };
+function quickMCPName(raw: string): string {
+	const argv = tokenizeMCPCommand(raw);
+	const executable = argv[0]?.split(/[\\/]/).pop()?.toLowerCase().replace(/\.(?:cmd|exe|bat)$/i, "") || "";
+	let candidate = argv[0] || "mcp-server";
+	if (["npx", "bunx", "uvx"].includes(executable)) {
+		candidate = firstMCPCommandOperand(argv.slice(1)) || candidate;
+	} else if (["python", "python3", "py"].includes(executable)) {
+		const moduleIndex = argv.findIndex((arg) => arg === "-m");
+		candidate = moduleIndex >= 0 ? argv[moduleIndex + 1] || candidate : firstMCPCommandOperand(argv.slice(1)) || candidate;
+	} else if (executable === "node") {
+		candidate = firstMCPCommandOperand(argv.slice(1)) || candidate;
+	} else if (executable === "uv" && argv[1] === "run") {
+		candidate = firstMCPCommandOperand(argv.slice(2)) || candidate;
+	}
+	const base = candidate.split(/[\\/]/).pop() || candidate;
+	const unversioned = base.replace(/@[^@]+$/, "").replace(/\.(?:cmd|exe|bat)$/i, "");
+	const sanitized = unversioned.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+	return sanitized && /[a-z0-9]/.test(sanitized) && !["npx", "uvx", "uv", "node", "bunx", "python", "python3", "py"].includes(sanitized)
+		? sanitized
+		: "mcp-server";
+}
 
-  return (
-    <div className="prov-card prov-card--edit">
-      <input className="mem-input" placeholder={t("caps.namePlaceholder")} value={name} onChange={(e) => setName(e.target.value)} />
-      <label className="set-label">{t("caps.transport")}</label>
-      <select className="mem-select" value={transport} onChange={(e) => setTransport(e.target.value)}>
-        <option value="stdio">stdio</option>
-        <option value="http">http</option>
-        <option value="sse">sse</option>
-      </select>
-      {isStdio ? (
-        <input className="mem-input" placeholder={t("caps.commandPlaceholder")} value={command} onChange={(e) => setCommand(e.target.value)} />
-      ) : (
-        <input className="mem-input" placeholder={t("caps.urlPlaceholder")} value={url} onChange={(e) => setUrl(e.target.value)} />
-      )}
-      {!isStdio && (
-        <>
-          <label className="set-label">{t("caps.headersLabel")}</label>
-          <textarea className="mem-textarea" value={headers} onChange={(e) => setHeaders(e.target.value)} placeholder={t("caps.headersPlaceholder")} spellCheck={false} />
-        </>
-      )}
-      <label className="set-label">{t("caps.envLabel")}</label>
-      <textarea className="mem-textarea" value={env} onChange={(e) => setEnv(e.target.value)} placeholder={t("caps.envPlaceholder")} spellCheck={false} />
-      <div className="prov-card__actions">
-        <button className="btn btn--small" onClick={onCancel} disabled={busy}>
-          {t("common.cancel")}
-        </button>
-        <button className="btn btn--primary btn--small" onClick={submit} disabled={busy || !ready}>
-          {t("caps.add")}
-        </button>
-      </div>
-    </div>
-  );
+export function parseMCPQuickDefinition(raw: string): MCPServerInput {
+  const definition = raw.trim();
+  if (definition.startsWith("{")) return parseMCPServerJSON(definition).input;
+  if (/^https?:\/\//i.test(definition)) {
+    let name = "remote-mcp";
+    try {
+      name = new URL(definition).hostname.replace(/^www\./, "").split(".")[0] || name;
+    } catch {
+      throw new Error("invalid" satisfies MCPServerJSONError);
+    }
+    return { name, transport: "http", command: "", args: [], url: definition, env: null, headers: null };
+  }
+  return { name: quickMCPName(definition), transport: "stdio", command: definition, args: [], url: "", env: null, headers: null };
 }
 
 type PluginInstallPlanAction = {
@@ -2271,6 +2333,7 @@ function pluginPlanNotice(plan: PluginInstallPlanView, t: ReturnType<typeof useT
 type MCPSettingsScreen =
 	| { kind: "list" }
 	| { kind: "add" }
+	| { kind: "marketplace" }
 	| { kind: "detail"; name: string }
 	| { kind: "edit"; name: string };
 
@@ -2289,10 +2352,6 @@ type MCPServerEditorDraft = {
 	autoStart?: boolean;
 	callTimeoutSeconds?: number;
 	toolTimeoutSeconds?: Record<string, number>;
-	trustedReadOnlyTools?: string[];
-	defaultToolsApprovalMode?: MCPApprovalMode | "";
-	tools?: Record<string, MCPToolPolicy>;
-	approvalsReviewer?: MCPApprovalsReviewer | "";
 };
 
 type MCPServerJSONError = "invalid" | "single" | "name" | "required" | "unsupported";
@@ -2495,10 +2554,27 @@ function mcpServerEditorDraft(server?: ServerView): MCPServerEditorDraft {
 		autoStart: server?.autoStart,
 		callTimeoutSeconds: server?.callTimeoutSeconds,
 		toolTimeoutSeconds: server?.toolTimeoutSeconds ? { ...server.toolTimeoutSeconds } : undefined,
-		trustedReadOnlyTools: server?.trustedReadOnlyTools ? [...server.trustedReadOnlyTools] : undefined,
-		defaultToolsApprovalMode: server?.defaultToolsApprovalMode,
-		tools: server?.toolPolicies ? { ...server.toolPolicies } : undefined,
-		approvalsReviewer: server?.approvalsReviewer,
+	};
+}
+
+function mcpServerInputDraft(input: MCPServerInput): MCPServerEditorDraft {
+	const transport = normalizeTransportValue(input.transport);
+	const command = transport === "stdio" ? [input.command, ...input.args].filter(Boolean).join(" ").trim() : "";
+	return {
+		name: input.name,
+		transport,
+		command,
+		structuredCommand: transport === "stdio" ? {
+			display: command,
+			command: input.command,
+			args: [...input.args],
+		} : undefined,
+		url: transport === "stdio" ? "" : input.url,
+		env: input.env ? Object.entries(input.env).map(([key, value]) => `${key}=${value}`).join("\n") : "",
+		headers: input.headers ? Object.entries(input.headers).map(([key, value]) => `${key}=${value}`).join("\n") : "",
+		autoStart: input.autoStart ?? undefined,
+		callTimeoutSeconds: input.callTimeoutSeconds ?? undefined,
+		toolTimeoutSeconds: input.toolTimeoutSeconds ? { ...input.toolTimeoutSeconds } : undefined,
 	};
 }
 
@@ -2518,12 +2594,26 @@ function mcpServerDraftInput(draft: MCPServerEditorDraft): MCPServerInput {
 		autoStart: draft.autoStart ?? null,
 		callTimeoutSeconds: draft.callTimeoutSeconds ?? null,
 		toolTimeoutSeconds: draft.toolTimeoutSeconds ?? null,
-		// Keep parsing the legacy field for the two-release migration window,
-		// but never generate it in a new or edited server configuration.
-		trustedReadOnlyTools: undefined,
-		defaultToolsApprovalMode: draft.defaultToolsApprovalMode ?? null,
-		tools: draft.tools ?? null,
-		approvalsReviewer: draft.approvalsReviewer ?? null,
+	};
+}
+
+function mcpMarketplaceServerInput(entry: MCPMarketplaceEntry, servers: ServerView[]): MCPServerInput {
+	const used = new Set(servers.map((server) => server.name));
+	const base = entry.suggestedName || entry.name.split("/").filter(Boolean).pop() || "mcp-server";
+	let name = base;
+	for (let suffix = 2; used.has(name); suffix += 1) name = `${base}-${suffix}`;
+	const transport = entry.transport || "stdio";
+	return {
+		name,
+		transport,
+		command: transport === "stdio" ? entry.command || "" : "",
+		args: transport === "stdio" ? [...(entry.args ?? [])] : [],
+		url: transport === "stdio" ? "" : entry.url || "",
+		env: null,
+		headers: null,
+		autoStart: null,
+		callTimeoutSeconds: null,
+		toolTimeoutSeconds: null,
 	};
 }
 
@@ -2540,9 +2630,6 @@ export function mcpServerDraftJSON(draft: MCPServerEditorDraft): string {
 	if (input.autoStart != null) entry.auto_start = input.autoStart;
 	if (input.callTimeoutSeconds != null) entry.call_timeout_seconds = input.callTimeoutSeconds;
 	if (input.toolTimeoutSeconds && Object.keys(input.toolTimeoutSeconds).length > 0) entry.tool_timeout_seconds = input.toolTimeoutSeconds;
-	if (input.defaultToolsApprovalMode != null) entry.default_tools_approval_mode = input.defaultToolsApprovalMode;
-	if (input.tools && Object.keys(input.tools).length > 0) entry.tools = input.tools;
-	if (input.approvalsReviewer != null) entry.approvals_reviewer = input.approvalsReviewer;
 	return JSON.stringify({ [input.name || "server-name"]: entry }, null, 2);
 }
 
@@ -2588,40 +2675,10 @@ function nonNegativeIntegerRecord(value: unknown): Record<string, number> | unde
 export function withExplicitMCPClears(input: MCPServerInput): MCPServerInput {
 	return {
 		...input,
-		trustedReadOnlyTools: undefined,
 		autoStart: input.autoStart ?? true,
 		callTimeoutSeconds: input.callTimeoutSeconds ?? 0,
 		toolTimeoutSeconds: input.toolTimeoutSeconds ?? {},
-		defaultToolsApprovalMode: input.defaultToolsApprovalMode ?? "",
-		tools: input.tools ?? {},
-		approvalsReviewer: input.approvalsReviewer ?? "",
 	};
-}
-
-function approvalMode(value: unknown): MCPApprovalMode | undefined {
-	if (value == null || value === "") return undefined;
-	if (value === "auto" || value === "prompt" || value === "writes" || value === "approve") return value;
-	throw new Error("invalid" satisfies MCPServerJSONError);
-}
-
-function approvalsReviewer(value: unknown): MCPApprovalsReviewer | undefined {
-	if (value == null || value === "") return undefined;
-	if (value === "user" || value === "auto_review") return value;
-	throw new Error("invalid" satisfies MCPServerJSONError);
-}
-
-function mcpToolPolicies(value: unknown): Record<string, MCPToolPolicy> | undefined {
-	if (value == null) return undefined;
-	if (!isRecord(value)) throw new Error("invalid" satisfies MCPServerJSONError);
-	const out: Record<string, MCPToolPolicy> = {};
-	for (const [name, item] of Object.entries(value)) {
-		if (!name.trim() || !isRecord(item)) throw new Error("invalid" satisfies MCPServerJSONError);
-		assertSupportedKeys(item, ["approval_mode"]);
-		const mode = approvalMode(item.approval_mode);
-		if (!mode) throw new Error("invalid" satisfies MCPServerJSONError);
-		out[name] = { approval_mode: mode };
-	}
-	return out;
 }
 
 export function parseMCPServerJSON(raw: string, fixedName?: string, options?: { allowIncomplete?: boolean }): { input: MCPServerInput; draft: MCPServerEditorDraft } {
@@ -2668,16 +2725,9 @@ export function parseMCPServerJSON(raw: string, fixedName?: string, options?: { 
 		throw new Error("invalid" satisfies MCPServerJSONError);
 	}
 	if (value.auto_start != null && typeof value.auto_start !== "boolean") throw new Error("invalid" satisfies MCPServerJSONError);
-	if (value.trusted_read_only_tools != null && (!Array.isArray(value.trusted_read_only_tools) || !value.trusted_read_only_tools.every((item) => typeof item === "string"))) {
-		throw new Error("invalid" satisfies MCPServerJSONError);
-	}
 	const autoStart = value.auto_start as boolean | undefined;
 	const callTimeoutSeconds = nonNegativeInteger(value.call_timeout_seconds);
 	const toolTimeoutSeconds = nonNegativeIntegerRecord(value.tool_timeout_seconds);
-	const trustedReadOnlyTools = value.trusted_read_only_tools ? [...value.trusted_read_only_tools as string[]] : undefined;
-	const defaultToolsApprovalMode = value.default_tools_approval_mode === "" ? "" : approvalMode(value.default_tools_approval_mode);
-	const tools = mcpToolPolicies(value.tools);
-	const reviewer = value.approvals_reviewer === "" ? "" : approvalsReviewer(value.approvals_reviewer);
 	const input: MCPServerInput = {
 		name: fixedName || name,
 		transport,
@@ -2689,10 +2739,6 @@ export function parseMCPServerJSON(raw: string, fixedName?: string, options?: { 
 		autoStart: autoStart ?? null,
 		callTimeoutSeconds: callTimeoutSeconds ?? null,
 		toolTimeoutSeconds: toolTimeoutSeconds ?? null,
-		trustedReadOnlyTools,
-		defaultToolsApprovalMode: defaultToolsApprovalMode ?? null,
-		tools: tools ?? null,
-		approvalsReviewer: reviewer ?? null,
 	};
 	return {
 		input,
@@ -2711,10 +2757,6 @@ export function parseMCPServerJSON(raw: string, fixedName?: string, options?: { 
 			autoStart,
 			callTimeoutSeconds,
 			toolTimeoutSeconds,
-			trustedReadOnlyTools,
-			defaultToolsApprovalMode,
-			tools,
-			approvalsReviewer: reviewer,
 		},
 	};
 }
@@ -2740,7 +2782,10 @@ function MCPServerSettingsEditor({
 	onSubmit: (input: MCPServerInput) => void;
 }) {
 	const t = useT();
-	const [mode, setMode] = useState<"form" | "json">("form");
+	type EditorMode = "quick" | "form" | "json";
+	const [mode, setMode] = useState<EditorMode>(server ? "form" : "quick");
+	const [definition, setDefinition] = useState("");
+	const [quickError, setQuickError] = useState("");
 	const [draft, setDraft] = useState<MCPServerEditorDraft>(() => mcpServerEditorDraft(server));
 	const [json, setJSON] = useState(() => mcpServerDraftJSON(mcpServerEditorDraft(server)));
 	const [jsonError, setJSONError] = useState("");
@@ -2749,8 +2794,28 @@ function MCPServerSettingsEditor({
 	const ready = Boolean(draft.name.trim() && (isStdio ? draft.command.trim() : draft.url.trim()));
 
 	const updateDraft = (patch: Partial<MCPServerEditorDraft>) => setDraft((current) => ({ ...current, ...patch }));
-	const switchMode = (next: "form" | "json") => {
+	const switchMode = (next: EditorMode) => {
 		if (next === mode) return;
+		if (next === "quick") {
+			setQuickError("");
+			setMode("quick");
+			return;
+		}
+		if (mode === "quick") {
+			if (definition.trim()) {
+				try {
+					const nextDraft = mcpServerInputDraft(parseMCPQuickDefinition(definition));
+					setDraft(nextDraft);
+					if (next === "json") setJSON(mcpServerDraftJSON(nextDraft));
+					setQuickError("");
+				} catch (error) {
+					setQuickError(mcpServerJSONErrorLabel(error, t));
+					return;
+				}
+			}
+			setMode(next);
+			return;
+		}
 		if (next === "json") {
 			setJSON(mcpServerDraftJSON(draft));
 			setJSONError("");
@@ -2773,6 +2838,15 @@ function MCPServerSettingsEditor({
 	};
 	const finalize = (input: MCPServerInput) => (server ? withExplicitMCPClears(input) : input);
 	const submit = () => {
+		if (mode === "quick") {
+			try {
+				setQuickError("");
+				onSubmit(parseMCPQuickDefinition(definition));
+			} catch (error) {
+				setQuickError(mcpServerJSONErrorLabel(error, t));
+			}
+			return;
+		}
 		if (mode === "form") {
 			onSubmit(finalize(mcpServerDraftInput(draft)));
 			return;
@@ -2789,6 +2863,11 @@ function MCPServerSettingsEditor({
 	return (
 		<div className="cap-mcp-editor">
 			<div className="cap-mcp-editor__mode set-seg" role="tablist" aria-label={t("caps.editorMode")}>
+				{!server && (
+					<button className={`set-seg__btn${mode === "quick" ? " set-seg__btn--on" : ""}`} type="button" role="tab" aria-selected={mode === "quick"} onClick={() => switchMode("quick")}>
+						{t("caps.quickMode")}
+					</button>
+				)}
 				<button className={`set-seg__btn${mode === "form" ? " set-seg__btn--on" : ""}`} type="button" role="tab" aria-selected={mode === "form"} onClick={() => switchMode("form")}>
 					{t("caps.formMode")}
 				</button>
@@ -2796,7 +2875,28 @@ function MCPServerSettingsEditor({
 					{t("caps.jsonMode")}
 				</button>
 			</div>
-			{mode === "form" ? (
+			{mode === "quick" ? (
+				<div className="cap-mcp-quick">
+					<label className="cap-mcp-field">
+						<span>{t("caps.installDefinition")}</span>
+						<textarea
+							className="mem-textarea cap-mcp-quick__input"
+							value={definition}
+							disabled={busy}
+							onChange={(event) => { setDefinition(event.target.value); setQuickError(""); }}
+							placeholder={t("caps.installDefinitionPlaceholder")}
+							spellCheck={false}
+						/>
+					</label>
+					<div className="cap-mcp-quick__hint">{t("caps.installDefinitionHint")}</div>
+					<div className="cap-mcp-quick__benefits" aria-label={t("caps.quickBenefitsLabel")}>
+						<span>{t("caps.quickDetectTransport")}</span>
+						<span>{t("caps.quickVerifyConnection")}</span>
+						<span>{t("caps.quickEnableTools")}</span>
+					</div>
+					{quickError && <div className="banner banner--error" role="alert">{quickError}</div>}
+				</div>
+			) : mode === "form" ? (
 				<div className="cap-mcp-form-grid">
 					<label className="cap-mcp-field cap-mcp-field--name">
 						<span>{t("caps.name")}</span>
@@ -2856,7 +2956,7 @@ function MCPServerSettingsEditor({
 			)}
 			<div className="cap-mcp-editor__actions">
 				<button className="btn btn--small" disabled={busy} type="button" onClick={onCancel}>{t("common.cancel")}</button>
-				<button className="btn btn--primary btn--small" disabled={busy || (mode === "form" && !ready)} type="button" onClick={submit}>
+				<button className="btn btn--primary btn--small" disabled={busy || (mode === "quick" ? !definition.trim() : mode === "form" && !ready)} type="button" onClick={submit}>
 					{server ? t("caps.saveConfig") : t("caps.addAndConnect")}
 				</button>
 			</div>
@@ -2874,6 +2974,8 @@ export function MCPServersSettingsPage() {
 	const [err, setErr] = useState<string | null>(null);
 	const [query, setQuery] = useState("");
 	const [screen, setScreen] = useState<MCPSettingsScreen>({ kind: "list" });
+	const [marketplace, setMarketplace] = useState<MCPMarketplaceView | null>(null);
+	const [marketplaceQuery, setMarketplaceQuery] = useState("");
 
 	const reload = useCallback(async () => {
 		const [meta, tabs] = await Promise.all([
@@ -2916,6 +3018,28 @@ export function MCPServersSettingsPage() {
 	};
 	const authorizeProjectAndConnect = async (name: string) =>
 		mutate(() => app.AuthorizeAndConnectMCPServer(name));
+	const browseMarketplace = async (search = marketplaceQuery) => {
+		setBusy(true);
+		setErr(null);
+		try {
+			const result = await app.MCPMarketplace(search);
+			setMarketplace({ ...result, servers: asArray(result.servers) });
+			return true;
+		} catch (error) {
+			setErr(String((error as Error)?.message ?? error));
+			return false;
+		} finally {
+			setBusy(false);
+		}
+	};
+	const openMarketplace = () => {
+		setScreen({ kind: "marketplace" });
+		if (marketplace === null) void browseMarketplace("");
+	};
+	const installMarketplaceEntry = async (entry: MCPMarketplaceEntry) => {
+		const current = await app.MCPMarketplaceResolve(entry.name);
+		return installMCPServer(mcpMarketplaceServerInput(current, servers ?? []));
+	};
 	const filteredServers = useMemo(() => {
 		const sorted = sortServersForDisplay(servers ?? []);
 		const normalizedQuery = query.trim().toLowerCase();
@@ -2953,6 +3077,10 @@ export function MCPServersSettingsPage() {
 									<RefreshCw aria-hidden size={15} />
 								</button>
 							</Tooltip>
+							<button className="btn btn--small" disabled={actionBusy} type="button" onClick={openMarketplace}>
+								<Search aria-hidden size={14} />
+								{t("caps.browseRegistry")}
+							</button>
 							<button className="btn btn--primary btn--small cap-mcp-add-btn" disabled={actionBusy} type="button" onClick={() => setScreen({ kind: "add" })}>
 								<Plus aria-hidden size={14} />
 								{t("caps.addServer")}
@@ -2987,13 +3115,54 @@ export function MCPServersSettingsPage() {
 					/>
 				</>
 			)}
+			{screen.kind === "marketplace" && (
+				<div className="cap-mcp-subpage">
+					<MCPSettingsSubpageHeader title={t("caps.registryTitle")} description={t("caps.registryHint")} onBack={() => setScreen({ kind: "list" })} />
+					<form className="cap-mcp-search cap-mcp-search--action" onSubmit={(event) => { event.preventDefault(); void browseMarketplace(); }}>
+						<Search aria-hidden size={15} />
+						<input type="search" value={marketplaceQuery} onInput={(event) => setMarketplaceQuery(event.currentTarget.value)} placeholder={t("caps.searchRegistry")} />
+						<button className="btn btn--small" disabled={busy} type="submit">{t("caps.search")}</button>
+					</form>
+					{marketplace?.warning && <div className="banner" role="status">{t("caps.registryCached")} {marketplace.warning}</div>}
+					{busy && marketplace === null && <div className="mem-empty">{t("caps.loading")}</div>}
+					{!busy && marketplace && marketplace.servers.length === 0 && <div className="mem-empty">{t("caps.noRegistryMatches")}</div>}
+					{marketplace && marketplace.servers.length > 0 && (
+						<div className="cap-mcp-list">
+							{marketplace.servers.map((entry) => (
+								<div className="cap-mcp-list-row" key={entry.name}>
+									<div className="cap-mcp-list-row__main">
+										<span className="cap-mcp-list-row__icon" aria-hidden><ServerIcon size={16} strokeWidth={1.8} /></span>
+										<span className="cap-mcp-list-row__copy">
+											<span className="cap-mcp-list-row__head">
+												<span className="cap-mcp-list-row__name">{entry.title || entry.name}</span>
+												{entry.version && <span className="cap-mcp-list-row__transport">{entry.version}</span>}
+												{entry.transport && <span className="cap-mcp-list-row__transport">{entry.transport}</span>}
+											</span>
+											<span className="cap-mcp-list-row__target">{entry.name}</span>
+											<span className="cap-mcp-list-row__summary">{entry.description || entry.unavailableReason}</span>
+											{!entry.installable && entry.unavailableReason && <span className="cap-mcp-list-row__owner">{entry.unavailableReason}</span>}
+										</span>
+									</div>
+									<div className="cap-mcp-list-row__actions">
+										{entry.installable ? (
+											<button className="btn btn--primary btn--small" disabled={actionBusy || marketplace.cached} type="button" onClick={() => void mutate(() => installMarketplaceEntry(entry)).then((ok) => { if (ok) setScreen({ kind: "list" }); })}>
+												{t("caps.install")}
+											</button>
+										) : <span className="cap-mcp-list-row__owner">{t("caps.manualSetup")}</span>}
+									</div>
+								</div>
+							))}
+						</div>
+					)}
+				</div>
+			)}
 			{screen.kind === "add" && (
 				<div className="cap-mcp-subpage">
 					<MCPSettingsSubpageHeader title={t("caps.addServerTitle")} description={t("caps.addServerHint")} onBack={() => setScreen({ kind: "list" })} />
 					<MCPServerSettingsEditor
 						busy={busy}
 						onCancel={() => setScreen({ kind: "list" })}
-						onSubmit={(input) => void mutate(() => app.AddMCPServer(input)).then((ok) => { if (ok) setScreen({ kind: "list" }); })}
+						onSubmit={(input) => void mutate(() => installMCPServer(input)).then((ok) => { if (ok) setScreen({ kind: "list" }); })}
 					/>
 				</div>
 			)}

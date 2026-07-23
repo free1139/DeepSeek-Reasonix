@@ -39,7 +39,8 @@ import { useWailsResizeFix } from "./lib/useWailsResizeFix";
 import { asArray } from "./lib/array";
 import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, t, useI18n, useT, type Translator } from "./lib/i18n";
 import { localizedNoticeText, useController, type Item, type LiveStream } from "./lib/useController";
-import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered, openExternal } from "./lib/bridge";
+import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered, onWorkbenchTarget, openExternal } from "./lib/bridge";
+import { preferredRemoteWorkspace, workbenchTargetTransitioning, type WorkbenchActiveTarget } from "./lib/workbenchTarget";
 import { generativeMusic, isGenerativeMusicEnabled } from "./lib/generative-music";
 import { clearAttentionChimeKeys, playAttentionChime, playSuccessChime, shouldPlayAttentionChimeForEvent } from "./lib/sound";
 import { NoticeCard, Transcript } from "./components/Transcript";
@@ -56,15 +57,18 @@ type DecisionSurfaceKind = "tool_approval" | "plan_approval" | "ask" | "clear_co
 import { StatusBar } from "./components/StatusBar";
 import { RemoteHostKeyDialog } from "./components/RemoteHostKeyDialog";
 import { RemoteSecretDialog } from "./components/RemoteSecretDialog";
+import { ProviderTrustDialog } from "./components/ProviderTrustDialog";
 import { onRemoteStatus, onRemoteForwards, onRemoteServer } from "./lib/bridge";
 import { RemoteConnectionTimeoutError, useRemoteStore, waitForRemoteConnection } from "./store/remote";
 import { CommandPalette, type PaletteItem } from "./components/CommandPalette";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { UpdaterProvider } from "./lib/useUpdater";
 import { ContextPanel } from "./components/ContextPanel";
 import { WorkspacePanel } from "./components/WorkspacePanel";
 import { Tooltip } from "./components/Tooltip";
 import { StartupSplash } from "./components/StartupSplash";
 import { OnboardingOverlay } from "./components/OnboardingOverlay";
+import { dismissOnboarding, shouldOpenOnboarding } from "./lib/onboarding";
 import { AppChrome } from "./components/AppChrome";
 import { ShortcutsCheatsheet } from "./components/ShortcutsCheatsheet";
 import { ProjectTree } from "./components/ProjectTree";
@@ -76,6 +80,7 @@ import { ExternalOpener } from "./components/ExternalOpener";
 import { parseTodos } from "./lib/tools";
 import {
   dismissedTodoKeyForScope,
+  resolveTodoPanelTodos,
   scopedTodoBatchKey,
   scopedTodoDismissalKey,
   shouldShowTodoPanel,
@@ -102,6 +107,7 @@ import {
 } from "./lib/types";
 import type { InvocationMetadataMap, StructuredInvocationSubmit } from "./lib/invocationDisplay";
 import { formatSelectionReference, type SelectedTextInsertRequest } from "./lib/selectedTextContext";
+import { workspaceTreeVisitId } from "./lib/workspaceTreeMemory";
 import {
   composerProfileFromMeta,
   composerProfileFromTab,
@@ -1036,6 +1042,7 @@ export default function App() {
     notice,
     cancel,
     approve,
+    resolveRecovery,
     answerQuestion,
     setControllerMode,
     setCollaborationMode: setControllerCollaborationMode,
@@ -1090,10 +1097,10 @@ export default function App() {
   const [transcriptRevealSignal, setTranscriptRevealSignal] = useState(0);
   const startupSplashVisible = useOverlayStore((s) => s.startupSplashVisible);
   const setStartupSplashVisible = useOverlayStore((s) => s.setStartupSplashVisible);
-  // null until the mount probe resolves; true shows the overlay. Probed once —
-  // clearing the key mid-session is the Settings panel's job, not the gate's.
+  // null until the mount probe resolves; true shows the first-run guide.
   const needsOnboarding = useOverlayStore((s) => s.needsOnboarding);
   const setNeedsOnboarding = useOverlayStore((s) => s.setNeedsOnboarding);
+  const [providerSetupNeeded, setProviderSetupNeeded] = useState(false);
   const settingsTarget = useOverlayStore((s) => s.settingsTarget);
   const setSettingsTarget = useOverlayStore((s) => s.setSettingsTarget);
   const settingsFocus = useOverlayStore((s) => s.settingsFocus);
@@ -1109,19 +1116,40 @@ export default function App() {
   const remoteExplorerHostId = useRemoteStore((s) => s.explorerHostId);
   const remoteHosts = useRemoteStore((s) => s.hosts);
   const remoteStatuses = useRemoteStore((s) => s.statuses);
+  const [workbenchTarget, setWorkbenchTarget] = useState<WorkbenchActiveTarget>({ kind: "local" });
+	const { showToast } = useToast();
   const setRemoteHosts = useRemoteStore((s) => s.setHosts);
   const hydrateRemoteStatuses = useRemoteStore((s) => s.hydrateStatuses);
   const requestRemoteExplorer = useRemoteStore((s) => s.openExplorer);
+  const setRemoteExplorerTab = useRemoteStore((s) => s.setExplorerTab);
   const closeRemoteExplorerRequest = useRemoteStore((s) => s.closeExplorer);
   const applyRemoteStatus = useRemoteStore((s) => s.applyStatus);
   const requestRemoteStatusPopover = useRemoteStore((s) => s.requestStatusPopover);
   const setRemoteForwards = useRemoteStore((s) => s.setForwards);
   const setRemoteServer = useRemoteStore((s) => s.setServer);
+
+  useEffect(() => {
+    let active = true;
+    void app.WorkbenchActiveTarget()
+      .then((target) => { if (active) setWorkbenchTarget(target); })
+      .catch(() => undefined);
+    const off = onWorkbenchTarget((target) => {
+		if (!active) return;
+		if (target.state === "background_activity") {
+			showToast(t("remote.backgroundActivity"), "info");
+			return;
+		}
+		setWorkbenchTarget(target);
+    });
+    return () => {
+      active = false;
+      off();
+    };
+	}, [showToast, t]);
   const shortcutsOpen = useOverlayStore((s) => s.shortcutsOpen);
   const setShortcutsOpen = useOverlayStore((s) => s.setShortcutsOpen);
   const paletteSessions = useOverlayStore((s) => s.paletteSessions);
   const setPaletteSessions = useOverlayStore((s) => s.setPaletteSessions);
-  const { showToast } = useToast();
   const [sidebarImConnections, setSidebarImConnections] = useState<SidebarImConnection[]>([]);
   const [imTopicSources, setImTopicSources] = useState<Record<string, SidebarImTopicSource>>({});
   const [sidebarImDetailConnectionId, setSidebarImDetailConnectionId] = useState("");
@@ -1539,6 +1567,14 @@ export default function App() {
     state.sessionGen,
     workspaceControllerEpoch,
   ].join("\u0000");
+  // A topic may contain multiple saved sessions; the concrete session path is
+  // the runtime conversation identity, with topic/tab ids only as fallbacks.
+  const workspaceTreeMemoryKey = [
+    activeTab?.scope ?? "",
+    activeTab?.workspaceRoot ?? state.meta?.cwd ?? "",
+    activeTab?.sessionPath || state.meta?.sessionPath || activeTab?.topicId || activeTabId || "",
+  ].join("\u0000");
+  const workspaceTreeMemoryVisitId = workspaceTreeVisitId(workspaceTreeMemoryKey);
   const sidebarImDetailConnection = useMemo(
     () => sidebarImConnections.find((connection) => connection.id === sidebarImDetailConnectionId) ?? null,
     [sidebarImConnections, sidebarImDetailConnectionId],
@@ -1586,7 +1622,7 @@ export default function App() {
   const collaborationMode = displayedComposerProfileCollaborationMode(composerProfile);
   const toolApprovalMode = composerProfile.toolApprovalMode;
   const tokenMode: TokenMode = composerProfile.tokenMode;
-  const runtimeTransitioning = Boolean(activeTabId && runtimeTransitionsByTab[activeTabId]);
+  const runtimeTransitioning = Boolean(activeTabId && runtimeTransitionsByTab[activeTabId]) || workbenchTargetTransitioning(workbenchTarget);
   const controllerReady = state.meta?.ready === true && !state.backendActivationPending && !runtimeTransitioning;
   // Single footer decision surface. Composer stays mounted underneath and is
   // only visually/a11y-hidden so per-session draft caches survive.
@@ -1830,7 +1866,11 @@ export default function App() {
     return null;
   }, [state.items]);
   const todoItem = todoEntry?.item ?? null;
-  const todos = useMemo(() => (todoItem ? parseTodos(todoItem.args) : []), [todoItem]);
+  const metaTodos = state.meta?.canonicalTodos;
+  const todos = useMemo(
+    () => resolveTodoPanelTodos(metaTodos, todoItem ? parseTodos(todoItem.args) : []),
+    [metaTodos, todoItem],
+  );
   const [dismissedTodoKeys, setDismissedTodoKeys] = useState<Set<string>>(loadDismissedTodoKeys);
   const todoKey = useMemo(() => todoDismissalKey(todos), [todos]);
   const todoBatch = useMemo(() => todoBatchKey(todos), [todos]);
@@ -2208,12 +2248,21 @@ export default function App() {
     };
   }, [hydrateRemoteStatuses, setRemoteHosts]);
 
+  const refreshProviderSetupState = useCallback(async () => {
+    const needs = await app.NeedsOnboarding();
+    setProviderSetupNeeded(needs);
+    return needs;
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const needs = await app.NeedsOnboarding();
-        if (!cancelled) setNeedsOnboarding(needs);
+        if (!cancelled) {
+          setProviderSetupNeeded(needs);
+          setNeedsOnboarding(shouldOpenOnboarding(needs));
+        }
       } catch {
         // Bridge unavailable (browser dev seam) — skip the gate; a real key
         // failure still surfaces via the topbar startupError banner.
@@ -2223,7 +2272,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [setNeedsOnboarding]);
 
   useEffect(() => {
     const el = footerRef.current;
@@ -2551,23 +2600,29 @@ export default function App() {
     if (hostId) requestRemoteExplorer(hostId);
   }, [remoteExplorerHostId, remoteHosts, requestRemoteExplorer]);
 
-  const launchRemoteWorkspace = useCallback(async (host: RemoteHostView) => {
-    const workspace = host.defaultWorkspace.trim();
+  const remoteWorkspaceLaunchSeq = useRef(0);
+  const launchRemoteWorkspace = useCallback(async (host: RemoteHostView, requestSeq: number) => {
+    const workspace = await preferredRemoteWorkspace(host.id, host.defaultWorkspace);
+    if (requestSeq !== remoteWorkspaceLaunchSeq.current) return;
     if (!workspace) {
-      useRemoteStore.getState().setExplorerTab("server");
+      setRemoteExplorerTab("server");
       requestRemoteExplorer(host.id);
-      return;
+      throw new Error(t("remote.workspaceRequired"));
     }
     await app.OpenRemoteWorkspace(host.id, workspace);
-  }, [requestRemoteExplorer]);
+    if (requestSeq !== remoteWorkspaceLaunchSeq.current) return;
+    setWorkbenchTarget(await app.WorkbenchActiveTarget());
+  }, [requestRemoteExplorer, setRemoteExplorerTab, t]);
 
   const openRemoteWorkspaceFromStatus = useCallback((host: RemoteHostView) => {
-    void launchRemoteWorkspace(host).catch((err) => {
+    const requestSeq = ++remoteWorkspaceLaunchSeq.current;
+    void launchRemoteWorkspace(host, requestSeq).catch((err) => {
       showToast(err instanceof Error ? err.message : String(err), "error", { durationMs: 6000 });
     });
   }, [launchRemoteWorkspace, showToast]);
 
   const connectAndOpenRemoteWorkspace = useCallback(function connectRemoteWorkspace(host: RemoteHostView) {
+    const requestSeq = ++remoteWorkspaceLaunchSeq.current;
     void (async () => {
       try {
         const status = useRemoteStore.getState().statuses[host.id]?.state;
@@ -2600,7 +2655,7 @@ export default function App() {
       }
 
       try {
-        await launchRemoteWorkspace(host);
+        await launchRemoteWorkspace(host, requestSeq);
       } catch (err) {
         showToast(err instanceof Error ? err.message : String(err), "error", { durationMs: 6000 });
       }
@@ -3533,6 +3588,7 @@ export default function App() {
 
   return (
     <ShellExpandProvider>
+    <UpdaterProvider>
     <ShellHotkeys />
     <TextSizeHotkeys />
       <div
@@ -4057,6 +4113,18 @@ export default function App() {
           {safeMode && (
             <div className="banner banner--warning">{t("guard.safeMode")}</div>
           )}
+          {providerSetupNeeded && !needsOnboarding && (
+            <div className="banner banner--warning banner--actionable">
+              <span className="banner__msg">{t("onboarding.inlinePrompt")}</span>
+              <span className="banner__spacer" />
+              <button type="button" className="btn btn--small" onClick={() => {
+                setSettingsFocus({ target: "model-access" });
+                setSettingsTarget("models");
+              }}>
+                {t("onboarding.configureProvider")}
+              </button>
+            </div>
+          )}
 
           <UpdateBanner
             enabled={startupUpdateChecksEnabled === true}
@@ -4151,6 +4219,9 @@ export default function App() {
                   // observes the updated state before it unblocks.
                   if (state.approval!.tool === "exit_plan_mode" && allow) await applyCollaborationMode("normal");
                   approve(state.approval!.id, allow, session, persist);
+                }}
+                onResolveRecovery={(action, feedback) => {
+                  resolveRecovery(state.approval!.id, action, feedback ?? "");
                 }}
                 onRevisePlan={(text) => {
                   if (activeTabId) {
@@ -4273,6 +4344,12 @@ export default function App() {
               onOpenRemoteWorkspace={openRemoteWorkspaceFromStatus}
               remoteHosts={remoteHosts}
               remoteStatuses={remoteStatuses}
+              workbenchTarget={workbenchTarget}
+              onSwitchLocal={() => {
+                void app.WorkbenchSwitchLocal()
+                  .then(setWorkbenchTarget)
+                  .catch((err) => showToast(err instanceof Error ? err.message : String(err), "error"));
+              }}
             />
           </footer>
           )}
@@ -4378,6 +4455,8 @@ export default function App() {
                   tabId={activeTabId}
                   cwd={state.meta?.cwd}
                   workspaceScopeKey={workspaceScopeKey}
+                  workspaceMemoryKey={workspaceTreeMemoryKey}
+                  workspaceMemoryVisitId={workspaceTreeMemoryVisitId}
                   maximized={workspacePanelMaximized}
                   panelWidth={workspacePanelRenderWidth}
                   onClose={() => setWorkspacePanel(false)}
@@ -4435,6 +4514,7 @@ export default function App() {
             }}
             onChanged={(settings) => {
               void refreshMeta();
+              void refreshProviderSetupState().catch(() => {});
               if (settings) {
                 applyDesktopPreferences(settings);
                 void refreshSidebarImConnectionsFromSettings(settings).catch((e) => console.warn("bot sidebar refresh failed", e));
@@ -4451,6 +4531,7 @@ export default function App() {
 
       <RemoteHostKeyDialog />
       <RemoteSecretDialog />
+      <ProviderTrustDialog />
 
       <CommandPalette
         open={paletteOpen}
@@ -4471,7 +4552,23 @@ export default function App() {
         <StartupSplash hold={startupSplashHold} onDone={() => setStartupSplashVisible(false)} />
       )}
 
-      {needsOnboarding && <OnboardingOverlay onComplete={() => setNeedsOnboarding(false)} />}
+      {needsOnboarding && (
+        <OnboardingOverlay
+          onComplete={() => {
+            setProviderSetupNeeded(false);
+            setNeedsOnboarding(false);
+          }}
+          onChooseProvider={() => {
+            setNeedsOnboarding(false);
+            setSettingsFocus({ target: "model-access" });
+            setSettingsTarget("models");
+          }}
+          onSkip={() => {
+            dismissOnboarding();
+            setNeedsOnboarding(false);
+          }}
+        />
+      )}
 
       <HeartbeatPanel open={heartbeatOpen} onClose={() => setHeartbeatOpen(false)} onOpenTopic={(scope, workspaceRoot, topicId) => {
         void handleOpenTopic(scope, workspaceRoot, topicId);
@@ -4488,6 +4585,7 @@ export default function App() {
         />
       )}
     </div>
+    </UpdaterProvider>
     </ShellExpandProvider>
   );
 }

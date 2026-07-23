@@ -190,20 +190,12 @@ type Gate interface {
 	Check(ctx context.Context, toolName string, args json.RawMessage, readOnly bool) (allow bool, reason string, err error)
 }
 
-// FreshApprovalGate is an optional Gate extension for calls that must be
-// answered by a current human decision even when Auto/YOLO or an allow rule
-// would normally bypass approval. MCP destructiveHint uses it as a conservative
-// fallback when the gate does not implement MCP-local approval policy.
-type FreshApprovalGate interface {
-	CheckFresh(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly bool) (allow bool, reason string, err error)
-}
-
-// MCPApprovalGate applies local per-server/per-tool MCP policy without changing
-// provider-visible tool metadata. Destructive calls are identified separately
-// so the gate can apply the effective approval mode before deciding whether a
-// fresh review is required.
-type MCPApprovalGate interface {
-	CheckMCP(ctx context.Context, toolName, subject string, args json.RawMessage, readOnly, destructive bool, mode, reviewer string) (allow bool, reason string, err error)
+// ExplicitDenyGate exposes the only global permission decision that applies to
+// an already-authorized MCP server. Installing or approving a server is the
+// user's authorization boundary; ordinary ask/fallback posture must not add a
+// second per-call prompt, while explicit deny rules remain authoritative.
+type ExplicitDenyGate interface {
+	ExplicitlyDenies(toolName string, args json.RawMessage) bool
 }
 
 const PlanModeReadOnlyCommandApprovalTool = "plan_mode_read_only_command"
@@ -322,6 +314,23 @@ type Agent struct {
 	// gate, when non-nil, is the per-call permission gate for both standard and
 	// Plan workflows. nil disables gating entirely.
 	gate Gate
+
+	// recoveryGate, when non-nil, is the Auto Guard boundary for Auto mode.
+	// Shared by root and sub-agents for the same controller task. nil disables
+	// recovery checks (Ask/YOLO, headless without wiring, or feature off).
+	recoveryGate RecoveryGate
+	// recoveryAgentID labels this agent on recovery cards (empty = root).
+	recoveryAgentID string
+	// recoveryTaskID isolates recovery state across concurrent top-level tasks.
+	// Empty shares the root task bucket.
+	recoveryTaskID string
+	// recoveryTaskSummary is the bounded task text for this Agent.Run. It lets a
+	// shared recovery gate review sub-agent mutations against the child task,
+	// rather than the root controller transcript.
+	recoveryTaskSummary string
+	// recoveryRunSeq gives ordinary (non-goal) runs a collision-free host scope.
+	// Goal runs use their stable delivery scope instead.
+	recoveryRunSeq atomic.Uint64
 
 	// planModeReadOnlyTrust is retained for legacy controller wiring. The main
 	// Plan execution path no longer consults it.
@@ -574,6 +583,35 @@ func (a *Agent) SetGate(g Gate) {
 		g = nil
 	}
 	a.gate = g
+}
+
+// SetRecoveryGate installs Auto Guard. Safe to call before the run loop starts;
+// nil disables its checks.
+func (a *Agent) SetRecoveryGate(g RecoveryGate) {
+	if a == nil {
+		return
+	}
+	if nilutil.IsNil(g) {
+		g = nil
+	}
+	a.recoveryGate = g
+}
+
+// SetRecoveryIdentity sets the agent/task labels used on recovery cards.
+func (a *Agent) SetRecoveryIdentity(agentID, taskID string) {
+	if a == nil {
+		return
+	}
+	a.recoveryAgentID = strings.TrimSpace(agentID)
+	a.recoveryTaskID = strings.TrimSpace(taskID)
+}
+
+// RecoveryGate returns the attached Auto Guard (may be nil).
+func (a *Agent) RecoveryGate() RecoveryGate {
+	if a == nil {
+		return nil
+	}
+	return a.recoveryGate
 }
 
 // SetPlanModeReadOnlyTrustGate retains the legacy confirmation bridge for old
@@ -911,13 +949,18 @@ type Options struct {
 	// user-turn context. Empty/auto keeps the stable same-as-user policy.
 	ResponseLanguage string
 
-	// PlanModeAllowedTools is retained for source compatibility. MCP assembly may
-	// still translate legacy entries into local read-only trust, but it does not
-	// grant or revoke calls in the main Plan workflow.
-	PlanModeAllowedTools []string
 	// PlanModeReadOnlyCommands is retained for old config/controller data. Main
 	// Plan execution classifies bash through Permissions instead.
 	PlanModeReadOnlyCommands []string
+
+	// RecoveryGate is the optional Auto Guard boundary. It checks deterministic
+	// high-risk mutations and failure recovery before permission approval and
+	// write-lock acquisition.
+	RecoveryGate RecoveryGate
+	// RecoveryAgentID labels this agent on recovery cards (empty = root).
+	RecoveryAgentID string
+	// RecoveryTaskID isolates recovery state for this agent (empty = root task).
+	RecoveryTaskID string
 
 	// SubagentDepth is the current nesting depth for this agent. Root sessions are
 	// depth 0; child subagents are depth 1. MaxSubagentDepth caps delegation.
@@ -996,6 +1039,9 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		usageSource:           usageSourceOrDefault(opts.UsageSource, event.UsageSourceExecutor),
 		sink:                  sink,
 		gate:                  gate,
+		recoveryGate:          opts.RecoveryGate,
+		recoveryAgentID:       strings.TrimSpace(opts.RecoveryAgentID),
+		recoveryTaskID:        strings.TrimSpace(opts.RecoveryTaskID),
 		readOnlyExecution:     opts.ReadOnlyExecution,
 		planModeReadOnlyTrust: planModeReadOnlyTrust,
 		sandboxEscapeApprover: sandboxEscapeApprover,
@@ -1061,6 +1107,7 @@ func (a *Agent) reserveParentWrite(runTool tool.Tool, args json.RawMessage, read
 // a round count. A positive maxSteps imposes an optional hard guard, surfaced as
 // a resumable notice when hit.
 func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
+	a.recoveryRunSeq.Add(1)
 	if a.deliveryProfile && a.workspaceLease != nil {
 		a.workspaceLease.BeginRun()
 		defer a.workspaceLease.EndRun()
@@ -1162,6 +1209,7 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	}
 	a.deliveryTaskExpected = deliveryTaskNeedsEvidence(classifierInput)
 	a.deliveryMutationExpected = deliveryTaskNeedsMutation(classifierInput) && registryHasWriterTools(a.tools)
+	a.recoveryTaskSummary = boundedRecoveryTaskSummary(classifierInput)
 	// A cancelled/error turn leaves a provider-excluded recovery record at the
 	// transcript tail. Fold its bounded facts into this new user turn exactly
 	// once; the user's raw text remains the classifier source above.
@@ -2944,7 +2992,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 				safety = planmode.PlanSafetyUnsafe
 			}
 		}
-		if decision := a.planModeDecision(canonicalName, t.ReadOnly(), planModeUntrustedReadOnly(t), safety, json.RawMessage(call.Arguments)); decision.Blocked {
+		if decision := a.planModeDecision(canonicalName, t.ReadOnly(), safety, json.RawMessage(call.Arguments)); decision.Blocked {
 			return toolOutcome{
 				output:  decision.Message,
 				blocked: true,
@@ -3035,7 +3083,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 				safety = planmode.PlanSafetyUnsafe
 			}
 		}
-		if decision := a.planModeDecision(permName, resolved.ReadOnly, planModeUntrustedReadOnly(execTool), safety, permArgs); decision.Blocked {
+		if decision := a.planModeDecision(permName, resolved.ReadOnly, safety, permArgs); decision.Blocked {
 			return toolOutcome{
 				output:  decision.Message,
 				blocked: true,
@@ -3043,11 +3091,15 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			}
 		}
 	}
-	if a.planMode.Load() && isMCPExecutionTarget(execTool, permName) && (!readOnly || planModeUntrustedReadOnly(execTool) || mcpDestructiveHint(execTool)) {
+	if a.planMode.Load() && isMCPExecutionTarget(execTool, permName) && (!readOnly || !mcpServerAuthorized(execTool) || mcpDestructiveHint(execTool)) {
+		reason := "writer/destructive target"
+		if readOnly && !mcpServerAuthorized(execTool) {
+			reason = "reader from an unauthorized server"
+		}
 		return toolOutcome{
-			output:  fmt.Sprintf("blocked: MCP writer/destructive target %q is unavailable during Plan mode; finish or exit Plan mode before requesting this call", permName),
+			output:  fmt.Sprintf("blocked: MCP %s %q is unavailable during Plan mode; finish or exit Plan mode before requesting this call", reason, permName),
 			blocked: true,
-			errMsg:  "blocked: MCP writer is unavailable during planning",
+			errMsg:  "blocked: MCP target is unavailable during planning",
 		}
 	}
 	if a.deliveryProfile && evidenceName == "bash" && evidence.BashToolCallMasksVerificationExit(evidenceArgs) {
@@ -3087,44 +3139,76 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			errMsg:  "blocked: active delivery todo required",
 		}
 	}
-	destructive := mcpDestructiveHint(execTool)
+	// Auto Guard: after resolution/mutation classification, before
+	// permission approval and workspace write-lock acquisition, so a waiting
+	// recovery card never holds a write lease.
+	verification := evidenceName == "bash" && evidence.IsDeliveryVerificationCommand(bashCommandFromArgs(evidenceArgs))
+	planTransition, planBefore, planAfter := a.recoveryPlanTransition(evidenceName, evidenceArgs)
+	planReplacementAuthorized := false
+	if a.recoveryGate != nil && (mutates || verification || planTransition) {
+		subject := recoverySubject(evidenceName, evidenceArgs)
+		if planTransition {
+			subject = "Update the active execution plan"
+		}
+		preview := strings.TrimSpace(call.Diff)
+		if preview == "" {
+			preview = subject
+		}
+		if planTransition {
+			preview = planAfter
+		}
+		dec, rerr := a.recoveryGate.BeforeMutation(ctx, RecoveryProposal{
+			AgentID:        a.recoveryAgentID,
+			TaskID:         a.recoveryTaskID,
+			TaskScopeID:    recoveryTaskScopeID(a.deliveryScopeID, a.recoveryRunSeq.Load()),
+			TaskSummary:    a.recoveryTaskSummary,
+			Tool:           evidenceName,
+			Args:           evidenceArgs,
+			Subject:        subject,
+			Preview:        preview,
+			ReadOnly:       readOnly,
+			Mutates:        mutates,
+			Verification:   verification,
+			PlanTransition: planTransition,
+			PlanBefore:     planBefore,
+			PlanAfter:      planAfter,
+		})
+		if rerr != nil && !dec.Blocked {
+			return toolOutcome{
+				output:  fmt.Sprintf("blocked: Auto Guard error: %v", rerr),
+				blocked: true,
+				errMsg:  "blocked: Auto Guard error",
+			}
+		}
+		if dec.Blocked || !dec.Allow {
+			msg := strings.TrimSpace(dec.Message)
+			if msg == "" {
+				msg = "blocked: Auto Guard declined this mutation"
+			}
+			if !strings.HasPrefix(msg, "blocked:") {
+				msg = "blocked: " + msg
+			}
+			return toolOutcome{
+				output:  msg,
+				blocked: true,
+				errMsg:  "blocked by Auto Guard",
+			}
+		}
+		planReplacementAuthorized = planTransition && dec.AuthorizePlanReplacement
+	}
 	if isInstalledMCPTool(execTool) {
-		mode, reviewer := mcpApprovalPolicy(execTool)
-		var allow bool
-		var reason string
-		var err error
-		if mcpGate, ok := a.gate.(MCPApprovalGate); ok {
-			allow, reason, err = mcpGate.CheckMCP(ctx, permName, mcpApprovalSubject(execTool, permName), permArgs, readOnly, destructive, mode, reviewer)
-		} else if destructive {
-			freshGate, ok := a.gate.(FreshApprovalGate)
-			if !ok {
-				return toolOutcome{
-					output:  "blocked: this destructive MCP tool requires fresh human approval or a configured automatic approval reviewer before execution.",
-					blocked: true,
-					errMsg:  "blocked: destructive MCP approval required",
-				}
-			}
-			allow, reason, err = freshGate.CheckFresh(ctx, permName, mcpApprovalSubject(execTool, permName), permArgs, readOnly)
-		} else if a.gate != nil {
-			allow, reason, err = a.gate.Check(ctx, permName, permArgs, readOnly)
-		} else {
-			allow = true
-		}
-		if err != nil {
+		if !mcpServerAuthorized(execTool) {
 			return toolOutcome{
-				output:  fmt.Sprintf("blocked: %s (%v)", reason, err),
+				output:  "blocked: this project MCP server identity has not been authorized; approve the server from a parent session and retry",
 				blocked: true,
-				errMsg:  fmt.Sprintf("blocked: %v", err),
+				errMsg:  "blocked: MCP server identity is not authorized",
 			}
 		}
-		if !allow {
-			if strings.TrimSpace(reason) == "" {
-				reason = "the MCP tool call was not approved"
-			}
+		if denyGate, ok := a.gate.(ExplicitDenyGate); ok && denyGate.ExplicitlyDenies(permName, permArgs) {
 			return toolOutcome{
-				output:  "blocked: " + reason,
+				output:  "blocked: denied by permission policy — this tool/command is on the deny list. Do not retry it; choose another approach or stop and explain.",
 				blocked: true,
-				errMsg:  "blocked by MCP approval policy",
+				errMsg:  "blocked by permission policy",
 			}
 		}
 	} else if a.gate != nil {
@@ -3226,6 +3310,9 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	if !a.planMode.Load() {
 		cctx = evidence.WithTodoState(cctx, a.CanonicalTodoState())
 	}
+	if planReplacementAuthorized {
+		cctx = tool.WithPlanReplacementAuthorization(cctx)
+	}
 	if len(a.projectChecks) > 0 {
 		cctx = instruction.WithChecks(cctx, a.projectChecks)
 	}
@@ -3260,14 +3347,10 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	var err error
 	// A call that was authorized under reader classification carries that
 	// basis into dispatch: the MCP execution layer re-verifies it linearizably
-	// against live trust state and refuses to promote it into a writer lane if
-	// a concurrent revocation or reclassification landed after the gate.
-	if readOnly && isInstalledMCPTool(runTool) && !mcpDestructiveHint(runTool) {
-		fingerprint := ""
-		if fp, ok := runTool.(tool.MCPCapabilityFingerprint); ok {
-			fingerprint = fp.MCPCapabilityFingerprint()
-		}
-		cctx = tool.WithReaderExecutionIntent(cctx, fingerprint)
+	// against server authorization and live safety metadata, and refuses to
+	// promote it into a writer lane if reclassification landed after the gate.
+	if readOnly && isInstalledMCPTool(runTool) && mcpServerAuthorized(runTool) && !mcpDestructiveHint(runTool) {
+		cctx = tool.WithReaderExecutionIntent(cctx)
 	}
 	if it, ok := runTool.(tool.ImageTool); ok {
 		result, images, err = it.ExecuteWithImages(cctx, runArgs)
@@ -3312,6 +3395,9 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			a.hooks.PostToolUse(ctx, permName, permArgs, result)
 		}
 	}
+	if a.recoveryGate != nil {
+		a.observeRecoveryResult(ctx, evidenceName, evidenceArgs, readOnly, mutates, result, err, false, false)
+	}
 	if err != nil {
 		detail := result
 		// Malformed-args failures are a transient model JSON glitch (e.g. options
@@ -3335,6 +3421,68 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	return toolOutcome{output: body, images: images, truncated: truncMsg != "", truncMsg: truncMsg}
 }
 
+// recoveryPlanTransition detects structural rewrites of an active canonical
+// task list. Initial plans and progress-only status updates stay on the fast
+// path; changing step identity, order, or hierarchy while work remains is a
+// semantic transition for the independent Auto reviewer.
+func (a *Agent) recoveryPlanTransition(toolName string, args json.RawMessage) (bool, string, string) {
+	if a == nil || toolName != "todo_write" || a.planMode.Load() {
+		return false, "", ""
+	}
+	before := a.CanonicalTodoState()
+	if len(before) == 0 || len(evidence.IncompleteTodos(before)) == 0 {
+		return false, "", ""
+	}
+	after := evidence.ReceiptFromToolCall("todo_write", args, true, true).Todos
+	if len(after) == 0 || evidence.ValidateSerialTodos(after) != nil || !evidence.PreservesCompletedTodoPositions(before, after) {
+		// Let todo_write report malformed or invalid state directly; an invalid
+		// task list is not a meaningful plan proposal for the reviewer.
+		return false, "", ""
+	}
+	if samePlanStructure(before, after) {
+		return false, "", ""
+	}
+	return true, planReviewText(before), planReviewText(after)
+}
+
+func samePlanStructure(a, b []evidence.TodoItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Level != b[i].Level || normalizePlanStep(a[i].Content) != normalizePlanStep(b[i].Content) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizePlanStep(s string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+}
+
+func planReviewText(todos []evidence.TodoItem) string {
+	var b strings.Builder
+	for i, todo := range todos {
+		indent := ""
+		if todo.Level == 1 {
+			indent = "  "
+		}
+		fmt.Fprintf(&b, "%s%d. %s [%s]", indent, i+1, normalizePlanStep(todo.Content), canonicalTodoStatus(todo.Status))
+		if i+1 < len(todos) {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func recoveryTaskScopeID(deliveryScopeID string, runSeq uint64) string {
+	if scope := strings.TrimSpace(deliveryScopeID); scope != "" {
+		return "goal:" + scope
+	}
+	return fmt.Sprintf("turn:%d", runSeq)
+}
+
 func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.ResolvedCall) (toolOutcome, bool) {
 	if a == nil || !a.readOnlyExecution {
 		return toolOutcome{}, false
@@ -3353,8 +3501,8 @@ func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.Resolve
 			}
 			return block("execute a state-changing tool")
 		}
-		if u, ok := visible.(tool.PlanModeUntrustedReadOnly); ok && u.PlanModeUntrustedReadOnly() {
-			return block("trust an externally asserted read-only target")
+		if isInstalledMCPTool(visible) && !mcpServerAuthorized(visible) {
+			return block("execute a reader from an unauthorized MCP server")
 		}
 		if readOnlyExecutionMCPDestructive(visible) {
 			return block("execute a destructive MCP capability")
@@ -3383,8 +3531,8 @@ func (a *Agent) readOnlyExecutionBlock(visible tool.Tool, resolved *tool.Resolve
 			}
 			return block("execute a state-changing dynamic capability")
 		}
-		if u, ok := resolved.Target.(tool.PlanModeUntrustedReadOnly); ok && u.PlanModeUntrustedReadOnly() {
-			return block("trust an externally asserted read-only dynamic capability")
+		if isInstalledMCPTool(resolved.Target) && !mcpServerAuthorized(resolved.Target) {
+			return block("execute a dynamic reader from an unauthorized MCP server")
 		}
 		if readOnlyExecutionMCPDestructive(resolved.Target) {
 			return block("execute a destructive MCP capability")
@@ -3406,21 +3554,14 @@ func readOnlyExecutionAllowsMCPStartup(t tool.Tool) bool {
 	if t == nil || !t.ReadOnly() || readOnlyExecutionMCPDestructive(t) {
 		return false
 	}
-	if untrusted, ok := t.(tool.PlanModeUntrustedReadOnly); ok && untrusted.PlanModeUntrustedReadOnly() {
+	if !mcpServerAuthorized(t) {
 		return false
 	}
 	meta, ok := t.(tool.MCPMetadata)
 	if !ok || strings.TrimSpace(meta.MCPServerName()) == "" || strings.TrimSpace(meta.MCPRawToolName()) == "" {
 		return false
 	}
-	// A reader classification only admits a host start when explicit local or
-	// signed package policy backs it. A server hint alone never satisfies the
-	// strict boundary.
-	if authority, ok := t.(tool.ReadOnlyExecutionAuthority); !ok || !authority.ReadOnlyExecutionAuthority() {
-		return false
-	}
-	_, governed := t.(tool.MCPApprovalPolicy)
-	return governed
+	return true
 }
 
 func isInstalledMCPTool(t tool.Tool) bool {
@@ -3432,9 +3573,9 @@ func isMCPExecutionTarget(t tool.Tool, name string) bool {
 	return isInstalledMCPTool(t) || strings.HasPrefix(strings.TrimSpace(name), "mcp__")
 }
 
-func planModeUntrustedReadOnly(t tool.Tool) bool {
-	untrusted, ok := t.(tool.PlanModeUntrustedReadOnly)
-	return ok && untrusted.PlanModeUntrustedReadOnly()
+func mcpServerAuthorized(t tool.Tool) bool {
+	authority, ok := t.(tool.MCPServerAuthorization)
+	return ok && authority.MCPServerAuthorized()
 }
 
 func mcpDestructiveHint(t tool.Tool) bool {
@@ -3442,32 +3583,12 @@ func mcpDestructiveHint(t tool.Tool) bool {
 	return ok && annotations.MCPDestructiveHint()
 }
 
-func mcpApprovalPolicy(t tool.Tool) (mode, reviewer string) {
-	policy, ok := t.(tool.MCPApprovalPolicy)
-	if !ok {
-		return tool.MCPApprovalAuto, ""
-	}
-	return tool.NormalizeMCPApprovalMode(policy.MCPApprovalMode()), tool.NormalizeMCPApprovalReviewer(policy.MCPApprovalReviewer())
-}
-
-func mcpApprovalSubject(t tool.Tool, fallback string) string {
-	if meta, ok := t.(tool.MCPMetadata); ok {
-		server := strings.TrimSpace(meta.MCPServerName())
-		raw := strings.TrimSpace(meta.MCPRawToolName())
-		if server != "" && raw != "" {
-			return server + "/" + raw
-		}
-	}
-	return strings.TrimSpace(fallback)
-}
-
-func (a *Agent) planModeDecision(toolName string, readOnly, untrustedReadOnly bool, safety planmode.PlanSafety, args json.RawMessage) planmode.Decision {
+func (a *Agent) planModeDecision(toolName string, readOnly bool, safety planmode.PlanSafety, args json.RawMessage) planmode.Decision {
 	return (planmode.Policy{}).Decide(planmode.Call{
-		Name:              toolName,
-		ReadOnly:          readOnly,
-		UntrustedReadOnly: untrustedReadOnly,
-		Safety:            safety,
-		Args:              args,
+		Name:     toolName,
+		ReadOnly: readOnly,
+		Safety:   safety,
+		Args:     args,
 	})
 }
 

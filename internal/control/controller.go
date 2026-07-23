@@ -49,6 +49,7 @@ import (
 	"reasonix/internal/plugin"
 	"reasonix/internal/proc"
 	"reasonix/internal/provider"
+	"reasonix/internal/recovery"
 	"reasonix/internal/sandbox"
 	"reasonix/internal/skill"
 	"reasonix/internal/store"
@@ -80,6 +81,9 @@ type Controller struct {
 	executor     *agent.Agent
 	guardianSess *guardian.Session // nil when guardian is disabled
 	guardianPath string            // persisted guardian session file ("" when disabled)
+	// recoveryGate is the shared Auto Guard state for this controller.
+	// nil when the feature is not wired for this controller.
+	recoveryGate *recovery.Gate
 	sink         event.Sink
 	policy       permission.Policy
 	// subagentGate is the shared gate every headless-only sub-agent surface
@@ -147,7 +151,7 @@ type Controller struct {
 	// prefix; only seeds the turn-scoped ledger and optional semantic router.
 	pluginCfg       []config.PluginEntry
 	capCachedTools  map[string][]plugin.CachedTool
-	capCacheHashOK  map[string]bool
+	capCacheKeyOK   map[string]bool
 	semanticRouter  *capability.SemanticRouter
 	capabilityAudit *capability.Audit
 	runtimeProfile  capability.Profile
@@ -249,6 +253,8 @@ type pendingApproval struct {
 	reason    string
 	fresh     bool
 	autoDrain bool
+	kind      string // tool | plan | recovery; empty = tool
+	recovery  *event.RecoveryApproval
 	reply     chan approvalReply
 }
 
@@ -342,8 +348,14 @@ type Options struct {
 	Runner   agent.Runner
 	Executor *agent.Agent
 	Guardian *guardian.Session
-	Sink     event.Sink
-	Policy   permission.Policy
+	// RecoveryReviewer is the optional independent recovery reviewer (nil =
+	// rule-only path with fail-closed human confirmation for ambiguous cases).
+	RecoveryReviewer recovery.Reviewer
+	// RecoveryHeadless blocks mutations that need confirmation instead of
+	// waiting forever when no human decision channel exists.
+	RecoveryHeadless bool
+	Sink             event.Sink
+	Policy           permission.Policy
 	// SubagentGate is the shared, mutable gate every headless-only sub-agent
 	// surface (task, writer-capable skill sub-agents, planner) reads from. Nil
 	// disables gating for those surfaces same as before this field existed.
@@ -423,10 +435,6 @@ type Options struct {
 	// OnSessionRecovered is called after a stale runtime's transcript has been
 	// saved as a recovery branch, before the controller commits to that branch.
 	OnSessionRecovered func(SessionRecoveryInfo) error
-	// PlanModeAllowedTools is retained for legacy config/controller data. MCP
-	// assembly may translate concrete entries into local read-only trust, but the
-	// field does not grant or revoke calls in the main Plan workflow.
-	PlanModeAllowedTools []string
 	// ApprovalTimeout bounds how long a tool-approval or ask prompt blocks waiting
 	// for a user decision. Zero (default) waits forever — right for an interactive
 	// terminal. Bot/headless frontends set a positive value so an unanswered
@@ -509,6 +517,9 @@ func New(opts Options) *Controller {
 		})
 		c.executor.SetMemoryQueue(c)
 	}
+	// Auto Guard is built into Auto. Ask and YOLO bypass it through the mode
+	// provider, so no separate enablement state is needed.
+	c.initRecoveryGate(opts.RecoveryReviewer, opts.RecoveryHeadless)
 	return c
 }
 
@@ -1735,6 +1746,25 @@ func (c *Controller) Turn() int {
 // also remembers a grant for the rest of the session so the same approval scope
 // is not re-prompted. Unknown/expired IDs are ignored.
 func (c *Controller) Approve(id string, allow, session, persist bool) {
+	// Recovery cards are strict fresh decisions. Prefer ResolveRecovery so a
+	// continue/deny from an old client that only knows Approve still maps onto
+	// the recovery state machine (allow=continue, deny=revise without feedback).
+	// Session/persist grants are intentionally ignored for recovery.
+	//
+	// Lookup must use the live waiter table (HasApproval), not Snapshot: pre-
+	// normal-execution plan prompts park a waiter without an armed taskRuntime, so
+	// they never appear in the persistence snapshot.
+	c.mu.Lock()
+	gate := c.recoveryGate
+	c.mu.Unlock()
+	if gate != nil && gate.HasApproval(id) {
+		action := agent.RecoveryActionRevise
+		if allow {
+			action = agent.RecoveryActionContinue
+		}
+		_ = c.ResolveRecovery(id, action, "")
+		return
+	}
 	pending := c.approval.resolve(id)
 	if pending.reply != nil {
 		pending.reply <- approvalReply{allow: allow, session: session, persist: persist} // buffered, never blocks
@@ -2032,6 +2062,10 @@ func (c *Controller) ReplayPendingPrompts() {
 	}
 	for _, a := range asks {
 		c.sink.Emit(event.Event{Kind: event.AskRequest, Ask: a})
+	}
+	// Retained compatibility hook; live Auto Guard cards are ordinary approvals.
+	if len(approvals) == 0 {
+		c.ReplayUnresolvedRecoveries()
 	}
 }
 
@@ -2532,6 +2566,11 @@ func (c *Controller) NewSession() error {
 		return err
 	}
 	defer c.endRotation()
+	// Retire asynchronous recovery writes before Snapshot publishes the final
+	// old-session checkpoint. Otherwise an earlier write can outlive the path
+	// rotation (or process teardown) and race cleanup of the old session.
+	oldPath := c.SessionPath()
+	c.flushRecoveryPersistence(oldPath)
 	if err := c.Snapshot(); err != nil {
 		return err
 	}
@@ -2551,7 +2590,9 @@ func (c *Controller) NewSession() error {
 		c.guardianSess.Reset()
 	}
 	c.ResetPlannerSession()
-	c.rebindCheckpoints(c.SessionPath())
+	freshPath := c.SessionPath()
+	c.rebindCheckpoints(freshPath)
+	c.resetRecoveryForNewSession(freshPath)
 	c.snapshotMu.Unlock()
 	// A new session starts with no active goal: without this, a running goal's
 	// text kept injecting into the fresh session's first turns. The old
@@ -2592,6 +2633,11 @@ func (c *Controller) ClearSession() error {
 			return err
 		}
 	}
+	// Retire the old recovery state before deleting its artifacts. Async gate
+	// snapshots are path-bound, so wait for every already-scheduled old-path
+	// write; otherwise one can recreate the sidecar after removeSessionArtifacts.
+	c.loadRecoveryState("")
+	c.flushRecoveryPersistence(oldPath)
 	// Hold snapshotMu from artifact removal through the swap: a save slipping
 	// in between would resurrect the just-removed transcript, and one that
 	// overlapped the swap could pair the old path with the fresh session.
@@ -2618,7 +2664,9 @@ func (c *Controller) ClearSession() error {
 		c.guardianSess.Reset()
 	}
 	c.ResetPlannerSession()
-	c.rebindCheckpoints(c.SessionPath())
+	freshPath := c.SessionPath()
+	c.rebindCheckpoints(freshPath)
+	c.resetRecoveryForNewSession(freshPath)
 	c.snapshotMu.Unlock()
 	// Same contract as NewSession: the fresh session starts with no active goal.
 	c.ClearGoal()
@@ -2687,6 +2735,13 @@ func removeSessionArtifacts(path string) error {
 		return err
 	}
 	return nil
+}
+
+// RemoveSessionArtifacts removes a transcript and every durable artifact owned
+// by it. Remote runtimes use this when a newly-created fork fails before it can
+// be registered as a live session.
+func RemoveSessionArtifacts(path string) error {
+	return removeSessionArtifacts(path)
 }
 
 // ReconcileCleanupPending retries physical cleanup for logically removed
@@ -2868,6 +2923,9 @@ func (c *Controller) forkNamed(turn int, name string, switchToFork bool) (string
 		c.mu.Unlock()
 		c.setActiveJobSession(newPath)
 		c.rebindCheckpoints(newPath)
+		// A historical fork rewinds before later failures, so it starts with no
+		// active recovery event even though it inherits the session preference.
+		c.loadRecoveryState(newPath)
 		if c.guardianSess != nil {
 			c.guardianSess.Reset()
 		}
@@ -2950,6 +3008,7 @@ func (c *Controller) Branch(name string) (string, error) {
 	if c.guardianSess != nil {
 		c.guardianSess.Reset()
 	}
+	c.carryRecoveryState(newPath)
 	c.snapshotMu.Unlock()
 	c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 		Text: fmt.Sprintf("created branch %s", agent.BranchID(newPath))})
@@ -3010,6 +3069,7 @@ func (c *Controller) SwitchBranch(ref string) (agent.BranchInfo, error) {
 	c.rebindCheckpoints(match.Path)
 	c.restoreTerminalGoalTodos(match.Path)
 	c.loadGuardianSession()
+	c.loadRecoveryState(match.Path)
 	c.snapshotMu.Unlock()
 	c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 		Text: fmt.Sprintf("switched to branch %s", branchDisplayName(match))})
@@ -3133,6 +3193,7 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	}
 	c.restoreTerminalGoalTodos(path)
 	c.loadGuardianSession()
+	c.loadRecoveryState(path)
 	c.snapshotMu.Unlock()
 	c.recoverInterruptedTurn(path)
 	c.maybeColdResumePrune(path)
@@ -3361,6 +3422,8 @@ func (c *Controller) snapshot(markActivity, forceRewrite, shutdownRecovery bool)
 			}
 		}
 	}
+	// Persist recovery gate state so unresolved checkpoints survive restart.
+	c.saveRecoveryState(path)
 	// Record the listing-only sidecar fields (model, preview, user-turn count)
 	// straight from the in-memory conversation, so the sidebar and resume picker
 	// never have to decode the whole .jsonl just to show them. markActivity bumps
@@ -4138,9 +4201,20 @@ func (c *Controller) snapshotActivityIfChanged(startMessages int) {
 	}
 }
 
-// SetSessionPath pins where auto-save lands (a fresh session file minted by the
-// caller when no resume path applies).
+// SetSessionPath rebinds auto-save without changing the current session
+// preference. Callers creating a genuinely fresh conversation should use
+// SetFreshSessionPath; callers resuming history should use Resume.
 func (c *Controller) SetSessionPath(p string) {
+	c.setSessionPath(p, false)
+}
+
+// SetFreshSessionPath binds a path that is known to belong to a newly-created
+// session and samples the configured new-session recovery default.
+func (c *Controller) SetFreshSessionPath(p string) {
+	c.setSessionPath(p, true)
+}
+
+func (c *Controller) setSessionPath(p string, fresh bool) {
 	// See snapshotMu: the swap must not interleave with an in-flight save.
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
@@ -4150,6 +4224,11 @@ func (c *Controller) SetSessionPath(p string) {
 	c.mu.Unlock()
 	c.setActiveJobSession(p)
 	c.rebindCheckpoints(p)
+	if fresh {
+		c.resetRecoveryForNewSession(p)
+	} else {
+		c.loadRecoveryState(p)
+	}
 }
 
 // SessionDestroyHandle separates waiting for cancelled jobs from ending the
@@ -4504,8 +4583,9 @@ func (c *Controller) HookRunner() *hook.Runner { return c.hooks }
 // tools are registered immediately and become available on the next turn (the
 // agent reads the registry per turn). The raw entry — ${VARS} intact — is what's
 // written to disk; the live connection uses the expanded form. Returns the number
-// of tools the server exposed. A save failure after a successful connect is
-// reported but non-fatal: the server still works this session.
+// of tools the server exposed. Persistence is transactional: a config or
+// activation failure removes the just-connected client so the live registry
+// never claims an install that will disappear after restart.
 func (c *Controller) AddMCPServer(e config.PluginEntry) (int, error) {
 	// AddMCPServer is an explicit user action. Mark the live entry with the same
 	// provenance it will receive when the saved user config is loaded next time,
@@ -4517,13 +4597,35 @@ func (c *Controller) AddMCPServer(e config.PluginEntry) (int, error) {
 	}
 	cfg, lerr := config.Load()
 	if lerr != nil {
-		return n, fmt.Errorf("connected, but reloading config to save failed: %w", lerr)
+		c.DisconnectMCPServer(e.Name)
+		return 0, fmt.Errorf("reloading config to save MCP server: %w", lerr)
+	}
+	var previous config.PluginEntry
+	hadPrevious := false
+	for _, configured := range cfg.Plugins {
+		if configured.Name == e.Name {
+			previous, hadPrevious = configured, true
+			break
+		}
 	}
 	if err := cfg.UpsertPlugin(e); err != nil {
-		return n, fmt.Errorf("connected, but config rejected the entry: %w", err)
+		c.DisconnectMCPServer(e.Name)
+		return 0, fmt.Errorf("config rejected MCP server: %w", err)
 	}
 	if err := cfg.Save(); err != nil {
-		return n, fmt.Errorf("connected, but saving config failed: %w", err)
+		c.DisconnectMCPServer(e.Name)
+		return 0, fmt.Errorf("saving MCP server config: %w", err)
+	}
+	// Install implies durable enable so the next session keeps the server in the
+	// catalog without a second activation step.
+	if err := config.DefaultMCPActivationStore().SetServerEnabled(e, c.WorkspaceRoot(), true); err != nil {
+		c.DisconnectMCPServer(e.Name)
+		if hadPrevious {
+			_ = cfg.UpsertPlugin(previous)
+		} else {
+			cfg.RemovePlugin(e.Name)
+		}
+		return 0, errors.Join(err, cfg.Save())
 	}
 	return n, nil
 }
@@ -4535,34 +4637,47 @@ func (c *Controller) ConnectMCPServer(e config.PluginEntry) (int, error) {
 	return c.connectMCPServer(e)
 }
 
+// RegisterMCPServerOnDemand restores a configured server's cached provider
+// surface without forcing a handshake. It is the durable-enable counterpart to
+// ConnectMCPServer, which remains the explicit install/retry operation.
+func (c *Controller) RegisterMCPServerOnDemand(e config.PluginEntry) (int, error) {
+	return c.mcp.registerSpecOnDemand(c.mcpSpec(e))
+}
+
 // connectMCPServer expands an entry's ${VARS}, applies the known-server
 // overrides scoped to the workspace, and connects it live via the mcp manager.
 func (c *Controller) connectMCPServer(e config.PluginEntry) (int, error) {
+	return c.mcp.connectSpec(c.mcpSpec(e))
+}
+
+func (c *Controller) mcpSpec(e config.PluginEntry) plugin.Spec {
 	exp := e.ExpandedPlugin()
 	configSource := strings.TrimSpace(string(exp.Source))
 	spec := plugin.ApplyKnownOverrides(plugin.Spec{
-		Name:                     exp.Name,
-		Type:                     exp.Type,
-		Command:                  exp.Command,
-		Args:                     exp.Args,
-		Env:                      exp.Env,
-		URL:                      exp.URL,
-		Headers:                  exp.Headers,
-		DefaultCallTimeout:       c.mcpDefaultCallTimeout,
-		CallTimeout:              controllerMCPTimeout(exp.CallTimeoutSeconds),
-		ToolTimeouts:             controllerMCPToolTimeouts(exp.ToolTimeoutSeconds),
-		ReadOnlyToolNames:        trustedReadOnlyToolNames(exp.TrustedReadOnlyTools),
-		DefaultToolsApprovalMode: exp.DefaultToolsApprovalMode,
-		ToolApprovalModes:        controllerMCPToolApprovalModes(exp.Tools),
-		ApprovalsReviewer:        exp.ApprovalsReviewer,
-		ConfigSource:             configSource,
-		ImplicitApproval:         exp.Source.UserAuthorized(),
-		RequireLaunchApproval:    exp.Source.RequiresLaunchApproval(),
+		Name:                  exp.Name,
+		Type:                  exp.Type,
+		Command:               exp.Command,
+		Args:                  exp.Args,
+		Env:                   exp.Env,
+		URL:                   exp.URL,
+		Headers:               exp.Headers,
+		DefaultCallTimeout:    c.mcpDefaultCallTimeout,
+		CallTimeout:           controllerMCPTimeout(exp.CallTimeoutSeconds),
+		ToolTimeouts:          controllerMCPToolTimeouts(exp.ToolTimeoutSeconds),
+		WorkspaceRoot:         c.WorkspaceRoot(),
+		ConfigSource:          configSource,
+		Authorized:            exp.Source.UserAuthorized(),
+		RequireLaunchApproval: exp.Source.RequiresLaunchApproval(),
+		// Explicit user installs and reconnects run as trusted host processes.
+		ProcessMode: plugin.MCPProcessHost,
 	}, c.WorkspaceRoot())
 	if c.mcpConfigureSpec != nil {
 		c.mcpConfigureSpec(&spec)
+		if spec.ProcessMode == "" {
+			spec.ProcessMode = plugin.MCPProcessHost
+		}
 	}
-	return c.mcp.connectSpec(spec)
+	return spec
 }
 
 func controllerMCPTimeout(seconds int) time.Duration {
@@ -4580,39 +4695,6 @@ func controllerMCPToolTimeouts(values map[string]int) map[string]time.Duration {
 	for name, seconds := range values {
 		if name = strings.TrimSpace(name); name != "" && seconds > 0 {
 			out[name] = time.Duration(seconds) * time.Second
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func controllerMCPToolApprovalModes(policies map[string]config.MCPToolPolicy) map[string]string {
-	if len(policies) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(policies))
-	for name, policy := range policies {
-		if name = strings.TrimSpace(name); name != "" {
-			out[name] = policy.ApprovalMode
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func trustedReadOnlyToolNames(names []string) map[string]bool {
-	if len(names) == 0 {
-		return nil
-	}
-	out := map[string]bool{}
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if name != "" {
-			out[name] = true
 		}
 	}
 	if len(out) == 0 {
@@ -4898,6 +4980,16 @@ func (c *Controller) Jobs() []jobs.View {
 	return c.jobs.RunningForSession(c.parentSessionID())
 }
 
+// CancelJob stops one background job owned by this controller's session.
+// Remote Workbench exposes this through its required jobCancel capability;
+// local callers may continue using the existing manager-backed lifecycle.
+func (c *Controller) CancelJob(id string) bool {
+	if c.jobs == nil {
+		return false
+	}
+	return c.jobs.Kill(id)
+}
+
 // SetToolApprovalMode changes the runtime approval posture for permission-gated
 // tools. It does not answer business asks or plan approval. Sub-agents (task,
 // writer-capable skill sub-agents, the planner) have no UI to prompt through,
@@ -5065,112 +5157,6 @@ func (g gateApprover) ApproveWithReason(ctx context.Context, tool, subject strin
 	}
 	allow, remember, err := g.c.requestApproval(ctx, tool, subject, args)
 	return allow, remember, "", err
-}
-
-func (g gateApprover) ApproveFresh(ctx context.Context, toolName, subject string, args json.RawMessage) (bool, string, error) {
-	target := strings.TrimSpace(subject)
-	if target == "" {
-		target = toolName
-	}
-	reply, err := g.c.requestStrictFreshApprovalDecision(
-		ctx,
-		toolName,
-		fmt.Sprintf(i18n.M.MCPDestructiveSubjectFmt, target),
-		args,
-		i18n.M.MCPDestructiveReason,
-	)
-	if err != nil {
-		return false, "approval aborted", err
-	}
-	if !reply.allow {
-		return false, i18n.M.MCPDestructiveDeclined, nil
-	}
-	return true, "", nil
-}
-
-func (g gateApprover) ApproveMCP(ctx context.Context, toolName, subject string, args json.RawMessage, destructive, forced bool, reviewer string) (bool, string, error) {
-	reviewer = tool.NormalizeMCPApprovalReviewer(reviewer)
-	subject = approvalDisplaySubject(toolName, subject, args)
-	if !forced && g.c.approval.preApproved(toolName, subject, args) {
-		return true, "", nil
-	}
-	// A destructive MCP call routed here by the permission gate requires a fresh
-	// user decision. This check deliberately precedes Guardian/auto_review so no
-	// reviewer, session grant, Auto, or YOLO posture can authorize it.
-	if destructive {
-		return g.ApproveFresh(ctx, toolName, subject, args)
-	}
-	if reviewer == tool.MCPApprovalReviewerAutoReview {
-		if g.c.guardianSess != nil && g.c.executor != nil {
-			allow, reason, err := g.c.guardianSess.ReviewVerdict(ctx, toolName, args, g.c.executor.Session())
-			if err == nil {
-				// A successful verdict — allow or deny — is final for auto_review
-				// and never falls back.
-				return allow, reason, nil
-			}
-			slog.Warn("automatic MCP approval review unavailable; falling back to fresh human approval", "tool", toolName, "err", err)
-		}
-		// Missing reviewer/parent, timeout, transport failure, or indeterminate
-		// review degrades to a decision only a present human can make: Auto/YOLO,
-		// the approved-plan window, and session grants must not answer it.
-		// Non-interactive sessions never reach here — their gates fail closed
-		// before an approver is consulted.
-		target := strings.TrimSpace(subject)
-		if target == "" {
-			target = toolName
-		}
-		reply, err := g.c.requestStrictFreshApprovalDecision(ctx, toolName, target, args, i18n.M.MCPReviewerUnavailableReason)
-		if err != nil {
-			return false, "approval aborted", err
-		}
-		if !reply.allow {
-			return false, i18n.M.MCPReviewerUnavailableDeclined, nil
-		}
-		return true, "", nil
-	}
-
-	// An explicit MCP prompt/write policy outranks global Auto/YOLO. The legacy
-	// empty-reviewer path still lets Guardian approve low-risk calls or provide
-	// context for a final human decision.
-	var reason string
-	if reviewer == "" && g.c.guardianSess != nil {
-		if g.c.executor == nil {
-			return false, "automatic MCP approval review is configured, but no parent session is available", nil
-		}
-		allow, reviewReason, err := g.c.guardianSess.Review(ctx, toolName, args, g.c.executor.Session())
-		if err != nil {
-			return false, "automatic MCP approval review failed", err
-		}
-		if allow {
-			return true, "", nil
-		}
-		reason = reviewReason
-	}
-	target := strings.TrimSpace(subject)
-	if target == "" {
-		target = toolName
-	}
-	if !forced {
-		allow, _, err := g.c.requestApprovalWithReason(ctx, toolName, target, args, reason)
-		if err != nil {
-			return false, "approval aborted", err
-		}
-		if !allow && strings.TrimSpace(reason) == "" {
-			reason = "the user declined this MCP tool call"
-		}
-		return allow, reason, nil
-	}
-	reply, err := g.c.requestStrictFreshApprovalDecision(ctx, toolName, target, args, reason)
-	if err != nil {
-		return false, "approval aborted", err
-	}
-	if !reply.allow {
-		if strings.TrimSpace(reason) == "" {
-			reason = "the user declined this MCP tool call"
-		}
-		return false, reason, nil
-	}
-	return true, "", nil
 }
 
 type planModeReadOnlyTrustApprover struct{ c *Controller }
@@ -5720,28 +5706,18 @@ func (c *Controller) requestFreshApprovalDecision(ctx context.Context, tool, sub
 	return c.requestApprovalDecisionWithOptions(ctx, tool, subject, args, reason, approvalDecisionOptions{fresh: true})
 }
 
-// requestStrictFreshApprovalDecision requires a new click for this invocation.
-// Unlike other fresh business decisions, it cannot reuse a session grant.
-func (c *Controller) requestStrictFreshApprovalDecision(ctx context.Context, tool, subject string, args json.RawMessage, reason string) (approvalReply, error) {
-	return c.requestApprovalDecisionWithOptions(ctx, tool, subject, args, reason, approvalDecisionOptions{fresh: true, alwaysPrompt: true})
-}
-
 type approvalDecisionOptions struct {
 	// fresh marks a user trust/business decision rather than an ordinary tool
 	// permission. It may reuse an explicit session grant, but YOLO/auto approval
 	// must not answer or drain the prompt.
 	fresh bool
-	// alwaysPrompt prevents even an explicit session grant from satisfying the
-	// decision. Destructive MCP calls use this because every invocation needs a
-	// current human approval.
-	alwaysPrompt bool
 }
 
 func (c *Controller) requestApprovalDecisionWithOptions(ctx context.Context, tool, subject string, args json.RawMessage, reason string, opts approvalDecisionOptions) (approvalReply, error) {
 	// YOLO/full access and the just-approved-plan execution window auto-allow
 	// approval-gated tools without prompting. Plan approval is a user decision,
 	// not a tool permission, so it deliberately stays interactive.
-	if !opts.alwaysPrompt && c.approval.preApprovedForDecision(tool, subject, args, opts.fresh) {
+	if c.approval.preApprovedForDecision(tool, subject, args, opts.fresh) {
 		return approvalReply{allow: true}, nil
 	}
 
@@ -5750,7 +5726,7 @@ func (c *Controller) requestApprovalDecisionWithOptions(ctx context.Context, too
 
 	// Re-check: a session grant may have landed while we queued behind another
 	// prompt for the same subject.
-	if !opts.alwaysPrompt && c.approval.preApprovedForDecision(tool, subject, args, opts.fresh) {
+	if c.approval.preApprovedForDecision(tool, subject, args, opts.fresh) {
 		return approvalReply{allow: true}, nil
 	}
 

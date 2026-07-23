@@ -152,6 +152,22 @@ type service struct {
 	clientCaps ClientCapabilities
 }
 
+// afterResponse wraps a result with work that must run after the transport has
+// successfully written that result. Session-opening notifications use this so a
+// client can register the returned session before receiving its first update.
+type afterResponse struct {
+	result any
+	after  func()
+}
+
+func (r afterResponse) Response() any { return r.result }
+
+func (r afterResponse) AfterResponse() {
+	if r.after != nil {
+		r.after()
+	}
+}
+
 func (s *service) setClientCapabilities(caps ClientCapabilities) {
 	s.mu.Lock()
 	s.clientCaps = caps
@@ -645,19 +661,21 @@ func (s *service) sessionNew(ctx context.Context, raw json.RawMessage) (any, err
 			return nil, sessionLeaseBindError("session/new", err)
 		}
 		sess.lease = lease
-		ctrl.SetSessionPath(sess.transcript)
+		ctrl.SetFreshSessionPath(sess.transcript)
 	}
 
 	s.mu.Lock()
 	s.sessions[id] = sess
 	s.mu.Unlock()
-	s.sendAvailableCommands(sess)
 
-	return SessionNewResult{
-		SessionID:     id,
-		Models:        cfgState.Models,
-		Modes:         sessionModesState(sessionModeNormal),
-		ConfigOptions: cfgState.ConfigOptions,
+	return afterResponse{
+		result: SessionNewResult{
+			SessionID:     id,
+			Models:        cfgState.Models,
+			Modes:         sessionModesState(sessionModeNormal),
+			ConfigOptions: cfgState.ConfigOptions,
+		},
+		after: func() { s.sendAvailableCommands(sess) },
 	}, nil
 }
 
@@ -791,7 +809,10 @@ func (s *service) sessionLoad(ctx context.Context, raw json.RawMessage) (any, er
 	if err != nil {
 		return nil, err
 	}
-	return SessionLoadResult{Models: cfgState.Models, Modes: s.sessionModesFor(p.SessionID), ConfigOptions: cfgState.ConfigOptions}, nil
+	return afterResponse{
+		result: SessionLoadResult{Models: cfgState.Models, Modes: s.sessionModesFor(p.SessionID), ConfigOptions: cfgState.ConfigOptions},
+		after:  func() { s.sendAvailableCommands(s.session(p.SessionID)) },
+	}, nil
 }
 
 // sessionModesFor reports the modes state for a just-opened session. A live
@@ -815,7 +836,10 @@ func (s *service) sessionResume(ctx context.Context, raw json.RawMessage) (any, 
 	if err != nil {
 		return nil, err
 	}
-	return SessionResumeResult{Models: cfgState.Models, Modes: s.sessionModesFor(p.SessionID), ConfigOptions: cfgState.ConfigOptions}, nil
+	return afterResponse{
+		result: SessionResumeResult{Models: cfgState.Models, Modes: s.sessionModesFor(p.SessionID), ConfigOptions: cfgState.ConfigOptions},
+		after:  func() { s.sendAvailableCommands(s.session(p.SessionID)) },
+	}, nil
 }
 
 func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam string, servers []MCPServerSpec, replay bool) (SessionConfigState, error) {
@@ -972,7 +996,6 @@ func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam 
 	s.mu.Lock()
 	s.sessions[id] = sess
 	s.mu.Unlock()
-	s.sendAvailableCommands(sess)
 
 	if replay {
 		sink.replay(ctrl.History())
@@ -2555,23 +2578,26 @@ func mcpSpecs(in []MCPServerSpec, cwd string) ([]plugin.Spec, error) {
 			if strings.TrimSpace(m.Command) == "" {
 				return nil, fmt.Errorf("MCP server %q command is required", m.Name)
 			}
-		case "http", "streamable-http", "streamable_http":
+		case "http", "streamable-http", "streamable_http", "sse":
 			if strings.TrimSpace(m.URL) == "" {
 				return nil, fmt.Errorf("MCP server %q url is required", m.Name)
 			}
-			typ = "http"
+			if typ != "sse" {
+				typ = "http"
+			}
 		default:
 			return nil, fmt.Errorf("MCP server %q uses unsupported transport %q", m.Name, m.Type)
 		}
 		out = append(out, plugin.Spec{
-			Name:    strings.TrimSpace(m.Name),
-			Type:    typ,
-			Command: strings.TrimSpace(m.Command),
-			Args:    append([]string(nil), m.Args...),
-			Env:     mapString(m.Env),
-			URL:     strings.TrimSpace(m.URL),
-			Headers: mapString(m.Headers),
-			Dir:     cwd,
+			Name:          strings.TrimSpace(m.Name),
+			Type:          typ,
+			Command:       strings.TrimSpace(m.Command),
+			Args:          append([]string(nil), m.Args...),
+			Env:           mapString(m.Env),
+			URL:           strings.TrimSpace(m.URL),
+			Headers:       mapString(m.Headers),
+			Dir:           cwd,
+			WorkspaceRoot: cwd,
 		})
 	}
 	return out, nil
