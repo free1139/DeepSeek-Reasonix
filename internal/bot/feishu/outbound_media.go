@@ -1,3 +1,5 @@
+//go:build !arm
+
 package feishu
 
 import (

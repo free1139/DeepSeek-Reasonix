@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"reasonix/internal/bot"
-	"reasonix/internal/bot/feishu"
 	"reasonix/internal/bot/qq"
 	"reasonix/internal/bot/weixin"
 	"reasonix/internal/config"
@@ -335,8 +334,10 @@ func AdapterBindings(cfg *config.Config, enabled map[bot.Platform]bool, feishuDo
 			}
 			feishuCfg.AppID = firstNonEmptyString(strings.TrimSpace(conn.Credential.AppID), feishuCfg.AppID)
 			feishuCfg.AppSecretEnv = firstNonEmptyString(strings.TrimSpace(conn.Credential.AppSecretEnv), feishuCfg.AppSecretEnv)
-			bindings = append(bindings, bot.AdapterBinding{ID: id, Domain: feishuCfg.Domain, Platform: platform, Adapter: feishu.New(feishuCfg, logger)})
-			hasConnection[platform] = true
+			if adapter := newFeishuAdapter(feishuCfg, logger); adapter != nil {
+				bindings = append(bindings, bot.AdapterBinding{ID: id, Domain: feishuCfg.Domain, Platform: platform, Adapter: adapter})
+				hasConnection[platform] = true
+			}
 		case bot.PlatformWeixin:
 			weixinCfg := cfg.Bot.Weixin
 			weixinCfg.Enabled = true
@@ -351,7 +352,9 @@ func AdapterBindings(cfg *config.Config, enabled map[bot.Platform]bool, feishuDo
 	}
 	if enabled[bot.PlatformFeishu] && !hasConnection[bot.PlatformFeishu] {
 		if feishuDomains == nil || feishuDomains[feishuDomainKey(cfg.Bot.Feishu.Domain)] {
-			bindings = append(bindings, bot.AdapterBinding{ID: string(bot.PlatformFeishu), Domain: cfg.Bot.Feishu.Domain, Platform: bot.PlatformFeishu, Adapter: feishu.New(cfg.Bot.Feishu, logger)})
+			if adapter := newFeishuAdapter(cfg.Bot.Feishu, logger); adapter != nil {
+				bindings = append(bindings, bot.AdapterBinding{ID: string(bot.PlatformFeishu), Domain: cfg.Bot.Feishu.Domain, Platform: bot.PlatformFeishu, Adapter: adapter})
+			}
 		}
 	}
 	if enabled[bot.PlatformWeixin] && !hasConnection[bot.PlatformWeixin] {
