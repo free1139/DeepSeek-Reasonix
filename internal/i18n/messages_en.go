@@ -27,6 +27,7 @@ var English = Messages{
 	ChatTip:             "Context is kept across turns. Type 'exit' or Ctrl-D to quit.",
 	TurnCancelled:       "cancelled — back to prompt",
 	InterruptedRecovery: "This turn was interrupted. Partial output is kept for reference; only completed tool pairs and a bounded recovery summary enter the next model turn. Inspect the workspace before continuing or reverting changes.",
+	RecoveryPaused:      "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send “Continue” to start a fresh attempt, or add instructions to change direction.",
 	NoSessionToResume:   "no saved session to resume — start a new one with `reasonix`",
 	ResumeRequiresTTY:   "--resume needs an interactive terminal; pass --continue for the most recent session",
 	PickSessionLabel:    "Resume which session?",
@@ -64,8 +65,9 @@ var English = Messages{
 	ChatStatusBalanceLabel:                 "BAL",
 	ChatStatusCacheNowFmt:                  "turn hit %s",
 	ChatStatusCacheAvgFmt:                  "avg %s",
-	ChatStatusPlanApproval:                 "Enter/y approves & executes · n/Esc keeps planning · PgUp/PgDn/Ctrl+Home/End scrolls",
-	PlanApprovalPrompt:                     "Plan ready above — Enter/y to approve & execute, n/Esc to keep planning",
+	ChatStatusPlanApproval:                 "1 execute · 2 revise · 3 exit without executing · n/Esc keeps planning · PgUp/PgDn/Ctrl+Home/End scrolls",
+	PlanApprovalPrompt:                     "Plan ready above — choose what to do next",
+	PlanApprovalChoices:                    "1. Start execution\n2. Revise plan (keep planning)\n3. Exit without executing\nChoose [1/2/3] (y starts; n/Esc keeps planning)",
 	ChatStatusToolApproval:                 "1 approve once · 2 allow scope this session · 3/4 prefix or save when offered · n/Esc deny · Ctrl-C cancels turn",
 	AskTypeSomething:                       "Type something else",
 	AskTypingHint:                          "type below, Enter to confirm",
@@ -277,7 +279,6 @@ var English = Messages{
 	ArgMcpList:          "show configured servers",
 	ArgMcpConnected:     "connected",
 	ArgHooksList:        "list active hooks",
-	ArgHooksTrust:       "trust this project's hooks",
 	ArgModelCurrent:     "current",
 	ArgEffortAuto:       "use the model default",
 	ArgEffortLow:        "lighter reasoning",
@@ -299,7 +300,7 @@ var English = Messages{
 	ListSkillsHeaderFmt: "skills (%d)",
 	ListSkillsNone:      "skills: none defined — invoke a built-in like /init, or author one with install_skill",
 	ListHooksHeaderFmt:  "hooks (%d active)",
-	ListHooksNone:       "hooks: none active — configure in .reasonix/settings.json (project, after trust) or <Reasonix home>/settings.json (global)",
+	ListHooksNone:       "hooks: none active — configure in .reasonix/settings.json (project) or <Reasonix home>/settings.json (global)",
 	ListMcpHeader:       "mcp servers",
 	ListMcpNone:         "mcp: no servers connected — add one in reasonix.toml ([[plugins]]) or a project .mcp.json",
 
@@ -317,7 +318,7 @@ var English = Messages{
 	GoalSetFmt:                "goal set → %s",
 	GoalCleared:               "goal cleared",
 	ModelSwitchUnavailable:    "model switching is unavailable in this session",
-	ModelSwitchBusy:           "finish or cancel the current turn before switching models",
+	ModelSwitchBusy:           "finish or cancel active work and stop background jobs before switching models",
 	ModelAlreadyOnFmt:         "already on %s",
 	ModelSwitchingFmt:         "switching to %s…",
 	ModelSwitchedFmt:          "switched to %s (conversation carried over; prompt cache resets)",
@@ -510,6 +511,7 @@ Usage:
   reasonix [--model NAME] [-c|--continue] [-r|--resume [QUERY]] [--permission-mode MODE] [--effort LEVEL] [--add-dir PATH]   interactive session
   reasonix -p|--print [--model NAME] [--output-format text|json|stream-json] [--allowed-tools RULES] [--add-dir PATH] <task>
   reasonix run [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] [--output-format FORMAT] <task>
+  reasonix run --events-jsonl [--model NAME] <task>      emit redacted structured events as JSONL
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI-powered code review on local diffs
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  serve over HTTP+SSE (with optional auth)
   reasonix acp [--model NAME]                           serve Agent Client Protocol over stdio (also: reasonix --acp)
@@ -520,6 +522,11 @@ Usage:
   reasonix init                                         show how to generate project memory (AGENTS.md)
   reasonix doctor [--json]                              print redacted local diagnostics
   reasonix doctor session <branch-id> [--zip] [--out PATH]  export a session conflict diagnostic zip
+  reasonix session list --json [--dir PATH]             list redacted sessions for machine clients
+  reasonix session show|status <machine-session-id> --json [--dir PATH]  query one redacted session
+  reasonix session recovery [<machine-session-id>] --json [--dir PATH]  query redacted recovery state
+  reasonix hook list|status --json [--dir PATH]         inspect redacted hook state
+  reasonix task list|show --json [--dir PATH]           inspect redacted task state
   reasonix bot start|doctor|weixin-login                multi-channel IM bot gateway
   reasonix upgrade [--check] [--force]                   self-update to the latest release (also: reasonix update)
   reasonix version

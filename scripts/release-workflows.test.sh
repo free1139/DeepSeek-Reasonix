@@ -14,6 +14,26 @@ trap cleanup EXIT
 # Stable tags have one entrypoint and one protected environment. Reusable
 # publishers must verify that only that entrypoint can claim prior approval.
 [ "$(grep -Ec '^    environment: release$' "$repo_root/.github/workflows/release-stable.yml")" = "1" ]
+for relay in release-stable-trigger.yml release-desktop-trigger.yml; do
+	grep -Eq 'actions: write' "$repo_root/.github/workflows/$relay"
+	grep -Eq "CONTROL_PLANE_REF.*default_branch" "$repo_root/.github/workflows/$relay"
+	grep -Eq "CONTROL_PLANE_REF !== 'main-v2'" "$repo_root/.github/workflows/$relay"
+	grep -Eq 'createWorkflowDispatch' "$repo_root/.github/workflows/$relay"
+	grep -Eq 'ref: process\.env\.CONTROL_PLANE_REF' "$repo_root/.github/workflows/$relay"
+done
+grep -Eq "workflow_id: 'release-stable\.yml'" \
+	"$repo_root/.github/workflows/release-stable-trigger.yml"
+grep -Eq "allow_recovery: 'false'" \
+	"$repo_root/.github/workflows/release-stable-trigger.yml"
+grep -Eq 'ALLOW_STABLE_RECOVERY:.*inputs\.allow_recovery' \
+	"$repo_root/.github/workflows/release-stable.yml"
+grep -Eq "workflow_id: 'release-desktop\.yml'" \
+	"$repo_root/.github/workflows/release-desktop-trigger.yml"
+if grep -Eq '^  push:$' "$repo_root/.github/workflows/release-stable.yml" ||
+	grep -Eq '^  push:$' "$repo_root/.github/workflows/release-desktop.yml"; then
+	echo "production workflow must be dispatched on protected main-v2, not run on a tag origin" >&2
+	exit 1
+fi
 for workflow in release.yml release-npm.yml release-desktop.yml; do
 	grep -Eq 'github\.workflow_ref' "$repo_root/.github/workflows/$workflow"
 	grep -Eq 'github\.ref_protected' "$repo_root/.github/workflows/$workflow"
@@ -24,8 +44,46 @@ for workflow in release.yml release-npm.yml release-desktop.yml; do
 done
 grep -Eq "needs\.build\.result == 'success'" "$repo_root/.github/workflows/release-desktop.yml"
 grep -Eq "needs\.publish\.result == 'success'" "$repo_root/.github/workflows/release-desktop.yml"
+grep -Eq '^      production_signing_smoke:$' "$repo_root/.github/workflows/release-desktop.yml"
+grep -Eq "signing-policy-slug:.*production_signing_smoke.*release-signing.*test-signing-ci-approval" \
+	"$repo_root/.github/workflows/release-desktop.yml"
+grep -Eq "needs\.build\.result == 'success'.*!inputs\.production_signing_smoke" \
+	"$repo_root/.github/workflows/release-desktop.yml"
+[ "$(grep -Ec 'wait-for-completion: false' "$repo_root/.github/workflows/release-desktop.yml")" = "2" ]
+[ "$(grep -Ec 'complete-signpath-request\.ps1' "$repo_root/.github/workflows/release-desktop.yml")" = "2" ]
+[ "$(grep -Ec -- '-WaitForExternalApproval:\$waitForExternalApproval' "$repo_root/.github/workflows/release-desktop.yml")" = "2" ]
+[ "$(grep -Ec 'signpath-api-url' "$repo_root/.github/workflows/release-desktop.yml")" = "0" ]
+grep -Eq 'steps\.submit-windows-payload\.outputs\.signing-request-id' \
+	"$repo_root/.github/workflows/release-desktop.yml"
+grep -Eq 'steps\.submit-windows-installer\.outputs\.signing-request-id' \
+	"$repo_root/.github/workflows/release-desktop.yml"
 grep -Eq '^  postflight:$' "$repo_root/.github/workflows/release-stable.yml"
 grep -Eq 'verify-stable-release-artifacts\.sh' "$repo_root/.github/workflows/release-stable.yml"
+grep -Eq 'name: Upload reviewed release notes' "$repo_root/.github/workflows/release-stable.yml"
+grep -Eq 'name: stable-reviewed-release-notes' "$repo_root/.github/workflows/release-stable.yml"
+for channel in cli npm desktop; do
+	grep -Eq '^      publish_'"$channel"':' "$repo_root/.github/workflows/release-stable.yml"
+	grep -Eq "inputs\.publish_$channel" "$repo_root/.github/workflows/release-stable.yml"
+done
+grep -Eq 'public postflight will still verify it' "$repo_root/.github/workflows/release-stable.yml"
+for workflow in release.yml release-desktop.yml; do
+	grep -Eq 'name: Download orchestrator-reviewed release notes' "$repo_root/.github/workflows/$workflow"
+	grep -Eq 'name: stable-reviewed-release-notes' "$repo_root/.github/workflows/$workflow"
+	grep -Eq 'if: \$\{\{ !inputs\.orchestrated' "$repo_root/.github/workflows/$workflow"
+done
+
+# Release notes should normally reuse an existing release-bound PR instead of
+# opening one PR per version. Fork PRs and stale branches must fail closed, and
+# the dedicated release-notes PR remains the explicit fallback.
+prepare_notes="$repo_root/.github/workflows/prepare-release-notes.yml"
+grep -Eq '^      target_pr:$' "$prepare_notes"
+grep -Eq 'isCrossRepository' "$prepare_notes"
+grep -Eq 'target_pr comes from a fork' "$prepare_notes"
+grep -Eq 'git merge-base --is-ancestor origin/main-v2 HEAD' "$prepare_notes"
+grep -Eq 'RELEASE_NOTES_PR=\$TARGET_PR' "$prepare_notes"
+grep -Eq 'Updated existing release-bound PR' "$prepare_notes"
+grep -Eq 'release-notes/v\$\{VERSION#v\}' "$prepare_notes"
+grep -Eq 'GITHUB_STEP_SUMMARY' "$prepare_notes"
 
 git init --bare -q "$test_root/remote.git"
 git clone -q "$test_root/remote.git" "$test_root/repo"

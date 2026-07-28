@@ -137,9 +137,19 @@ The gateway resolves only the desktop `desktop-v*` release line and never uses
 GitHub's repository-wide `/releases/latest` shortcut, so updater behavior does
 not depend on homepage badge semantics. Self-update behavior by platform:
 
-- **Linux / Windows** — download, verify the minisign signature, then update in
-  place: Linux replaces the binary and relaunches; Windows runs the per-user NSIS
-  installer (no admin rights needed).
+- **Linux portable (`.tar.gz`)** — download, verify the minisign signature, replace
+  the binaries in the install directory, and relaunch through Guard. No elevation.
+- **Linux Debian/Ubuntu (`.deb`)** — download the signed `.deb`, request administrator
+  authorization via Polkit (`pkexec`), re-verify and install with `apt-get
+  --only-upgrade`, then relaunch through Guard. The first build that ships the
+  update helper and Polkit policy is a one-time bootstrap: existing `.deb` users
+  should overwrite-install once with
+  `sudo apt install ./Reasonix-linux-amd64.deb` (no uninstall required). After
+  that, in-app authorized updates work. If Polkit/`pkexec` is unavailable, use
+  the same manual command. Failed installs leave the running app intact so you
+  can retry; successful installs are managed by apt/dpkg and are not auto-downgraded.
+- **Windows** — download, verify the minisign signature, then run the per-user
+  NSIS installer (no admin rights needed).
 - **macOS** — *not* self-updating yet. The build is unsigned/un-notarized, so an
   in-place swap would be blocked by Gatekeeper; the banner links to the download
   page for a manual update instead.
@@ -272,16 +282,20 @@ desktop/
 
 The desktop app sends one anonymous ping per launch to `crash.reasonix.io`:
 a random install id (generated locally, tied to nothing), app version, OS,
-arch, and OS version. It exists solely to count active installs. It never
-includes conversations, API keys, file contents, or paths.
+arch, and OS version. When the previous process ended abnormally, the next
+normal launch may also send a bounded native diagnostic (lifecycle phase,
+symbolized stack, WebView2/window failure kind, and coarse device facts).
+Panic values are removed and paths/secrets are scrubbed before the report is
+queued. It never includes conversations, API keys, or file contents.
 
 Opt out any time: Settings > Updates > "Anonymous usage ping", or set
 `telemetry = false` under `[desktop]` in the global config. Dev builds
-never ping. Crash and performance-pressure reports are separate and only
-ever sent when the user clicks "Send report" on the diagnostic UI.
+never ping or upload queued native diagnostics. Frontend crash and
+performance-pressure reports remain separate and are sent only when the user
+clicks "Send report" on the diagnostic UI.
 
 Aggregate quality metrics are also enabled by default and can be disabled from
 Settings > Updates > "Share aggregate quality metrics", or by setting
 `metrics = false` under `[desktop]`. These metrics are anonymous signal/bucket
-counts and preference buckets; they never include conversations, prompts, keys,
-paths, base URLs, or file contents.
+counts, lifecycle/window failure buckets, and preference buckets; they never
+include conversations, prompts, keys, paths, base URLs, or file contents.

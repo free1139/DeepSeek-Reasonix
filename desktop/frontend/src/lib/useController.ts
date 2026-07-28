@@ -57,6 +57,11 @@ type SyncActiveTabOptions = {
   preserveCachedHistory?: boolean;
 };
 
+type ModelSwitchQueueState = {
+  tail: Promise<void>;
+  fallbackBalance?: BalanceInfo;
+};
+
 const HISTORY_PAGE_TURNS = 60;
 
 export type Item =
@@ -79,6 +84,8 @@ export type Item =
       name: string;
       args: string;
       readOnly: boolean;
+      resolvedName?: string;
+      capabilityId?: string;
       status: ToolStatus;
       output?: string;
       error?: string;
@@ -180,7 +187,7 @@ interface State {
   sessionTokens: number;
   sessionCost: number;
   sessionCurrency: string;
-  retry?: { attempt: number; max: number };
+  retry?: { attempt: number; max: number; observedAt: number };
   seq: number;
   sessionGen: number;
   // Monotonic count of usage events from ANY source (executor, subagent,
@@ -267,6 +274,14 @@ export function runtimeSnapshotPredatesPrompt(
   return snapshotAt <= state.promptArrivedAt;
 }
 
+function runtimeSnapshotPredatesRetry(
+  state: Pick<State, "retry"> | undefined,
+  snapshotAt: number | undefined,
+): boolean {
+  if (snapshotAt === undefined || state?.retry?.observedAt === undefined) return false;
+  return snapshotAt <= state.retry.observedAt;
+}
+
 function updatesContextGauge(usage?: WireUsage): boolean {
   const source = usage?.source?.trim();
   return !source || source === "executor";
@@ -284,6 +299,7 @@ export function metaFromTab(tab: TabMeta, existing?: Meta): Meta {
   return {
     label: tab.label || existing?.label || "",
     ready: tab.ready,
+    runtime: tab.runtime,
     startupErr: tab.startupErr,
     eventChannel: existing?.eventChannel ?? "agent:event",
     cwd,
@@ -314,6 +330,14 @@ export function sameMeta(a?: Meta, b?: Meta): boolean {
   return (
     a.label === b.label &&
     a.ready === b.ready &&
+    a.runtime?.phase === b.runtime?.phase &&
+    a.runtime?.epoch === b.runtime?.epoch &&
+    a.runtime?.issue?.code === b.runtime?.issue?.code &&
+    a.runtime?.issue?.message === b.runtime?.issue?.message &&
+    a.runtime?.issue?.retryable === b.runtime?.issue?.retryable &&
+    a.runtime?.issue?.holderPid === b.runtime?.issue?.holderPid &&
+    a.runtime?.issue?.holderHost === b.runtime?.issue?.holderHost &&
+    a.runtime?.issue?.acquiredAt === b.runtime?.issue?.acquiredAt &&
     a.startupErr === b.startupErr &&
     a.eventChannel === b.eventChannel &&
     a.cwd === b.cwd &&
@@ -333,6 +357,15 @@ export function sameMeta(a?: Meta, b?: Meta): boolean {
     a.goalStatus === b.goalStatus &&
     sameTodoList(a.canonicalTodos, b.canonicalTodos)
   );
+}
+
+export function runtimeReadyForSubmit(meta?: Meta): boolean {
+  if (!meta || meta.ready !== true || meta.startupErr) return false;
+  return !meta.runtime || meta.runtime.phase === "ready";
+}
+
+export function acceptsRuntimeEventEpoch(acceptedEpoch: string | undefined, eventEpoch: string | undefined): boolean {
+  return !eventEpoch || !acceptedEpoch || acceptedEpoch === eventEpoch;
 }
 
 function metaWithoutCanonicalTodos(meta?: Meta): Meta | undefined {
@@ -557,7 +590,9 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
           id: tc.id || `${idPrefix}tool${seq}`,
           name: tc.name,
           args: tc.arguments ?? "",
-          readOnly: isReadOnlyTool(tc.name),
+          readOnly: typeof tc.resolvedReadOnly === "boolean" ? tc.resolvedReadOnly : isReadOnlyTool(tc.name),
+          resolvedName: tc.resolvedName,
+          capabilityId: tc.capabilityId,
           status: result ? (error ? "error" : "done") : "stopped",
           output,
           error,
@@ -768,7 +803,25 @@ function applyEvent(s: State, e: WireEvent): State {
     s = flushPendingUser(s);
   }
   if (e.kind === "retrying") {
-    return { ...s, retry: { attempt: e.retryAttempt ?? 0, max: e.retryMax ?? 0 } };
+    // Retrying is emitted synchronously from inside the foreground provider
+    // request, immediately before its cancellation-aware backoff. Treat it as
+    // authoritative proof that the turn is still active. An idle ListTabs
+    // snapshot fetched before this event can otherwise clear `running`,
+    // regardless of which one reaches the reducer first, and leave the
+    // composer showing "retrying (n/m)" without its Stop button (or Escape
+    // cancellation) until all retries are exhausted.
+    return {
+      ...s,
+      retry: {
+        attempt: e.retryAttempt ?? 0,
+        max: e.retryMax ?? 0,
+        observedAt: promptEventClock(),
+      },
+      running: true,
+      turnActive: true,
+      cancellable: true,
+      turnStartAt: s.turnStartAt || Date.now(),
+    };
   }
   if (s.retry) s = { ...s, retry: undefined };
   switch (e.kind) {
@@ -881,7 +934,7 @@ function applyEvent(s: State, e: WireEvent): State {
           ...s,
           turnArgChars,
           seq: s.seq + 1,
-          items: [...s.items, { kind: "tool", id, name: t.name, args: "", readOnly: t.readOnly, status: "running", argChars: t.argChars || undefined, parentId: t.parentId }],
+          items: [...s.items, { kind: "tool", id, name: t.name, args: "", readOnly: t.readOnly, resolvedName: t.resolvedName, capabilityId: t.capabilityId, status: "running", argChars: t.argChars || undefined, parentId: t.parentId }],
         };
       }
       const id = t.id || `tool${s.seq}`;
@@ -893,13 +946,13 @@ function applyEvent(s: State, e: WireEvent): State {
           const args = t.args ? t.args : it.args;
           const fileDiff = fileDiffFromWire(t);
           const summary = summarizeFileDiff(fileDiff) || summarize(t.name, args) || (t.name === it.name && args === it.args ? it.summary : undefined);
-          next[idx] = { ...it, name: t.name, args, readOnly: t.readOnly, profile: t.profile ?? it.profile, summary, fileDiff, argChars: undefined };
+          next[idx] = { ...it, name: t.name, args, readOnly: t.readOnly, resolvedName: t.resolvedName ?? it.resolvedName, capabilityId: t.capabilityId ?? it.capabilityId, profile: t.profile ?? it.profile, summary, fileDiff, argChars: undefined };
         }
         return { ...s, items: next };
       }
       const args = t.args ?? "";
       const fileDiff = fileDiffFromWire(t);
-      return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "tool", id, name: t.name, args, readOnly: t.readOnly, status: "running", summary: summarizeFileDiff(fileDiff) || summarize(t.name, args), fileDiff, isShell: id.startsWith("shell-"), parentId: t.parentId, profile: t.profile }] };
+      return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "tool", id, name: t.name, args, readOnly: t.readOnly, resolvedName: t.resolvedName, capabilityId: t.capabilityId, status: "running", summary: summarizeFileDiff(fileDiff) || summarize(t.name, args), fileDiff, isShell: id.startsWith("shell-"), parentId: t.parentId, profile: t.profile }] };
     }
     case "tool_result": {
       const t = e.tool;
@@ -922,6 +975,9 @@ function applyEvent(s: State, e: WireEvent): State {
           const summary = t.err ? undefined : existing.summary || summarize(existing.name, existing.args, t.output);
           next[idx] = {
             ...existing,
+            readOnly: t.readOnly,
+            resolvedName: t.resolvedName ?? existing.resolvedName,
+            capabilityId: t.capabilityId ?? existing.capabilityId,
             status: t.err ? "error" : "done",
             output: t.output,
             error: t.err,
@@ -1077,6 +1133,15 @@ function applyEvent(s: State, e: WireEvent): State {
           detail: deliveryReadinessDetail(e.readiness, e.err),
           action: "continue_delivery",
         }];
+      } else if (e.outcome === "recovery_paused") {
+        // Informational pause — not a send failure. Composer is immediately free.
+        items = [...finalized, {
+          kind: "notice",
+          id: `e${s.seq}`,
+          level: "info",
+          title: t("notice.recoveryPausedTitle"),
+          text: t("notice.recoveryPausedBody"),
+        }];
       } else if (e.err) {
         items = [...finalized, { kind: "notice", id: `e${s.seq}`, level: "warn", text: e.err }];
       }
@@ -1178,13 +1243,19 @@ export function reducer(s: State, a: Action): State {
       const backgroundJobs = Math.max(0, a.backgroundJobs ?? s.backgroundJobs ?? 0);
       const cancelRequested = Boolean(a.cancelRequested);
       const foregroundRunning = foregroundRunningFromRuntimeMeta({ running: a.running, pendingPrompt, backgroundJobs, cancellable: a.cancellable });
+      // A retry event is newer evidence of foreground activity than an idle
+      // snapshot whose fetch started earlier. Keep the turn cancellable until
+      // a snapshot started after the retry confirms that it is actually idle.
+      if (!foregroundRunning && runtimeSnapshotPredatesRetry(s, a.snapshotAt)) return s;
       const cancellable = foregroundRunning;
+      const clearsRetry = !foregroundRunning && s.retry !== undefined;
       if (
         foregroundRunning === s.running &&
         pendingPrompt === s.pendingPrompt &&
         backgroundJobs === s.backgroundJobs &&
         cancelRequested === s.cancelRequested &&
-        cancellable === s.cancellable
+        cancellable === s.cancellable &&
+        !clearsRetry
       ) return s;
       if (foregroundRunning) {
         return {
@@ -1217,6 +1288,7 @@ export function reducer(s: State, a: Action): State {
         currentAssistant: undefined,
         approval: undefined,
         ask: undefined,
+        retry: undefined,
       });
     }
     case "meta": {
@@ -1697,7 +1769,12 @@ export function replayPendingPromptsForActiveTab(activeTabId: string | undefined
 
 export function useController() {
   const statesRef = useRef<TabStates>(new Map());
+  const balanceRefreshSeqByTab = useRef(new Map<string, number>());
+  const modelSwitchSeqByTab = useRef(new Map<string, number>());
+  const modelSwitchSuccessVersionByTab = useRef(new Map<string, number>());
+  const modelSwitchQueueByTab = useRef(new Map<string, ModelSwitchQueueState>());
   const lastTurnActivityAtByTab = useRef(new Map<string, number>());
+  const runtimeEpochByTabRef = useRef(new Map<string, string>());
   const cancelReconcileTimers = useRef(new Map<string, number>());
   const stalePromptReconcileTimers = useRef(new Map<string, number>());
   // Indirection so dispatchRuntimeStatusForTab (defined above reconcileTabRuntime)
@@ -1738,6 +1815,41 @@ export function useController() {
       bump();
     }
   }, [bump]);
+
+  const clearBalanceForTab = useCallback((tabId: string): void => {
+    const seq = (balanceRefreshSeqByTab.current.get(tabId) ?? 0) + 1;
+    balanceRefreshSeqByTab.current.set(tabId, seq);
+    dispatchTo(tabId, { type: "balance", balance: { available: false, display: "" } });
+  }, [dispatchTo]);
+
+  const invalidateProviderStateForTab = useCallback((tabId: string): void => {
+    balanceRefreshSeqByTab.current.set(
+      tabId,
+      (balanceRefreshSeqByTab.current.get(tabId) ?? 0) + 1,
+    );
+    modelSwitchSeqByTab.current.set(
+      tabId,
+      (modelSwitchSeqByTab.current.get(tabId) ?? 0) + 1,
+    );
+  }, []);
+
+  const refreshBalanceForTab = useCallback(async (
+    tabId: string,
+    options: { apply?: () => boolean } = {},
+  ): Promise<void> => {
+    const seq = (balanceRefreshSeqByTab.current.get(tabId) ?? 0) + 1;
+    balanceRefreshSeqByTab.current.set(tabId, seq);
+    try {
+      const balance = await app.BalanceForTab(tabId);
+      if (balanceRefreshSeqByTab.current.get(tabId) !== seq) return;
+      if (options.apply && !options.apply()) return;
+      if (balance.err?.trim()) return;
+      dispatchTo(tabId, { type: "balance", balance });
+    } catch {
+      // Balance is optional. Keep the last explicit cleared/unavailable state
+      // instead of surfacing a provider-specific wallet failure in chat.
+    }
+  }, [dispatchTo]);
 
   const confirmBackendActiveTab = useCallback((tabId: string) => {
     backendActiveTabIdRef.current = tabId;
@@ -1790,6 +1902,7 @@ export function useController() {
     const seq = bumpMetaRefreshSeq(tabId);
     const meta = await app.MetaForTab(tabId).catch(() => undefined);
     if (!metaRefreshCurrent(tabId, seq)) return undefined;
+    if (meta?.runtime?.epoch) runtimeEpochByTabRef.current.set(tabId, meta.runtime.epoch);
     return meta;
   }, [bumpMetaRefreshSeq, metaRefreshCurrent]);
   const refreshMetaOnlyForTab = useCallback(async (tabId: string): Promise<Meta | undefined> => {
@@ -1946,11 +2059,9 @@ export function useController() {
       }
       if (checkpoints !== undefined) dispatchTo(tabId, { type: "checkpoints", checkpoints: asArray(checkpoints) });
       addBreadcrumb("tab.hydrate", `ancillary ${reason} ${tabId} ms=${Date.now() - ancillaryStartedAt}`);
-      app.BalanceForTab(tabId)
-        .then((balance) => {
-          if (sessionLoadCurrent(tabId, seq) && stillVisible()) dispatchTo(tabId, { type: "balance", balance });
-        })
-        .catch((err) => { noteFailure("balance", err); });
+      void refreshBalanceForTab(tabId, {
+        apply: () => sessionLoadCurrent(tabId, seq) && stillVisible(),
+      });
     })();
     if (shouldTrackInFlight) {
       sessionLoadInFlight.current.set(tabId, { sessionPath, promise });
@@ -1962,7 +2073,7 @@ export function useController() {
         sessionLoadInFlight.current.delete(tabId);
       }
     }
-  }, [bumpSessionLoadSeq, dispatchTo, loadMetaForTab, sessionLoadCurrent]);
+  }, [bumpSessionLoadSeq, dispatchTo, loadMetaForTab, refreshBalanceForTab, sessionLoadCurrent]);
 
   const loadOlderHistory = useCallback(async (tabId?: string): Promise<void> => {
     const targetTabId = tabId || activeTabIdRef.current;
@@ -2056,6 +2167,7 @@ export function useController() {
     setActiveTabId(active.id);
     activeTabIdRef.current = active.id;
     confirmBackendActiveTab(active.id);
+    if (active.runtime?.epoch) runtimeEpochByTabRef.current.set(active.id, active.runtime.epoch);
     dispatchTo(active.id, { type: "optimistic_meta", meta: metaFromTab(active, statesRef.current.get(active.id)?.meta) });
     const preserveCachedHistory = options.preserveCachedHistory ?? !reset;
     if (!reset) dispatchRuntimeStatusForTab(active.id, active, snapshotAt);
@@ -2076,6 +2188,7 @@ export function useController() {
     const tabs = asArray(await app.ListTabs().catch(() => [] as TabMeta[]));
     const tab = tabs.find((candidate) => candidate.id === tabId);
     if (!tab) return undefined;
+    if (tab.runtime?.epoch) runtimeEpochByTabRef.current.set(tabId, tab.runtime.epoch);
     const local = statesRef.current.get(tabId);
     const needsInitialLoad = !local?.meta;
     const foregroundRunning = dispatchRuntimeStatusForTab(tabId, tab, snapshotAt);
@@ -2084,16 +2197,15 @@ export function useController() {
       await loadSessionDataForTab(tabId, missedTurnDone, "startup");
       return tabs;
     }
-    const [jobs, effort, balance] = await Promise.all([
+    const [jobs, effort] = await Promise.all([
       app.JobsForTab(tabId).catch(() => undefined),
       app.EffortForTab(tabId).catch(() => undefined),
-      app.BalanceForTab(tabId).catch(() => undefined),
     ]);
     if (jobs) dispatchTo(tabId, { type: "jobs", jobs: asArray(jobs) });
     if (effort) dispatchTo(tabId, { type: "effort", effort });
-    if (balance) dispatchTo(tabId, { type: "balance", balance });
+    await refreshBalanceForTab(tabId);
     return tabs;
-  }, [dispatchRuntimeStatusForTab, loadSessionDataForTab]);
+  }, [dispatchRuntimeStatusForTab, loadSessionDataForTab, refreshBalanceForTab]);
 
   // Authoritative backstop for the prompt-freshness heuristic: after the reducer
   // rejects a stale idle snapshot, refetch backend state once. If the backend
@@ -2146,6 +2258,11 @@ export function useController() {
       // leaks the previous session's approval/ask gate into the new composer.
       const targetTabId = e.tabId || backendActiveTabIdRef.current || activeTabIdRef.current;
       if (!targetTabId) return;
+      const acceptedEpoch = runtimeEpochByTabRef.current.get(targetTabId);
+      if (e.runtimeEpoch) {
+        if (!acceptsRuntimeEventEpoch(acceptedEpoch, e.runtimeEpoch)) return;
+        if (!acceptedEpoch) runtimeEpochByTabRef.current.set(targetTabId, e.runtimeEpoch);
+      }
       if (
         e.kind === "turn_started" ||
         e.kind === "text" ||
@@ -2173,7 +2290,7 @@ export function useController() {
           .ContextUsageForTab(targetTabId)
           .then((context) => dispatchTo(targetTabId, { type: "context", context }))
           .catch(() => {});
-        app.BalanceForTab(targetTabId).then((balance) => dispatchTo(targetTabId, { type: "balance", balance })).catch(() => {});
+        void refreshBalanceForTab(targetTabId);
         app.EffortForTab(targetTabId).then((effort) => dispatchTo(targetTabId, { type: "effort", effort })).catch(() => {});
         void refreshCheckpoints(targetTabId);
         void refreshMetaForTab(targetTabId);
@@ -2199,10 +2316,14 @@ export function useController() {
     // prompt from the new controller is never misread as a stale replay of
     // one the old controller already resolved (#6432 round 3). A tab-less
     // rebuild (settings-wide) affects every known tab.
-    const offRebuilt = onRuntimeRebuilt((rebuiltTabId) => {
+    const offRebuilt = onRuntimeRebuilt((rebuiltTabId, runtimeEpoch) => {
       if (rebuiltTabId) {
+        if (runtimeEpoch) runtimeEpochByTabRef.current.set(rebuiltTabId, runtimeEpoch);
         dispatchTo(rebuiltTabId, { type: "controller_rebuilt" });
       } else {
+        if (runtimeEpoch) {
+          for (const id of Array.from(statesRef.current.keys())) runtimeEpochByTabRef.current.set(id, runtimeEpoch);
+        }
         for (const id of Array.from(statesRef.current.keys())) dispatchTo(id, { type: "controller_rebuilt" });
       }
     });
@@ -2228,7 +2349,7 @@ export function useController() {
       offReady();
       offRebuilt();
     };
-  }, [dispatchTo, loadSessionDataForTab, refreshCheckpoints, refreshMetaForTab, syncActiveTabFromBackend]);
+  }, [dispatchTo, loadSessionDataForTab, refreshBalanceForTab, refreshCheckpoints, refreshMetaForTab, syncActiveTabFromBackend]);
 
   // Keep shared all-source telemetry live between turn boundaries. Delivery
   // mode can complete dozens of provider requests inside one UI turn, while
@@ -2332,7 +2453,12 @@ export function useController() {
 
   const sendToTab = useCallback(async (tabId: string, displayText: string, submitText = displayText, originalText?: string, structured?: import("./invocationDisplay").StructuredInvocationSubmit) => {
     if (!tabId) throw new Error(t("composer.workspaceStarting"));
-    const seq = getOrCreateState(statesRef.current, tabId).seq;
+    const currentState = getOrCreateState(statesRef.current, tabId);
+    const runtime = currentState.meta?.runtime;
+    if (currentState.meta && !runtimeReadyForSubmit(currentState.meta)) {
+      throw new Error(runtime?.issue?.message || currentState.meta.startupErr || t("composer.workspaceStarting"));
+    }
+    const seq = currentState.seq;
     const display = displayText.trim();
     const submit = submitText.trim();
     const original = originalText?.trim() ?? "";
@@ -2355,7 +2481,12 @@ export function useController() {
 
   const recoverDeliveryToTab = useCallback(async (tabId: string, displayText: string, submitText = displayText) => {
     if (!tabId) throw new Error(t("composer.workspaceStarting"));
-    const seq = getOrCreateState(statesRef.current, tabId).seq;
+    const currentState = getOrCreateState(statesRef.current, tabId);
+    const runtime = currentState.meta?.runtime;
+    if (currentState.meta && !runtimeReadyForSubmit(currentState.meta)) {
+      throw new Error(runtime?.issue?.message || currentState.meta.startupErr || t("composer.workspaceStarting"));
+    }
+    const seq = currentState.seq;
     const display = displayText.trim();
     const submit = submitText.trim();
     dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq, deliveryRecovery: true });
@@ -2719,15 +2850,60 @@ export function useController() {
   }, [waitForTabReady]);
 
   const setModel = useCallback(async (name: string) => {
-    if (!activeTabId) return;
+    if (!activeTabId) return false;
+    const tabId = activeTabId;
+    const switchSeq = (modelSwitchSeqByTab.current.get(tabId) ?? 0) + 1;
+    const successVersion = modelSwitchSuccessVersionByTab.current.get(tabId) ?? 0;
+    const existingQueue = modelSwitchQueueByTab.current.get(tabId);
+    // Every attempt in one queued burst shares the balance that was visible
+    // before the first switch cleared it. Otherwise a later queued failure
+    // captures the placeholder and cannot restore the outgoing provider.
+    const fallbackBalance = existingQueue
+      ? existingQueue.fallbackBalance
+      : statesRef.current.get(tabId)?.balance;
+    modelSwitchSeqByTab.current.set(tabId, switchSeq);
+    // Hide the outgoing provider's wallet as soon as the user starts a hot
+    // switch. If the rebuild fails, the catch path re-queries the still-active
+    // provider and restores its balance.
+    clearBalanceForTab(tabId);
+    const previousSwitch = existingQueue?.tail ?? Promise.resolve();
+    const backendSwitch = previousSwitch.then(() => app.SetModelForTab(tabId, name));
+    const queueTail = backendSwitch.catch(() => {});
+    const queueState: ModelSwitchQueueState = { tail: queueTail, fallbackBalance };
+    modelSwitchQueueByTab.current.set(tabId, queueState);
     try {
-      await app.SetModelForTab(activeTabId, name);
+      await backendSwitch;
+      modelSwitchSuccessVersionByTab.current.set(
+        tabId,
+        (modelSwitchSuccessVersionByTab.current.get(tabId) ?? 0) + 1,
+      );
     } catch (err) {
-      dispatchTo(activeTabId, { type: "local_notice", level: "warn", text: modelSwitchNoticeText(err) });
-      return;
+      if (modelSwitchSeqByTab.current.get(tabId) !== switchSeq) return false;
+      dispatchTo(tabId, { type: "local_notice", level: "warn", text: modelSwitchNoticeText(err) });
+      const olderSwitchSucceeded =
+        (modelSwitchSuccessVersionByTab.current.get(tabId) ?? 0) !== successVersion;
+      // Restore the known balance only when no older overlapping switch
+      // completed after this attempt began. Otherwise the backend now owns a
+      // different provider and the refresh below must establish its balance.
+      if (fallbackBalance && !olderSwitchSucceeded) {
+        dispatchTo(tabId, { type: "balance", balance: fallbackBalance });
+      }
+      void refreshBalanceForTab(tabId);
+      // A superseded success deliberately skips its own UI reconciliation.
+      // If this latest queued switch then fails, reconcile the model metadata
+      // to the provider that actually became active in the backend.
+      if (olderSwitchSucceeded) await refreshMetaForTab(tabId);
+      return false;
+    } finally {
+      if (modelSwitchQueueByTab.current.get(tabId) === queueState) {
+        modelSwitchQueueByTab.current.delete(tabId);
+      }
     }
-    await refreshMetaForTab(activeTabId);
-  }, [activeTabId, dispatchTo, refreshMetaForTab]);
+    if (modelSwitchSeqByTab.current.get(tabId) !== switchSeq) return false;
+    void refreshBalanceForTab(tabId);
+    await refreshMetaForTab(tabId);
+    return modelSwitchSeqByTab.current.get(tabId) === switchSeq;
+  }, [activeTabId, clearBalanceForTab, dispatchTo, refreshBalanceForTab, refreshMetaForTab]);
 
   const setEffort = useCallback(async (level: string) => {
     if (!activeTabId) return;
@@ -2982,7 +3158,10 @@ export function useController() {
     // during loading, avoiding a blank/Welcome flash before history arrives.
     const prevItems = activeTabIdRef.current ? statesRef.current.get(activeTabIdRef.current)?.items : undefined;
     for (const id of Array.from(statesRef.current.keys())) {
-      if (id !== meta.id) statesRef.current.delete(id);
+      if (id !== meta.id) {
+        invalidateProviderStateForTab(id);
+        statesRef.current.delete(id);
+      }
     }
     setActiveTabId(meta.id);
     activeTabIdRef.current = meta.id;
@@ -2993,7 +3172,7 @@ export function useController() {
       .then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false }))
       .catch(() => {});
     return meta;
-  }, [beginActiveNavigation, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime]);
+  }, [beginActiveNavigation, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, invalidateProviderStateForTab, loadSessionDataForTab, reconcileTabRuntime]);
 
   // Ensure a blank tab exists for the given scope — reuses an existing one
   // or creates a new tab, then loads its session data.
@@ -3018,7 +3197,10 @@ export function useController() {
     const snapshotAt = promptEventClock();
     const meta = await app.EnsureBlankSurface(scope, workspaceRoot);
     for (const id of Array.from(statesRef.current.keys())) {
-      if (id !== meta.id) statesRef.current.delete(id);
+      if (id !== meta.id) {
+        invalidateProviderStateForTab(id);
+        statesRef.current.delete(id);
+      }
     }
     setActiveTabId(meta.id);
     activeTabIdRef.current = meta.id;
@@ -3029,7 +3211,7 @@ export function useController() {
       .then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false }))
       .catch(() => {});
     return meta;
-  }, [beginActiveNavigation, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime]);
+  }, [beginActiveNavigation, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, invalidateProviderStateForTab, loadSessionDataForTab, reconcileTabRuntime]);
 
   const createDeliveryWorktree = useCallback(async (workspaceRoot: string): Promise<DeliveryWorktreeOpenResult> => {
     beginActiveNavigation();
@@ -3052,11 +3234,12 @@ export function useController() {
     if (tabId === activeTabIdRef.current) beginActiveNavigation();
     try {
       await app.CloseTab(tabId);
+      invalidateProviderStateForTab(tabId);
       statesRef.current.delete(tabId);
       bump();
       if (tabId === activeTabId) await syncActiveTabFromBackend(false);
     } catch { /* ignore */ }
-  }, [activeTabId, beginActiveNavigation, bump, syncActiveTabFromBackend]);
+  }, [activeTabId, beginActiveNavigation, bump, invalidateProviderStateForTab, syncActiveTabFromBackend]);
 
   const reorderTabs = useCallback(async (tabIds: string[]) => {
     try {

@@ -28,6 +28,7 @@ var Chinese = Messages{
 	ChatTip:             "对话上下文将跨轮保留。输入 'exit' 或按 Ctrl-D 退出。",
 	TurnCancelled:       "已取消 — 回到提示符",
 	InterruptedRecovery: "本轮已中断。部分输出会永久保留供查看；只有完整工具调用及结果和有界恢复摘要会进入模型下一轮。继续或回滚前请先检查当前工作区。",
+	RecoveryPaused:      "已暂停自动重试。Reasonix 已停止重复尝试，并保留已完成的工作。发送“继续”即可开始新一轮，也可以补充要求来调整方向。",
 	NoSessionToResume:   "没有可恢复的会话 — 用 `reasonix` 开一个新的",
 	ResumeRequiresTTY:   "--resume 需要交互式终端；用 --continue 直接恢复最近一次",
 	PickSessionLabel:    "恢复哪个会话？",
@@ -65,8 +66,9 @@ var Chinese = Messages{
 	ChatStatusBalanceLabel:                 "余额",
 	ChatStatusCacheNowFmt:                  "本次命中 %s",
 	ChatStatusCacheAvgFmt:                  "平均 %s",
-	ChatStatusPlanApproval:                 "Enter/y 批准并执行 · n/Esc 继续规划 · PgUp/PgDn/Ctrl+Home/End 滚动",
-	PlanApprovalPrompt:                     "计划已生成（见上方）— Enter/y 批准执行,n/Esc 继续规划",
+	ChatStatusPlanApproval:                 "1 开始执行 · 2 修改计划 · 3 暂不执行并退出 · n/Esc 继续规划 · PgUp/PgDn/Ctrl+Home/End 滚动",
+	PlanApprovalPrompt:                     "计划已生成（见上方）— 请选择下一步操作",
+	PlanApprovalChoices:                    "1. 开始执行\n2. 修改计划（继续规划）\n3. 暂不执行，退出计划模式\n选择 [1/2/3]（y 开始执行；n/Esc 继续规划）",
 	ChatStatusToolApproval:                 "1 本次允许 · 2 本会话允许此范围 · 提供时 3/4 为前缀或保存 · n/Esc 拒绝 · Ctrl-C 取消本轮",
 	AskTypeSomething:                       "自己输入",
 	AskTypingHint:                          "输入后按 Enter 确认",
@@ -278,7 +280,6 @@ var Chinese = Messages{
 	ArgMcpList:          "显示已配置的服务器",
 	ArgMcpConnected:     "已连接",
 	ArgHooksList:        "列出生效的 hooks",
-	ArgHooksTrust:       "信任本项目的 hooks",
 	ArgModelCurrent:     "当前",
 	ArgEffortAuto:       "使用模型默认值",
 	ArgEffortLow:        "较轻推理",
@@ -300,7 +301,7 @@ var Chinese = Messages{
 	ListSkillsHeaderFmt: "skills（%d 个）",
 	ListSkillsNone:      "暂无 skill — 调用内置的（如 /init），或用 install_skill 创建一个",
 	ListHooksHeaderFmt:  "hooks（生效 %d 个）",
-	ListHooksNone:       "无生效 hooks — 在 .reasonix/settings.json（项目，需信任后）或 <Reasonix home>/settings.json（全局）配置",
+	ListHooksNone:       "无生效 hooks — 在 .reasonix/settings.json（项目）或 <Reasonix home>/settings.json（全局）配置",
 	ListMcpHeader:       "MCP 服务器",
 	ListMcpNone:         "未连接 MCP 服务器 — 在 reasonix.toml（[[plugins]]）或项目 .mcp.json 中添加",
 
@@ -318,7 +319,7 @@ var Chinese = Messages{
 	GoalSetFmt:                "目标已设置 → %s",
 	GoalCleared:               "目标已清除",
 	ModelSwitchUnavailable:    "本会话不支持切换模型",
-	ModelSwitchBusy:           "请先完成或取消当前这一轮再切换模型",
+	ModelSwitchBusy:           "请先完成或取消当前工作，并停止后台任务后再切换模型",
 	ModelAlreadyOnFmt:         "已经在使用 %s",
 	ModelSwitchingFmt:         "正在切换到 %s…",
 	ModelSwitchedFmt:          "已切换到 %s（会保留当前对话，但提示词缓存会重新计算）",
@@ -511,6 +512,7 @@ var Chinese = Messages{
   reasonix [--model NAME] [-c|--continue] [-r|--resume [QUERY]] [--permission-mode MODE] [--effort LEVEL] [--add-dir PATH]   交互式会话
   reasonix -p|--print [--model NAME] [--output-format text|json|stream-json] [--allowed-tools RULES] [--add-dir PATH] <task>
   reasonix run [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] [--output-format FORMAT] <task>
+  reasonix run --events-jsonl [--model NAME] <task>      输出脱敏结构化事件 JSONL
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI 代码审查（基于本地 diff）
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  通过 HTTP+SSE 提供服务（支持可选认证）
   reasonix acp [--model NAME]                           通过 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
@@ -521,6 +523,11 @@ var Chinese = Messages{
   reasonix init                                         查看如何生成项目记忆（AGENTS.md）
   reasonix doctor [--json]                              输出脱敏的本地诊断信息
   reasonix doctor session <branch-id> [--zip] [--out PATH]  导出会话冲突诊断 zip
+  reasonix session list --json [--dir PATH]             为机器客户端列出脱敏会话
+  reasonix session show|status <machine-session-id> --json [--dir PATH]  查询单个脱敏会话
+  reasonix session recovery [<machine-session-id>] --json [--dir PATH]  查询脱敏恢复状态
+  reasonix hook list|status --json [--dir PATH]         查看脱敏 Hook 状态
+  reasonix task list|show --json [--dir PATH]           查看脱敏 Task 状态
   reasonix bot start|doctor|weixin-login                多渠道 IM bot 网关
   reasonix upgrade [--check] [--force]                   自更新到最新版本（也可用：reasonix update）
   reasonix version

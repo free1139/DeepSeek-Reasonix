@@ -110,8 +110,9 @@ tool_timeout_seconds = { "generate_video" = 1800 }   # 可选：raw MCP tool 名
 
 完整 schema 与每个字段的契约见 [`SPEC.md` §5](./SPEC.md#5-configuration-toml)。
 
-新安装或明确确认过的 MCP server 不需要逐工具 reader 名单，其非破坏性的
-`readOnlyHint` 工具会自动进入 planner 和只读 subagent。
+已安装或由项目配置声明的 MCP server 不需要逐工具信任名单。独立双模型 Planner 可使用所有
+非 destructive 工具，即使 server 没有声明 `readOnlyHint`；严格只读 subagent 仍要求
+`readOnlyHint: true` 且无 `destructiveHint`。
 
 `[agent].plan_mode_read_only_commands` 也继续参与配置 round-trip，但主 Plan 工作流不再维护独立的
 bash allowlist 或信任提示。Plan 与常规模式使用相同的 Permissions 规则做 bash 分类和审批；Sandbox
@@ -316,8 +317,9 @@ Thinking 覆盖选项：
 
 这里按使用端来写，因为用户通常是先知道“我现在在桌面端/CLI”，再找对应按键。
 桌面端仍用 `Shift+Tab` 切换 Plan；CLI 则用它在 Ask、Auto、Plan 之间循环。
-`Ctrl/Cmd+Y` 只管 YOLO。桌面端粘贴继续走系统快捷键；CLI 则把终端原生文本粘贴
-和应用接管的图片粘贴拆成不同快捷键。
+桌面端默认用 macOS 的 `Cmd+Y` 或 Windows/Linux 的 `Ctrl+Y` 切换 YOLO；
+如果在 Windows/Linux 上改绑了 YOLO，`Ctrl+Y` 会成为输入框的标准重做兼容键。
+桌面端粘贴继续走系统快捷键；CLI 则把终端原生文本粘贴和应用接管的图片粘贴拆成不同快捷键。
 
 `[ui].shortcut_layout` 仍被接受以兼容旧配置，但下面的快捷键行为已经跨布局统一。
 
@@ -328,7 +330,8 @@ CLI/TUI 文本输入可通过 `[ui].cursor_shape` 设置光标形状，支持 `u
 
 ### 桌面端 GUI
 
-桌面端快捷键在 **设置 → 快捷键** 中管理。选择一行后按下新的组合键，Reasonix 会为桌面端保存该绑定。
+桌面端快捷键在 **设置 → 快捷键** 中管理。选择可配置的行后按下新的组合键，Reasonix 会为桌面端保存该绑定。
+撤销、重做等标准编辑快捷键会以锁定行展示，因为 WebView 的原生文本历史依赖这些平台组合键。
 如果新组合键和已有动作冲突，会拒绝保存，避免一个快捷键触发两个动作。按 `?` 或点击 topic bar
 里的帮助按钮可打开快捷键帮助表；帮助表由同一份快捷键 registry 生成，因此会同步显示自定义后的绑定。
 
@@ -352,7 +355,9 @@ CLI/TUI 文本输入可通过 `[ui].cursor_shape` 设置光标形状，支持 `u
 | `Enter` | 发送当前消息 | IME 组合输入确认不会被截获。 |
 | `Shift+Enter` | 插入换行 | 输入框保持焦点。 |
 | `Shift+Tab` | 切换 Plan 开/关 | Plan 只改变“先规划”的工作流；内置 writer 仍走当前 Ask/Auto/YOLO 与 Sandbox，MCP writer/destructive 目标在整个规划阶段保持硬阻断。 |
-| `Cmd+Y` / `Ctrl+Y` | 切换 YOLO 开/关 | 关闭 YOLO 时会尽量恢复之前的 Ask/Auto 基底。 |
+| macOS `Cmd+Z`，Windows/Linux `Ctrl+Z` | 撤销输入框中的最近一次编辑 | 普通键入继续由 WebView 原生历史管理；Reasonix 接管的粘贴、剪切、折叠块和结构化 token 会作为完整事务恢复。 |
+| macOS `Cmd+Shift+Z`，Windows/Linux `Ctrl+Shift+Z` | 重做输入框中的最近一次编辑 | Windows/Linux 改绑 YOLO 后也可使用 `Ctrl+Y`。 |
+| `Cmd+Y` / `Ctrl+Y`（默认） | 切换 YOLO 开/关 | 关闭 YOLO 时会尽量恢复之前的 Ask/Auto 基底；当前绑定可在 **设置 → 快捷键** 查看。 |
 | macOS `Cmd+V`，Windows/Linux `Ctrl+V` | 粘贴剪贴板内容 | 剪贴板图片会作为附件加入；图片也可以拖进输入框。 |
 | 输入边界处的普通 `Up` / `Down` | 回放更旧或更新的已提交提示词 | 带修饰键的方向键和原生文本导航仍交给 textarea。 |
 | 运行中按 `Esc` | 取消当前 turn | 如果后端尚未开始回复，会恢复草稿。 |
@@ -485,7 +490,7 @@ compaction 摘要数，以及可用时的桌面端 token/cache telemetry。结�
 
 ## 能力诊断
 
-当 skill、斜杠命令、Hook、插件包、MCP 或 `AGENTS.md` 缺失、被覆盖、未信任或启动失败时，用统一只读诊断。完整参数、JSON schema 与 issue code 见
+当 skill、斜杠命令、Hook、插件包、MCP 或 `AGENTS.md` 缺失、被覆盖或启动失败时，用统一只读诊断。完整参数、JSON schema 与 issue code 见
 **[能力诊断](./CAPABILITY_DIAGNOSTICS.zh-CN.md)**。
 
 ```bash
@@ -523,12 +528,16 @@ Reasonix 是一个 MCP 客户端。`[[plugins]]` 的 `type` 选择传输：`stdi
 不会写入不完整配置；Registry 故障时可回退到同一查询的缓存结果。
 
 普通配置流程现在只有一步：使用桌面端的“添加并连接”、`/mcp add`，或直接让 Reasonix
-安装一个 package、URL 或 `.mcp.json`。这次明确安装本身就是授权：server 会保存并在当前
-会话连接，现在和下次启动都不会再弹出第二套信任步骤。显式 deny 仍然优先；包括声明
-`destructiveHint` 的工具在内都直接执行。Plan 与只读 subagent 仍只暴露符合条件的工具身份。只有被动从仓库
-`reasonix.toml` 或 `.mcp.json` 发现的 server 会在第一次启动前，请用户确认一次精确命令或
-地址；Reasonix 会先记录该决定而不启动临时检查进程，然后只启动一次正式连接。内容不变时
-以后自动连接，发生变化时才重新确认。
+安装一个 package 或 URL。此类主动安装统一写入用户全局 `config.toml`，安装本身就是授权：
+server 会在当前会话连接，现在和下次启动都不会再弹出第二套信任步骤。当前项目
+`reasonix.toml` 或 `.mcp.json` 中声明的 server 保留在项目配置中，同样默认可信，不需要额外
+启动确认。显式 deny 仍然优先；包括声明
+`destructiveHint` 的工具在内都可由普通 Executor 直接执行。独立 Planner 仍拒绝 destructive，
+严格只读 subagent 仍只暴露带只读 hint 的非破坏工具。
+
+MCP 名称按 workspace 解析：项目声明覆盖同名全局安装；项目内部以 `reasonix.toml` 高于
+`.mcp.json`。编辑会写回当前生效声明的原文件；删除高优先级声明后，会显示并启用下一层同名
+声明，而不会顺带删除其他作用域。
 
 stdio server 从初始化到读写都复用同一个进程，因此浏览器等有状态 MCP 能保留会话和
 已打开页面。由于进程启动后无法按调用切换 OS 沙箱，这个共享进程始终使用该 server 的普通
@@ -536,11 +545,12 @@ stdio server 从初始化到读写都复用同一个进程，因此浏览器等�
 的进程沙箱。
 
 工具以 `mcp__<server>__<tool>` 暴露给模型，与 Claude Code 一致；声明 MCP `readOnlyHint: true`
-的工具会参与并行调度并命中普通权限层的只读默认放行。用户安装 server，或首次确认仓库提供的
-精确 server 身份后，其非破坏性 reader 元数据即获得授权，这些工具会自动进入独立 planner 和
-只读研究 subagent，不再需要逐工具设置。没有 `readOnlyHint` 的工具仍按写工具处理。计划期间，内置 writer 仍走
-Permissions/Sandbox；已安装 MCP 与代理解析后的 MCP writer、destructive 目标和未授权
-reader 在任何审批前硬阻断，退出 Plan 后即可直接使用。
+的工具会参与并行调度并命中普通权限层的只读默认放行。用户安装或项目配置声明 server 后，
+独立 Planner 即可使用该 server 的全部非 destructive 工具，不再需要逐工具设置；
+严格只读研究 subagent 只获得带 `readOnlyHint` 的非破坏 reader。没有 `readOnlyHint` 的工具在调度和
+mutation 记账上仍按 writer 处理。计划期间，内置 writer 仍走 Permissions/Sandbox；独立 Planner
+允许已授权、非 destructive 的 MCP（包括缺少只读 hint 的 opaque writer），但在任何审批前硬阻断
+destructive 或未授权目标；没有独立 Planner 的单模型 Plan 仍维持原有 writer/destructive 阻断。
 
 安装 MCP server 本身就是授权决定。安装完成后，该 server 的所有工具都直接执行，不再存在
 server、raw tool、writer 或 destructive 的第二套审批设置；显式全局 deny 规则仍然优先。
@@ -719,6 +729,27 @@ planner_model = "deepseek-pro"   # 作为低频规划器
 
 Planner 会看到已加载的 `REASONIX.md` / `AGENTS.md` 记忆，并拿到一小组只读研究工具，
 因此可以先检查相关文件再把计划交给执行器。写入类和流程类工具仍只给执行器使用。
+
+Reasonix 会用确定性规则路由每一轮，不再调用额外的 classifier 模型：问答、短回复、
+明确的单点小改和边界清楚的纯只读动作直达 Executor；边界清楚的实现任务可生成简短的
+Light 计划；模糊、跨面、结构化、高风险、活跃 Goal 或 Delivery 的任务生成 Full 计划，
+明确的原子小改或纯只读动作除外。
+显式 Plan Mode 仍是独立的宿主流程，不会发生双重规划。
+明确的 `先规划` / `plan first` 会强制规划，`直接改` / `just do it` 则直达 Executor；
+执行边界可出现在请求中的任意子句，不要求位于句首，同时会忽略引号内的示例；
+普通的“先规划”会在规划完成后自动交接 Executor；明确要求“等我确认”的请求停在宿主
+审批边界，批准后继续交接 Executor。只有明确的 `只规划` / `不要执行` 才以计划结束当前
+回合而不执行，计划会写入同一会话，用户之后仍可继续要求 Executor 落地。阶段详情会记录
+不含用户原文的 route、depth 与 reason code，便于诊断。
+
+Light 计划包含紧凑目标、最多四个有序步骤、可能触点和主要验证；Full 计划会区分已验证
+与候选触点，并按需补充非目标、风险、验收标准、命令级验证，以及难回滚操作的回滚方案。
+这些合约位于同一个稳定的 Planner system prompt，单轮只在 user turn 追加很小的深度指令，
+因此除本次 prompt 升级的一次缓存未命中外，不会持续破坏 Planner prefix cache。宿主也会
+为 Light 与 Full 调研设置不同的单轮轮次预算。若 Planner 在有界调研和最终总结轮后仍未
+给出最终计划，普通 plan-and-execute 会用原始任务直接交给 Executor 继续；plan-only 与
+等待批准请求仍保持 fail-closed，并回滚不完整的 Planner 回合，避免留下无法继续的会话尾部。
+
 Reasonix 会自动管理正常执行：活跃 Todo 连续 8 个工具调用轮次没有新的完成项、唯一读取、
 命令或修改时，宿主会要求执行器重新评估；连续 16 个无进展轮次后暂停并保存工作，可在
 下一轮用户消息中继续。完全重复的操作不算进展，新的宿主可观测工作会自动续期。两级任务
@@ -747,12 +778,10 @@ ephemeral 只读 subagent，只暴露只读研究工具和安全前台 bash，�
 `connect_tool_source(source="read_only_skill")` 连接这条窄入口；完整的 `skills`
 source 也可在 Plan 中加载，后续 writer 调用仍通过 Permissions/Sandbox。
 
-所有严格只读子会话都经过同一对共享构造入口——批处理子会话用
-`RunReadOnlySubAgentWithSession`，交互式双模型 planner 用 `NewReadOnlyAgent`——
-两者都会把子会话标记为永久只读并做最终 registry 过滤：移除 writer、destructive MCP
-目标、来自未授权 server 的 reader，以及一切会改变 host capability 的工具。用户安装的
-server 会立即获得授权；仓库声明的 server 则在其精确身份确认一次后符合条件。符合条件的
-reader 仍可按需启动。严格只读入口一览：
+所有严格只读子会话都经过同一对共享构造入口——`RunReadOnlySubAgentWithSession` /
+`NewReadOnlyAgent`——两者都会把子会话标记为永久只读并做最终 registry 过滤：移除 writer、
+destructive MCP 目标、来自未授权 server 的 reader，以及一切会改变 host capability 的工具。
+用户安装和项目配置声明的 server 都会立即获得授权。符合条件的 reader 仍可按需启动。严格只读入口一览：
 
 | 入口 | 用途 |
 | --- | --- |
@@ -762,24 +791,40 @@ reader 仍可按需启动。严格只读入口一览：
 | `read_only_skill` | 以既有 skill 驱动的同等隔离 |
 | `reasonix review`（CLI） | 只读评审 diff 或分支 |
 | 桌面端 preview/review 子代理 | 桌面端只读分析面 |
-| 双模型 planner | 独立 planner 的只读 registry |
+
+交互式双模型 Planner 使用专用构造路径（`NewPlannerAgent`）：仍阻止 bash、文件写入与普通
+writer，但可通过固定的 `use_capability` 代理调用已授权、非 destructive 的 MCP，不再要求
+`readOnlyHint`。直接 `mcp__*` schema 永不进入 Planner 工具列表，因此 MCP 安装/连接变动
+不会在一次性 schema 升级后继续改变 Planner 缓存前缀。缺少 `readOnlyHint` 不再阻止 Planner；
+带 `destructiveHint` 的工具零执行，应写入方案交给 Executor。
+
+普通 `task` / `fleet` 子 Agent 同样获得该固定代理（会话共享 Host/连接，每 Agent 独立
+frontend/ledger），可调用已安装或项目配置 MCP，不要求 `readOnlyHint`。这些调用走可信 MCP
+权限路径（实时授权复核 + 仅显式 deny）；writer/destructive 仍会串行、按 mutation 记账，并受
+Delivery 证据/租约门禁约束，而不是 Planner 的 Executor handoff。严格 `read_only_task` /
+`read_only_skill` / review 子 Agent 共享稳定代理 schema 与连接复用，但执行仍要求
+`authorized && readOnlyHint && !destructiveHint`。Profile `allowed-tools` 中的 MCP 名称
+会转换为代理上的 capability ID 白名单；子 Agent 从不继承动态 `mcp__*` schema。
 
 在严格只读子会话内：`use_capability` 在 Commit/permission/hook/执行前会对解析出的
 真实目标再次校验；未连接且符合条件的 MCP reader 可从当前 schema cache 按需启动，
 initialize/tools-list 后会在 `tools/call` 前核对缓存与 live 的 `readOnlyHint`/
 `destructiveHint`；reader 变 writer 或升级为 destructive 时零执行，普通重试会重新经过当前
-边界。仅 schema 变化会静默刷新下一会话的缓存，不再中断已授权调用。未授权 server 无法在这里提升权限。
-这一层比主 Plan 更严格：Plan 在整个规划阶段硬阻断 MCP writer/destructive 目标——
-审批也不能放行，退出 Plan 后才恢复——内置 writer 仍走 Permissions/Sandbox，
-而严格只读子会话根本不暴露 writer。
+边界。仅 schema 变化会静默刷新下一会话的缓存，不再中断已授权调用。分发前还会再次检查运行时
+enable、授权与完整连接身份，因此共享 Host 中另一个项目/tab 的同名 client 不能被误复用。未授权
+server 无法在这里提升权限。严格只读边界比独立 Planner 更窄：Planner 接受已授权的 opaque
+非 destructive MCP，而严格只读子会话必须有明确 reader hint，且根本不暴露 writer。
 
 启动会话时可以用 `--profile economy|balanced|delivery` 选择运行模式，例如
 `reasonix run --profile delivery "修复并验证这个 bug"`。Economy（轻量）初始只带 9 个工具：
 直接读/bash/编辑/写入、后台 shell 生命周期控制、`ask` 和 `connect_tool_source`；专用搜索/文件/
 workflow 工具、session history、memory 写入、slash command、Skills、MCP、LSP、网络、安装与
 subagent 都在任务需要时才连接。
-Balanced（均衡）是提供完整工具面的默认档；Delivery（交付优先）
-保留完整工具面，额外增加稳定能力代理 `use_capability`（按需 inspect/call MCP，包括
+Balanced（均衡）是提供完整工具面的默认档；配置独立 Planner 时，Planner 与 Executor 都会获得各自的
+`use_capability` frontend，规划阶段发现的 capability 可在 handoff 后按同一 ID 直接执行，同时保留
+Executor 的完整直接 MCP 工具面。固定代理自身的 schema 保持稳定，但由于 Balanced Executor 刻意保留
+直接 `mcp__*`，安装、连接或刷新这些直接工具时，Executor 的整体 provider 工具前缀仍可能变化。Delivery（交付优先）
+保留完整工具面，额外增加稳定能力代理 `use_capability`（list/inspect/call MCP，包括
 `auto_start=false`，且不改变主工具 Schema），并增加“明确验收标准、修复根因、运行验证、复审最终
 diff”的稳定交付合约。该合约由宿主运行时强制执行：没有具体 `todo_write` 验收清单时会阻止变更和验证
 命令；发生变更后，必须复查结果、在最后一次变更之后运行验证，并用带证据的 `complete_step` 签收后才能

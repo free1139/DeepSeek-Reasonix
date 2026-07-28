@@ -11,12 +11,57 @@ import (
 	"time"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/capability"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/hook"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
 )
+
+type plannerMetadataRunner struct {
+	meta  plannerTurnMetadata
+	input string
+}
+
+func (r *plannerMetadataRunner) Run(ctx context.Context, input string) error {
+	r.meta, _ = plannerTurnMetadataFromContext(ctx)
+	r.input = input
+	return nil
+}
+
+func TestTurnOrchestratorAttachesTrustedPlannerMetadata(t *testing.T) {
+	sess := agent.NewSession("sys")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "explain the bug"})
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "the bug is in parser.go"})
+	exec := agent.New(nil, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
+	runner := &plannerMetadataRunner{}
+	c := New(Options{
+		Runner:         runner,
+		Executor:       exec,
+		RuntimeProfile: capability.ProfileDelivery,
+	})
+	c.SetGoal("migrate authentication across the backend")
+
+	const raw = "fix typo in README"
+	const expanded = "Referenced context:\n\nprivate injected details\n\nfix typo in README"
+	if err := newTurnOrchestrator(c).runTurnWithRawDisplay(context.Background(), expanded, raw, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if runner.meta.UserText != raw {
+		t.Fatalf("planner metadata user text = %q, want pristine %q", runner.meta.UserText, raw)
+	}
+	if runner.meta.ExplicitPlanMode || !runner.meta.GoalActive || !runner.meta.DeliveryProfile {
+		t.Fatalf("planner metadata missing trusted host state: %+v", runner.meta)
+	}
+	if !runner.meta.HasConversationContext {
+		t.Fatalf("planner metadata lost executor conversation ownership: %+v", runner.meta)
+	}
+	if !strings.Contains(runner.input, expanded) {
+		t.Fatalf("model input lost expanded context: %q", runner.input)
+	}
+}
 
 func TestTurnOrchestratorRunsForegroundUnit(t *testing.T) {
 	runner := &fakeTurnRunner{}
@@ -128,6 +173,64 @@ func TestGoalReadinessFailureBlocksAndKeepsDeliveryScope(t *testing.T) {
 	}
 	if id, task, ok := c.goals.deliveryScope(); !ok || id != runner.scopes[0].ID || task != "ship the integration" {
 		t.Fatalf("resumed scope = (%q, %q, %v), want preserved id/task", id, task, ok)
+	}
+}
+
+type recoveryPauseRunner struct {
+	scopes []agent.DeliveryExecutionScope
+	calls  int
+}
+
+func (r *recoveryPauseRunner) Run(ctx context.Context, _ string) error {
+	r.calls++
+	if scope, ok := agent.DeliveryExecutionScopeFromContext(ctx); ok {
+		r.scopes = append(r.scopes, scope)
+	}
+	return &agent.RecoveryPauseError{
+		Message:    "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send \"continue\" to start a fresh attempt, or add instructions to change direction.",
+		StopReason: "episode_failures",
+	}
+}
+
+func TestRecoveryPauseKeepsGoalRunningAndDeliveryScope(t *testing.T) {
+	runner := &recoveryPauseRunner{}
+	c := New(Options{Runner: runner})
+	c.SetGoal("ship the integration")
+	if id, task, ok := c.goals.deliveryScope(); !ok || task != "ship the integration" {
+		t.Fatalf("initial scope = (%q, %q, %v)", id, task, ok)
+	}
+	scopeID, _, _ := c.goals.deliveryScope()
+
+	err := newTurnOrchestrator(c).runGoalLoopWithRawDisplay(context.Background(), "start", "start", "")
+	var pause *agent.RecoveryPauseError
+	if !errors.As(err, &pause) {
+		t.Fatalf("run err = %v, want RecoveryPauseError", err)
+	}
+	// Recovery pause ends auto-continue only; Goal must stay running so the next
+	// ordinary "continue" keeps the same Goal prompt and delivery scope.
+	if got := c.GoalStatus(); got != GoalStatusRunning {
+		t.Fatalf("GoalStatus = %q, want running after recovery pause", got)
+	}
+	if id, task, ok := c.goals.deliveryScope(); !ok || id != scopeID || task != "ship the integration" {
+		t.Fatalf("scope after pause = (%q, %q, %v), want preserved running Goal", id, task, ok)
+	}
+	if len(runner.scopes) != 1 || runner.scopes[0].ID != scopeID {
+		t.Fatalf("delivery scopes = %+v, want one call with scope %q", runner.scopes, scopeID)
+	}
+
+	// A follow-up ordinary Goal turn reuses the same delivery scope without ResumeGoal.
+	err = newTurnOrchestrator(c).runGoalLoopWithRawDisplay(context.Background(), "continue", "continue", "")
+	if !errors.As(err, &pause) {
+		t.Fatalf("follow-up err = %v, want RecoveryPauseError again", err)
+	}
+	if got := c.GoalStatus(); got != GoalStatusRunning {
+		t.Fatalf("GoalStatus after continue = %q, want running", got)
+	}
+	if id, task, ok := c.goals.deliveryScope(); !ok || id != scopeID || task != "ship the integration" {
+		t.Fatalf("scope after continue = (%q, %q, %v), want same Goal", id, task, ok)
+	}
+	if runner.calls != 2 || len(runner.scopes) != 2 || runner.scopes[1].ID != scopeID {
+		t.Fatalf("follow-up scopes = %+v calls=%d, want same delivery scope reused", runner.scopes, runner.calls)
 	}
 }
 

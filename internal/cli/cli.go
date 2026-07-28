@@ -134,6 +134,15 @@ func Run(args []string, version string) int {
 			configureCLIThemeFromConfigNoProbe()
 		}
 		return doctorCommand(rest, version)
+	case "session":
+		configureCLIThemeFromConfigNoProbe()
+		return sessionCommand(rest)
+	case "hook", "hooks":
+		configureCLIThemeFromConfigNoProbe()
+		return hookCommand(rest)
+	case "task":
+		configureCLIThemeFromConfigNoProbe()
+		return taskCommand(rest)
 	case "review":
 		configureCLIThemeFromConfigNoProbe()
 		return reviewCommand(rest)
@@ -239,11 +248,17 @@ type cliBuildOverrides struct {
 	AdditionalDirs       []string
 	WorkspaceRoot        string
 	HeadlessApprovalMode string
+	Stderr               io.Writer
+	OnSessionRecovered   func(control.SessionRecoveryInfo) error
 }
 
 func setupProfileWithOverrides(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, sink event.Sink, profile string, overrides cliBuildOverrides) (*control.Controller, error) {
 	migrateMCPConfigForCLIWorkspace()
-	return boot.Build(ctx, boot.Options{
+	return boot.Build(ctx, cliProfileBuildOptions(modelName, maxStepsOverride, requireKey, sink, profile, overrides))
+}
+
+func cliProfileBuildOptions(modelName string, maxStepsOverride int, requireKey bool, sink event.Sink, profile string, overrides cliBuildOverrides) boot.Options {
+	return boot.Options{
 		Model:                modelName,
 		MaxSteps:             maxStepsOverride,
 		MaxStepsKey:          "--max-steps",
@@ -256,7 +271,9 @@ func setupProfileWithOverrides(ctx context.Context, modelName string, maxStepsOv
 		PermissionAllow:      overrides.PermissionAllow,
 		AdditionalDirs:       overrides.AdditionalDirs,
 		HeadlessApprovalMode: overrides.HeadlessApprovalMode,
-	})
+		Stderr:               overrides.Stderr,
+		OnSessionRecovered:   overrides.OnSessionRecovered,
+	}
 }
 
 type cliPermissionMode struct {
@@ -310,24 +327,14 @@ func resolveCLISessionDir() string {
 	return config.SessionDir()
 }
 
-// setupQuietProfile is like setupProfile but suppresses plugin subprocess
-// stderr. Used during model switch inside a bubbletea session to prevent plugin
-// logs from corrupting the TUI's terminal raw mode.
+// setupQuietProfile is like setupProfile but guarantees plugin subprocess
+// stderr stays off the terminal. Interactive callers provide the private TUI
+// diagnostic writer; other callers fall back to io.Discard.
 func setupQuietProfile(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, sink event.Sink, profile string, overrides cliBuildOverrides) (*control.Controller, error) {
-	return boot.Build(ctx, boot.Options{
-		Model:           modelName,
-		MaxSteps:        maxStepsOverride,
-		MaxStepsKey:     "--max-steps",
-		RequireKey:      requireKey,
-		Sink:            sink,
-		Stderr:          io.Discard,
-		TokenMode:       profile,
-		SessionDir:      resolveCLISessionDir(),
-		WorkspaceRoot:   overrides.WorkspaceRoot,
-		EffortOverride:  overrides.Effort,
-		PermissionAllow: overrides.PermissionAllow,
-		AdditionalDirs:  overrides.AdditionalDirs,
-	})
+	if overrides.Stderr == nil {
+		overrides.Stderr = io.Discard
+	}
+	return boot.Build(ctx, cliProfileBuildOptions(modelName, maxStepsOverride, requireKey, sink, profile, overrides))
 }
 
 func parseRuntimeProfile(value string) (string, error) {
@@ -424,6 +431,7 @@ func runAgent(args []string) int {
 	effort := fs.String("effort", "", "session reasoning effort override")
 	permissionMode := fs.String("permission-mode", "ask", "permission mode: manual | ask | auto | acceptEdits | dontAsk | plan | bypassPermissions")
 	printOnly := fs.BoolP("print", "p", false, "print only the final response")
+	eventsJSONL := fs.Bool("events-jsonl", false, "emit a redacted structured event stream as JSONL")
 	outputFormat := fs.String("output-format", "text", "output format: text | json | stream-json")
 	var additionalDirs []string
 	fs.StringArrayVar(&additionalDirs, "add-dir", nil, "allow tool access to an additional directory (repeatable)")
@@ -442,6 +450,13 @@ func runAgent(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 2
+	}
+	if *eventsJSONL {
+		if fs.Changed("output-format") {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "--events-jsonl cannot be combined with --output-format")
+			return 2
+		}
+		format = runOutputEventsJSONL
 	}
 	profile, err := parseRuntimeProfile(*profileFlag)
 	if err != nil {
@@ -476,6 +491,14 @@ func runAgent(args []string) int {
 	if prompt == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.UsageRunHint)
 		return 2
+	}
+	var machineIdentityKey []byte
+	if format == runOutputEventsJSONL {
+		machineIdentityKey, err = loadMachineIdentityKey()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "machine identity is unavailable")
+			return 1
+		}
 	}
 
 	// Resolve the resume target up front so --copy and the session lease can be
@@ -582,7 +605,14 @@ func runAgent(args []string) int {
 	// executor, not just the top-level one. Default/ask and acceptEdits already
 	// keep the default headless gate (ask decisions resolve to allow); only
 	// auto/dontAsk/yolo need the explicit contract.
-	overrides := cliBuildOverrides{Effort: effortOverride, PermissionAllow: allowedTools, AdditionalDirs: additionalDirs, WorkspaceRoot: workspaceRoot, HeadlessApprovalMode: permissions.approval}
+	overrides := cliBuildOverrides{
+		Effort:               effortOverride,
+		PermissionAllow:      allowedTools,
+		AdditionalDirs:       additionalDirs,
+		WorkspaceRoot:        workspaceRoot,
+		HeadlessApprovalMode: permissions.approval,
+		OnSessionRecovered:   cliSessionRecoveredHandler(leases),
+	}
 	ctrl, err := setupProfileWithOverrides(ctx, *model, *maxSteps, true, sink, profile, overrides)
 	if err != nil {
 		if resultOutput != nil && format != runOutputText {
@@ -617,8 +647,13 @@ func runAgent(args []string) int {
 	}
 
 	runErr := ctrl.Run(ctx, prompt)
+	completion := classifyRunCompletion(runErr)
 	if cfg != nil {
-		notify.SendEvent(newNotificationSender(), cfg.Notifications, event.Event{Kind: event.TurnDone, Err: runErr})
+		notify.SendEvent(newNotificationSender(), cfg.Notifications, event.Event{
+			Kind:    event.TurnDone,
+			Err:     runErr,
+			Outcome: completion.outcome,
+		})
 	}
 	if metrics != nil {
 		if exec := ctrl.Executor(); exec != nil {
@@ -641,18 +676,25 @@ func runAgent(args []string) int {
 		}
 	}
 	if resultOutput != nil {
-		if err := resultOutput.Finalize(agent.BranchID(ctrl.SessionPath()), started, runErr); err != nil {
+		sessionID := runOutputSessionID(format, agent.BranchID(ctrl.SessionPath()), machineIdentityKey)
+		if err := resultOutput.Finalize(sessionID, started, runErr); err != nil {
 			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 			return 1
 		}
 	}
 	if runErr != nil {
+		if !completion.isError {
+			if format == runOutputText {
+				fmt.Fprintln(os.Stderr, "\n"+runErr.Error())
+			}
+			return completion.exitCode
+		}
 		if resultOutput == nil {
 			fmt.Fprintln(os.Stderr, "\n"+i18n.M.ErrorPrefix, runErr)
 		}
-		return 1
+		return completion.exitCode
 	}
-	return 0
+	return completion.exitCode
 }
 
 // runServe exposes the controller over HTTP+SSE: events stream to the browser,
@@ -775,7 +817,9 @@ func runServe(args []string) int {
 			}
 		}
 	}
-	ctrl, err := setupProfile(ctx, *model, *maxSteps, true, bc, profile, "")
+	ctrl, err := setupProfileWithOverrides(ctx, *model, *maxSteps, true, bc, profile, cliBuildOverrides{
+		OnSessionRecovered: cliSessionRecoveredHandler(leases),
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 1
@@ -929,6 +973,11 @@ func chatREPL(args []string) int {
 		configureCLIThemeWithStyle(cfg.UITheme(), cfg.UIThemeStyle())
 		cliCursorShape = cfg.UICursorShape()
 	}
+	// Bubble Tea owns the terminal from the resume picker through controller
+	// shutdown. Route process logs and plugin stderr to a private, bounded file
+	// for that whole lifetime; user-facing warnings arrive as typed TUI events.
+	diagnostics := startTUIDiagnostics(config.ReasonixHomeDir())
+	defer diagnostics.Close()
 
 	// Decide whether we're starting fresh or resuming. --resume opens an
 	// interactive picker; --continue / -c jumps straight into the newest.
@@ -1008,7 +1057,14 @@ func chatREPL(args []string) int {
 	if strings.TrimSpace(*effort) != "" {
 		effortOverride = effort
 	}
-	overrides := cliBuildOverrides{Effort: effortOverride, PermissionAllow: allowedTools, AdditionalDirs: additionalDirs, WorkspaceRoot: workspaceRoot}
+	overrides := cliBuildOverrides{
+		Effort:             effortOverride,
+		PermissionAllow:    allowedTools,
+		AdditionalDirs:     additionalDirs,
+		WorkspaceRoot:      workspaceRoot,
+		Stderr:             diagnostics.Writer(),
+		OnSessionRecovered: cliSessionRecoveredHandler(leases),
+	}
 	ctrl, err := setupProfileWithOverrides(ctx, *model, *maxSteps, false, sink, profile, overrides)
 	if err != nil && errors.Is(err, boot.ErrUnknownModel) && isInteractive() && config.SourcePath() == "" {
 		// True first run whose default model can't resolve: guide setup, then retry.

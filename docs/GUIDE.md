@@ -116,9 +116,10 @@ tool_timeout_seconds = { "generate_video" = 1800 }   # optional raw MCP tool nam
 
 For the full schema and every field's contract, see [`SPEC.md` §5](./SPEC.md#5-configuration-toml).
 
-Newly installed or explicitly authorized MCP servers need no per-tool reader
-list. Their non-destructive `readOnlyHint` tools are available to planner and
-read-only sub-agent registries automatically.
+Installed and project-configured MCP servers need no per-tool trust
+list. The dedicated two-model Planner may use every non-destructive MCP tool,
+even when the server omits `readOnlyHint`; strict read-only sub-agents still
+require `readOnlyHint: true` and no `destructiveHint`.
 
 `[agent].plan_mode_read_only_commands` is also retained for config round trips,
 but the main Plan workflow no longer has a separate bash allowlist or trust
@@ -392,15 +393,17 @@ events.
 The injected hook context is dynamic current-turn context. It does not change
 the stable system prompt, memory prefix, or tool schema, though dynamic content
 can still reduce cache reuse for that turn. The detailed desktop hook schema and
-trust model are documented in [the Chinese desktop hooks guide](./DESKTOP_HOOKS.zh-CN.md).
+loading model are documented in [the Chinese desktop hooks guide](./DESKTOP_HOOKS.zh-CN.md).
 
 ## Keyboard shortcuts
 
 Shortcuts are documented by client because users usually look for the keys that
 work in the surface they are using. Desktop keeps its Plan toggle, while the CLI
-cycles Ask, Auto, and Plan with `Shift+Tab`. `Ctrl/Cmd+Y` controls YOLO, and
-desktop paste stays on the platform paste key. In the CLI, terminal-native text
-paste and application-owned image paste use separate shortcuts.
+cycles Ask, Auto, and Plan with `Shift+Tab`. Desktop uses `Cmd+Y` on macOS or
+`Ctrl+Y` elsewhere for YOLO by default. If YOLO is rebound on Windows/Linux,
+`Ctrl+Y` becomes the standard composer redo fallback. Desktop paste stays on the
+platform paste key; in the CLI, terminal-native text paste and
+application-owned image paste use separate shortcuts.
 
 `[ui].shortcut_layout` is still accepted for old configs, but the shortcut
 behavior below is unified across layouts.
@@ -413,8 +416,10 @@ setting does not change desktop or web text fields.
 
 ### Desktop GUI
 
-Desktop shortcuts are managed from **Settings → Shortcuts**. Pick a row, press a
-new key combination, and Reasonix saves it for the desktop app. Conflicting
+Desktop shortcuts are managed from **Settings → Shortcuts**. Pick a configurable
+row, press a new key combination, and Reasonix saves it for the desktop app.
+Standard editing shortcuts such as Undo and Redo are shown as locked rows because
+the WebView's native text history uses those platform chords. Conflicting
 bindings are rejected so one shortcut never triggers two actions. Press `?` or
 use the help button in the topic bar to open the shortcuts sheet; it is generated
 from the same shortcut registry, so it reflects any custom bindings.
@@ -439,7 +444,9 @@ Composer shortcuts:
 | `Enter` | Sends the current message | IME composition confirmation is left alone. |
 | `Shift+Enter` | Inserts a newline | The composer keeps focus. |
 | `Shift+Tab` | Toggles Plan on/off | Plan changes the workflow instruction; built-in writers keep the active Ask/Auto/YOLO and Sandbox boundary, while MCP writer/destructive targets stay hard-blocked for the whole planning phase. |
-| `Cmd+Y` / `Ctrl+Y` | Toggles YOLO on/off | Turning YOLO off restores the previous Ask/Auto base when known. |
+| `Cmd+Z` on macOS, `Ctrl+Z` on Windows/Linux | Undoes the latest composer edit | Native typing stays in the WebView history; Reasonix-managed paste, cut, folded blocks, and structured tokens are restored as complete transactions. |
+| `Cmd+Shift+Z` on macOS, `Ctrl+Shift+Z` on Windows/Linux | Redoes the latest composer edit | On Windows/Linux, `Ctrl+Y` is also accepted after the YOLO shortcut has been rebound. |
+| `Cmd+Y` / `Ctrl+Y` (default) | Toggles YOLO on/off | Turning YOLO off restores the previous Ask/Auto base when known. The current binding is shown in **Settings → Shortcuts**. |
 | `Cmd+V` on macOS, `Ctrl+V` on Windows/Linux | Pastes clipboard content | Clipboard images are attached; images can also be dropped into the composer. |
 | Plain `Up` / `Down` at the prompt boundary | Recalls older or newer submitted prompts | Modified arrows and native text navigation stay with the textarea. |
 | `Esc` while a turn is running | Cancels the running turn | If the turn has not produced a response yet, the draft is restored. |
@@ -594,7 +601,7 @@ channel.
 ## Capability diagnostics
 
 Use this when a skill, slash command, hook, plugin package, MCP server, or
-`AGENTS.md` is missing, shadowed, untrusted, or fails to start. Full flag
+`AGENTS.md` is missing, shadowed, disabled, or fails to start. Full flag
 reference, JSON schema, and issue codes:
 **[Capability diagnostics](./CAPABILITY_DIAGNOSTICS.md)**.
 
@@ -639,17 +646,22 @@ as manual setup instead of being installed with an incomplete configuration;
 query-specific cached results remain available during a registry outage.
 
 The normal setup path is intentionally one step. Use Desktop's **Add and
-connect**, `/mcp add`, or ask Reasonix to install a package, URL, or `.mcp.json`.
-That explicit install is also authorization: the server is saved and connected
-in the current session, and no second trust step appears now or on the next
-startup. Explicit deny rules still win. The installed server's calls run
-directly, including tools that declare
-`destructiveHint`. Plan/read-only sub-agents still expose only eligible tool
-identities. A server merely discovered in repository-controlled
-`reasonix.toml` or `.mcp.json` is different: Reasonix asks once to confirm the
-exact command or endpoint, records that decision without launching a temporary
-inspection process, then starts the server once. It reconnects automatically
-while that value is unchanged and asks again only after a change.
+connect**, `/mcp add`, or ask Reasonix to install a package or URL. These
+explicit installs are saved to the user-global `config.toml` and are also
+authorization: the server connects in the current session, and no second trust
+step appears now or on the next startup. Servers declared by the current
+project's `reasonix.toml` or `.mcp.json` remain in that project and are trusted
+without a separate launch confirmation. Explicit deny rules still win. The
+server's calls run
+directly, including tools that declare `destructiveHint`. The dedicated Planner
+still refuses destructive tools, and strict read-only sub-agents still expose
+only hinted non-destructive readers.
+
+MCP names are resolved once per workspace. Project declarations override
+same-name global installs; inside a project, `reasonix.toml` overrides
+`.mcp.json`. Editing updates the effective declaration in its original file,
+and removing a higher-priority declaration reveals the next one instead of
+deleting every same-name entry.
 
 stdio servers keep one process for initialize, reads, and writes, so stateful
 servers such as browsers retain sessions and open pages. Because an OS sandbox
@@ -659,14 +671,15 @@ are dispatch policy, not a second per-call process sandbox.
 
 Tools surface to the model as `mcp__<server>__<tool>`. A tool declaring MCP's
 `readOnlyHint: true` joins parallel dispatch and the strict read-only tool
-surfaces. Installing a server, or confirming an exact
-repository-provided server once, authorizes its non-destructive reader metadata;
-those tools are also available to the dedicated planner and read-only research
-sub-agents without another per-tool setting. Tools without the hint remain
-write-capable. While planning, built-in
-writers keep the ordinary permission posture; installed MCP and proxy-resolved
-MCP writers, destructive targets, and readers from unauthorized servers are hard-blocked before
-any approval and become directly usable once Plan exits.
+surfaces. Installing a server or declaring it in project configuration
+authorizes the dedicated Planner to use all of its non-destructive
+tools without another per-tool setting; strict read-only research sub-agents
+receive only hinted non-destructive readers. Tools without the hint remain
+write-capable for scheduling and mutation accounting. While planning, built-in
+writers keep the ordinary permission posture. The dedicated Planner permits
+authorized non-destructive MCP (including opaque writers) but hard-blocks
+destructive or unauthorized targets; a single-model Plan without that dedicated
+Planner keeps the older writer/destructive block until Plan exits.
 
 Installing an MCP server is the authorization decision. After installation, all
 of its tools run directly without a second server-level, per-tool, writer, or
@@ -897,16 +910,48 @@ planner_model = "deepseek-pro"   # used as the low-frequency planner
 
 The planner sees loaded `REASONIX.md` / `AGENTS.md` memory and a small read-only
 research tool set, so it can inspect relevant files before handing a plan to the
-executor. Writer and workflow tools remain executor-only. Reasonix manages
-normal execution automatically: if an active todo produces no new completion,
-unique read, command, or mutation for 8 tool-call rounds, the host asks the
-executor to reassess. After 16 no-progress rounds it pauses with saved work that
-can be resumed in the next user turn. Exact repeats do not count as progress;
-new host-observed work renews the lease. Two-level task lists keep the same
-single-current contract: the active level-1 sub-step is the one `in_progress`
-item while its level-0 phase stays `pending`; sub-steps are worked and signed
-off in order, and once every sub-step has completed the phase itself becomes
-`in_progress` for its own final sign-off.
+executor. Writer and workflow tools remain executor-only.
+
+Reasonix routes each turn deterministically without another classifier model:
+questions, short follow-ups, clear atomic edits, and bounded read-only actions
+go straight to the executor; bounded implementation work may receive a short
+light plan. Ambiguous, cross-surface, structured, high-risk, active-Goal, or
+Delivery work receives a full plan unless the request is clearly atomic or
+read-only. Explicit Plan Mode
+remains a separate host workflow and is never planned twice. An explicit
+`plan first` / `先规划` request forces planning, while `just do it` / `直接改`
+goes directly to the executor. Execution boundaries are recognized across the
+request, not only at its beginning, while quoted examples are ignored. Bare
+plan-first requests continue from the planner to the executor automatically.
+Requests that explicitly say to wait for confirmation pause at the host
+approval boundary and continue to the executor after approval. Only an
+explicit `plan only` / `不要执行` request ends the
+current turn with the plan persisted and no execution; a later user instruction
+can continue in the same session. The phase detail records a privacy-safe route,
+depth, and reason code for diagnosis without logging the user prompt.
+
+Light plans contain a compact objective, at most four ordered steps, likely
+touchpoints, and the main verification. Full plans distinguish verified from
+candidate touchpoints and add relevant non-goals, risks, acceptance criteria,
+command-level verification, and rollback guidance when the operation is hard to
+reverse. These contracts are part of one stable planner system prompt; only the
+small per-turn depth instruction is appended to the user turn, preserving the
+planner's prefix cache after the one-time prompt upgrade. The host also gives
+light and full research different per-turn round budgets. If a planner still
+does not finalize after its bounded research and finalization round, ordinary
+plan-and-execute work continues with the executor using the original task.
+Plan-only and approval-gated requests remain fail-closed, and the incomplete
+planner turn is rolled back instead of leaving an unusable continuation tail.
+
+Reasonix manages normal execution automatically: if an active todo produces no
+new completion, unique read, command, or mutation for 8 tool-call rounds, the
+host asks the executor to reassess. After 16 no-progress rounds it pauses with
+saved work that can be resumed in the next user turn. Exact repeats do not count
+as progress; new host-observed work renews the lease. Two-level task lists keep
+the same single-current contract: the active level-1 sub-step is the one
+`in_progress` item while its level-0 phase stays `pending`; sub-steps are worked
+and signed off in order, and once every sub-step has completed the phase itself
+becomes `in_progress` for its own final sign-off.
 
 Existing `[agent].max_steps` and `planner_max_steps` keys remain syntactically
 accepted during upgrades, but their values are ignored and removed with a
@@ -940,13 +985,11 @@ required; loading the full `skills` source in Plan is allowed, and subsequent
 writer calls still pass through Permissions/Sandbox.
 
 Every strict read-only child is built through one shared construction
-pairing — `RunReadOnlySubAgentWithSession` for batch children and
-`NewReadOnlyAgent` for the interactive two-model planner — which marks the
-child permanently read-only and applies a final registry filter. The filter
+pairing — `RunReadOnlySubAgentWithSession` / `NewReadOnlyAgent` — which marks
+the child permanently read-only and applies a final registry filter. The filter
 removes writers, destructive MCP targets, readers from unauthorized servers,
-and every host-mutating tool. A user-installed server is authorized immediately;
-a repository-declared server becomes eligible after its exact identity is
-confirmed once. Eligible readers may still start on demand. These are
+and every host-mutating tool. User-installed and project-configured servers are
+authorized immediately. Eligible readers may still start on demand. These are
 the strict read-only entrances:
 
 | Entrance | Purpose |
@@ -957,7 +1000,31 @@ the strict read-only entrances:
 | `read_only_skill` | The same isolation driving an existing skill |
 | `reasonix review` (CLI) | Read-only review of a diff or branch |
 | Desktop preview/review subagents | Read-only desktop analysis surfaces |
-| Two-model planner | The dedicated planner's read-only registry |
+
+The interactive two-model Planner uses a dedicated construction path
+(`NewPlannerAgent`): it still blocks bash, file writers, and ordinary writers,
+but may call authorized, non-destructive MCP through the fixed
+`use_capability` proxy without requiring `readOnlyHint`. Direct `mcp__*`
+schemas never enter the Planner tool list, so MCP install/connect churn does
+not change the Planner cache prefix after the one-time schema upgrade. Missing
+`readOnlyHint` no longer blocks the Planner; tools with `destructiveHint` are
+zero-exec and should be written into the plan for the Executor.
+In Balanced two-model sessions the Executor has its own frontend for the same
+stable proxy, so an `auto_start=false` or destructive capability discovered by
+the Planner remains callable by capability ID after handoff. Planner and
+Executor ledgers/audits stay isolated and only the Host connection is shared.
+
+Ordinary `task` / `fleet` sub-agents also get the same fixed proxy (session-
+shared Host and connections, per-agent frontend/ledger) and may call installed
+or project-configured MCP without `readOnlyHint`. Those calls use the trusted
+MCP permission path (live authorization plus explicit deny only); writer and
+destructive calls are still serialized, recorded as mutations, and subject to
+Delivery evidence/lease guards rather than Planner handoff. Strict
+`read_only_task` / `read_only_skill` / review sub-agents share the stable proxy
+schema and connection reuse but keep the strict execution gate
+(`authorized && readOnlyHint && !destructiveHint`). Profile `allowed-tools`
+MCP names convert to capability-id allowlists on the proxy; children never
+inherit dynamic `mcp__*` schemas.
 
 Inside a strict child, `use_capability` re-checks the resolved target before
 commit/permission/hooks/execution. An unconnected eligible MCP reader may start
@@ -966,12 +1033,13 @@ on demand from the current schema cache. Before `tools/call`, cached
 initialize/tools-list result; a reader-to-writer change or destructive promotion
 means zero executions and a normal retry through the current boundary. A
 schema-only change refreshes the cache for the next session without interrupting
-the authorized call. An unauthorized server cannot raise privileges there. This
-is a stricter layer than the main Plan workflow: Plan hard-blocks MCP
-writer/destructive targets for the entire planning phase — no approval can
-release them until Plan exits — while built-in writers keep
-Permissions/Sandbox, whereas a strict read-only child never exposes writers at
-all.
+the authorized call. Runtime enablement, authorization, and the complete
+connection identity are checked again immediately before dispatch, so a
+same-name client from another project/tab cannot be reused accidentally. An
+unauthorized server cannot raise privileges there. This strict-child boundary
+is narrower than the dedicated Planner: the Planner accepts authorized opaque
+non-destructive MCP, while a strict child requires an explicit reader hint and
+never exposes writers at all.
 
 Choose the startup runtime profile with
 `--profile economy|balanced|delivery` (for example, `reasonix run --profile
@@ -980,7 +1048,11 @@ read/bash/edit/write, background-shell lifecycle controls, `ask`, and
 `connect_tool_source`. Dedicated search/file/workflow tools, session history,
 memory mutation, slash commands, Skills, MCP, LSP, web access, installation, and
 subagents are connected only when the task needs them. Balanced is the default
-with the complete tool surface. Delivery keeps that complete surface,
+with the complete tool surface; when a distinct Planner is configured, both
+Planner and Executor add the fixed `use_capability` proxy. The proxy schema is
+stable, but the Balanced Executor deliberately retains direct `mcp__*` tools,
+so its overall provider tool prefix may still change when those direct tools
+are installed, connected, or refreshed. Delivery keeps that complete surface,
 adds one stable proxy tool (`use_capability`) for on-demand MCP inspect/call
 without schema churn, and adds a stable contract to establish acceptance
 criteria, fix root causes, verify the result, and review the final diff. The

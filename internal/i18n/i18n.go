@@ -51,6 +51,7 @@ type Messages struct {
 	ChatTip             string // tip line under the chat banner
 	TurnCancelled       string // shown when Ctrl-C aborts the in-flight turn but the chat keeps running
 	InterruptedRecovery string // replay notice for a durable interrupted turn
+	RecoveryPaused      string // controlled Auto retry pause; user can continue in the next message
 	NoSessionToResume   string // shown when --continue / --resume finds nothing
 	ResumeRequiresTTY   string // shown when --resume runs piped instead of on a terminal
 	PickSessionLabel    string // header on the --resume picker
@@ -92,6 +93,7 @@ type Messages struct {
 	ChatStatusCacheAvgFmt                  string // cache status tag, "%s" = session-average hit rate with percent sign
 	ChatStatusPlanApproval                 string // shortcuts hint while a plan is pending
 	PlanApprovalPrompt                     string // one-line "plan above is ready" banner shown above the input
+	PlanApprovalChoices                    string // start / revise / exit-without-executing choice list
 	ChatStatusToolApproval                 string // shortcuts hint while a tool call awaits approval
 	ToolApprovalPromptFmt                  string // approval banner — tool, subject suffix, source/intent detail, choices
 	ToolApprovalChoices                    string // standard approval choice list
@@ -266,7 +268,6 @@ type Messages struct {
 	ArgMcpList          string // /mcp list
 	ArgMcpConnected     string // /mcp remove <server> tag
 	ArgHooksList        string // /hooks list
-	ArgHooksTrust       string // /hooks trust
 	ArgModelCurrent     string // /model <ref> active tag
 	ArgEffortAuto       string // /effort auto
 	ArgEffortLow        string // /effort low

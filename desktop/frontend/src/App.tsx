@@ -1548,6 +1548,9 @@ export default function App() {
       ? planRevisionInsertRequest.request
       : null;
   const composerInsertRequest = activeTabId ? composerInsertRequestsByTab[activeTabId] ?? null : null;
+  const handleRevisionActiveChange = useCallback((active: boolean) => {
+    setWorkspaceInsertTarget(active ? "planRevision" : "composer");
+  }, []);
   const selectedTextRequest = activeTabId ? selectedTextRequestsByTab[activeTabId] ?? null : null;
   const prefillSubagentCommand = useCallback((command: string) => {
     if (!activeTabId) return;
@@ -1623,7 +1626,12 @@ export default function App() {
   const toolApprovalMode = composerProfile.toolApprovalMode;
   const tokenMode: TokenMode = composerProfile.tokenMode;
   const runtimeTransitioning = Boolean(activeTabId && runtimeTransitionsByTab[activeTabId]) || workbenchTargetTransitioning(workbenchTarget);
-  const controllerReady = state.meta?.ready === true && !state.backendActivationPending && !runtimeTransitioning;
+  const controllerReady =
+    state.meta?.ready === true &&
+    (!state.meta.runtime || state.meta.runtime.phase === "ready") &&
+    !state.meta.startupErr &&
+    !state.backendActivationPending &&
+    !runtimeTransitioning;
   // Single footer decision surface. Composer stays mounted underneath and is
   // only visually/a11y-hidden so per-session draft caches survive.
   const decisionSurface = useMemo((): DecisionSurfaceKind | null => {
@@ -1825,10 +1833,12 @@ export default function App() {
   // controller silently uses normal gating.
   const switchModel = useCallback(
     async (name: string) => {
-      await setModel(name);
+      const switched = await setModel(name);
+      if (!switched) return false;
       await setControllerCollaborationMode(controllerComposerProfileCollaborationMode(composerProfile));
       await setControllerToolApprovalMode(toolApprovalMode);
       if (goal.trim()) await setControllerGoal(goal);
+      return true;
     },
     [composerProfile, goal, setControllerCollaborationMode, setControllerGoal, setControllerToolApprovalMode, setModel, toolApprovalMode],
   );
@@ -2888,7 +2898,13 @@ export default function App() {
     const sourceTab = tabMetas.find((tab) => tab.id === sourceTabId);
     if (!sourceTab) throw new Error(t("composer.workspaceStarting"));
     if (sourceTab.readOnly) throw new Error(t("composer.readOnlyChannel"));
-    if (sourceTab.ready === false) throw new Error(t("composer.workspaceStarting"));
+    if (
+      sourceTab.ready !== true ||
+      (sourceTab.runtime && sourceTab.runtime.phase !== "ready") ||
+      sourceTab.startupErr
+    ) {
+      throw new Error(sourceTab.runtime?.issue?.message || sourceTab.startupErr || t("composer.workspaceStarting"));
+    }
     const rs = rewindStatesByTabRef.current[sourceTabId];
     if (rs) {
       setRewindStateForTab(sourceTabId, null);
@@ -4212,7 +4228,7 @@ export default function App() {
                 tabId={activeTabId}
                 workspaceScopeKey={workspaceScopeKey}
                 insertRequest={activePlanRevisionInsertRequest}
-                onRevisionActiveChange={(active) => setWorkspaceInsertTarget(active ? "planRevision" : "composer")}
+                onRevisionActiveChange={handleRevisionActiveChange}
                 onAnswer={async (allow, session, persist) => {
                   // Approving an exit_plan_mode plan leaves plan mode; await the
                   // mode switch before sending the approval so the controller

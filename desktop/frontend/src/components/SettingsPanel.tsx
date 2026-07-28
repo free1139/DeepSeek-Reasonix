@@ -182,6 +182,7 @@ export function SettingsPanel({
       const result = await fn();
       const next = await reload();
       onChanged(next);
+      window.dispatchEvent(new Event("reasonix:model-catalog-changed"));
       if (typeof result === "string" && result.trim()) {
         setWarning(result.trim());
       }
@@ -198,6 +199,7 @@ export function SettingsPanel({
       await fn();
       const next = await reload();
       onChanged(next);
+      window.dispatchEvent(new Event("reasonix:model-catalog-changed"));
     } catch (e) {
       setErr(formatSettingsError(e, t));
     }
@@ -6390,31 +6392,12 @@ function HooksSection({ onChanged }: { onChanged: (settings?: SettingsView | nul
       setBusy(false);
     }
   };
-  const trustProject = async () => {
-    const projectRoot = view?.projectRoot?.trim() ?? "";
-    if (!projectRoot) {
-      setErr(t("settings.hooksProjectRootUnavailable"));
-      return;
-    }
-    setBusy(true);
-    setErr(null);
-    try {
-      await app.TrustProjectHooksForRoot(projectRoot);
-      await load("project");
-      onChanged();
-    } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <>
       {err && <div className="banner banner--error">{err}</div>}
       <SettingsSection title={t("settings.hooksScopeSection")} description={t("settings.hooksScopeHint")}>
         <SettingsField label={t("settings.hooksScopeField")}>
-          <select className="mem-select set-grow" value={scope} disabled={busy} onChange={(e) => setScope(e.target.value === "project" ? "project" : "global")}>
+          <select name="hooks-scope" className="mem-select set-grow" value={scope} disabled={busy} onChange={(e) => setScope(e.target.value === "project" ? "project" : "global")}>
             <option value="global">{t("settings.hooksGlobal")}</option>
             <option value="project">{t("settings.hooksProject")}</option>
           </select>
@@ -6430,19 +6413,6 @@ function HooksSection({ onChanged }: { onChanged: (settings?: SettingsView | nul
             {pathMessage && <div className="hooks-path-display__message">{pathMessage}</div>}
           </div>
         </SettingsField>
-        {scope === "project" && (
-          <SettingsField label={t("settings.hooksTrust")} hint={t("settings.hooksTrustHint")}>
-            <div className="hooks-trust-stack">
-              <div className="hooks-trust-row">
-                <span className={`set-rule${view?.trusted ? "" : " set-rule--warn"}`}>{view?.trusted ? t("settings.hooksTrusted") : t("settings.hooksUntrusted")}</span>
-                <button className="btn btn--small" disabled={busy || view?.trusted || !view?.projectRoot} onClick={() => void trustProject()}>{t("settings.hooksTrustProject")}</button>
-              </div>
-              <code className={`hooks-trust-root${view?.projectRoot ? "" : " hooks-trust-root--empty"}`} title={view?.projectRoot || t("settings.hooksProjectRootUnavailable")}>
-                {view?.projectRoot || t("settings.hooksProjectRootUnavailable")}
-              </code>
-            </div>
-          </SettingsField>
-        )}
       </SettingsSection>
 
       <SettingsSection
@@ -6466,6 +6436,7 @@ function HooksSection({ onChanged }: { onChanged: (settings?: SettingsView | nul
               </div>
             </div>
             <textarea
+              name="hooks-json"
               className="mem-textarea hooks-json-panel__textarea"
               value={jsonText}
               disabled={busy}
@@ -6711,14 +6682,18 @@ function UpdatesSection({
   applySettings: (fn: () => Promise<void>) => Promise<void>;
 }) {
   const t = useT();
-  const { status, check, download: downloadUpdate, install: installUpdate } = useUpdater();
+  const { status, check, download: downloadUpdate, install: installUpdate, openDownload } = useUpdater();
   const [version, setVersion] = useState("");
   useEffect(() => {
     app.Version().then(setVersion).catch(() => {});
   }, []);
 
   const updaterBusy =
-    status.kind === "checking" || status.kind === "downloading" || status.kind === "verifying" || status.kind === "installing";
+    status.kind === "checking" ||
+    status.kind === "downloading" ||
+    status.kind === "verifying" ||
+    status.kind === "authorizing" ||
+    status.kind === "installing";
 
   return (
     <SettingsSection title={t("updater.title")}>
@@ -6787,13 +6762,33 @@ function UpdatesSection({
       {status.kind === "downloaded" && (
         <SettingsField label={t("updater.downloaded", { v: status.info.latest })}>
           <button className="btn btn--primary btn--small" onClick={installUpdate}>
-            {t("updater.restartInstall")}
+            {status.info.requiresElevation || status.info.installMode === "deb"
+              ? t("updater.authorizeInstall")
+              : t("updater.restartInstall")}
           </button>
         </SettingsField>
       )}
-      {status.kind === "installing" && <div className="mem-hint">{t("updater.installing")}</div>}
+      {status.kind === "authorizing" && <div className="mem-hint">{t("updater.authorizing")}</div>}
+      {status.kind === "installing" && (
+        <div className="mem-hint">
+          {status.info?.requiresElevation || status.info?.installMode === "deb"
+            ? t("updater.installingPackage")
+            : t("updater.installing")}
+        </div>
+      )}
       {status.kind === "done" && <div className="mem-hint">{t("updater.done")}</div>}
-      {status.kind === "error" && <div className="banner banner--error">{t("updater.failed", { msg: status.message })}</div>}
+      {status.kind === "error" && (
+        <div className="banner banner--error">
+          {t("updater.failed", { msg: status.message })}
+          {status.manualHint && (
+            <div className="mem-hint">
+              <button className="btn btn--small" onClick={openDownload}>
+                {t("updater.goToDownload")}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
       {configPath && (
         <Tooltip label={configPath} fill block className="mem-hint settings-config-path">
           {t("settings.config", { path: configPath })}

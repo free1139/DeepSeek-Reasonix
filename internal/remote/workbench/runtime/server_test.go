@@ -33,6 +33,7 @@ import (
 type fakeController struct {
 	model   string
 	history []provider.Message
+	status  control.RuntimeStatus
 }
 
 type blockingController struct {
@@ -253,7 +254,10 @@ func (c *fakeController) History() []provider.Message {
 	return append([]provider.Message(nil), c.history...)
 }
 func (c *fakeController) Turn() int     { return len(c.history) }
-func (c *fakeController) Running() bool { return false }
+func (c *fakeController) Running() bool { return c.status.Running }
+func (c *fakeController) RuntimeStatus() control.RuntimeStatus {
+	return c.status
+}
 func (c *fakeController) Submit(input string) {
 	c.history = append(c.history, provider.Message{Role: provider.RoleUser, Content: input})
 }
@@ -332,6 +336,30 @@ func TestHistoryPageCapsAndPaginatesByVisibleUserTurns(t *testing.T) {
 	}
 	if len(older.Messages) != 101 || older.Messages[0].Role != "system" {
 		t.Fatalf("older messages = %d first=%+v", len(older.Messages), older.Messages[0])
+	}
+}
+
+func TestHistoryPagePreservesResolvedCapabilityMetadata(t *testing.T) {
+	resolvedReadOnly := false
+	history := []provider.Message{
+		{Role: provider.RoleUser, Content: "update the database"},
+		{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{
+			ID: "call-1", Name: "use_capability",
+			Arguments:        `{"action":"call","capability_id":"mcp-tool:db/write"}`,
+			ResolvedName:     "mcp__db__write",
+			CapabilityID:     "mcp-tool:db/write",
+			ResolvedReadOnly: &resolvedReadOnly,
+		}}},
+		{Role: provider.RoleTool, ToolCallID: "call-1", Name: "use_capability", Content: "done"},
+	}
+	page := historyPage(&session{ctrl: &fakeController{model: "model", history: history}}, "snapshot_test", 0, protocol.HistoryMaxTurns)
+	if len(page.Messages) != 3 || len(page.Messages[1].ToolCalls) != 1 {
+		t.Fatalf("history page = %+v", page)
+	}
+	call := page.Messages[1].ToolCalls[0]
+	if call.ResolvedName != "mcp__db__write" || call.CapabilityID != "mcp-tool:db/write" ||
+		call.ResolvedReadOnly == nil || *call.ResolvedReadOnly {
+		t.Fatalf("resolved capability metadata = %+v", call)
 	}
 }
 
@@ -652,6 +680,98 @@ func TestRuntimeRestoresSessionRegistryAfterProcessRestart(t *testing.T) {
 	}
 }
 
+func TestRuntimeSessionLeaseBlocksConcurrentRestoreAndReleasesOnClose(t *testing.T) {
+	workspace := t.TempDir()
+	sessionDir := filepath.Join(t.TempDir(), "sessions")
+	registryPath := filepath.Join(t.TempDir(), "remote-sessions.json")
+	build := func(_ context.Context, model string, _ *string, _ event.Sink) (SessionController, error) {
+		return &persistentFakeController{
+			fakeController: &fakeController{model: model},
+			sessionDir:     sessionDir,
+		}, nil
+	}
+	first := New(Options{
+		Workspace: workspace, SessionDir: sessionDir, RegistryPath: registryPath,
+		BuildController: build,
+	})
+	model := "local/test-model"
+	created, err := first.create(context.Background(), protocol.SessionCreateParams{
+		HostMutation: protocol.HostMutation{ExpectedHostEpoch: first.hostEpoch},
+		WorkspaceID:  first.workspaceID,
+		Topic:        protocol.TopicSelection{Kind: protocol.TopicNew},
+		Profile:      protocol.ProfileSelection{Model: &model},
+	})
+	if err != nil {
+		t.Fatalf("create first runtime session: %v", err)
+	}
+	first.mu.Lock()
+	firstSession := first.sessions[created.Target.SessionID]
+	first.mu.Unlock()
+	if firstSession == nil {
+		t.Fatal("created session missing from first runtime")
+	}
+	path := firstSession.ctrl.SessionPath()
+	if lease, leaseErr := agent.TryAcquireSessionLease(path); !errors.Is(leaseErr, agent.ErrSessionLeaseHeld) {
+		if lease != nil {
+			lease.Release()
+		}
+		t.Fatalf("concurrent lease acquire err = %v, want ErrSessionLeaseHeld", leaseErr)
+	}
+
+	second := New(Options{
+		Workspace: workspace, SessionDir: sessionDir, RegistryPath: registryPath,
+		BuildController: build,
+	})
+	listed, err := second.list(context.Background(), protocol.SessionListParams{
+		ExpectedHostEpoch: second.hostEpoch,
+		WorkspaceID:       second.workspaceID,
+	})
+	if err != nil {
+		t.Fatalf("list while first runtime owns lease: %v", err)
+	}
+	if len(listed.Items) != 0 {
+		t.Fatalf("concurrent restore published sessions = %+v, want none", listed.Items)
+	}
+	if _, ok := second.dormant[created.Target.SessionID]; !ok {
+		t.Fatal("lease-blocked restore was not kept dormant")
+	}
+
+	first.snapshotAndClose()
+	listed, err = second.list(context.Background(), protocol.SessionListParams{
+		ExpectedHostEpoch: second.hostEpoch,
+		WorkspaceID:       second.workspaceID,
+	})
+	if err != nil {
+		t.Fatalf("list after first runtime released lease: %v", err)
+	}
+	if len(listed.Items) != 1 || listed.Items[0].Target.SessionID != created.Target.SessionID {
+		t.Fatalf("restored sessions = %+v, want %s", listed.Items, created.Target.SessionID)
+	}
+	second.mu.Lock()
+	restored := second.sessions[created.Target.SessionID]
+	second.mu.Unlock()
+	if restored == nil {
+		t.Fatal("second runtime did not restore the released session")
+	}
+
+	closed, err := second.closeSession(protocol.SessionCloseParams{SessionMutation: protocol.SessionMutation{
+		ExpectedHostEpoch:    second.hostEpoch,
+		Target:               second.target(created.Target.SessionID),
+		ExpectedRuntimeEpoch: restored.runtimeEpoch,
+	}})
+	if err != nil {
+		t.Fatalf("close restored runtime session: %v", err)
+	}
+	if closed.Disposition != protocol.SessionReleased {
+		t.Fatalf("close disposition = %q, want released", closed.Disposition)
+	}
+	lease, err := agent.TryAcquireSessionLease(path)
+	if err != nil {
+		t.Fatalf("lease was not released on close: %v", err)
+	}
+	lease.Release()
+}
+
 func TestRuntimeDefersRestoreWhenControllerBuilderReturnsTypedNil(t *testing.T) {
 	workspace := t.TempDir()
 	sessionDir := t.TempDir()
@@ -776,6 +896,117 @@ func TestSetProfileRegistryFailurePreservesUsableSession(t *testing.T) {
 	})
 }
 
+func TestSetProfileRejectsAllControllerActiveWork(t *testing.T) {
+	tests := []struct {
+		name   string
+		status control.RuntimeStatus
+	}{
+		{name: "foreground turn", status: control.RuntimeStatus{Running: true}},
+		{name: "pending prompt", status: control.RuntimeStatus{PendingPrompt: true}},
+		{name: "background job", status: control.RuntimeStatus{BackgroundJobs: 1}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			built := false
+			srv := New(Options{
+				Workspace: t.TempDir(), SessionDir: t.TempDir(),
+				BuildController: func(context.Context, string, *string, event.Sink) (SessionController, error) {
+					built = true
+					return nil, errors.New("replacement must not be built while work is active")
+				},
+			})
+			old := &profileFakeController{persistentFakeController: &persistentFakeController{
+				fakeController: &fakeController{model: "local/old", status: tc.status}, sessionDir: t.TempDir(),
+			}}
+			target := srv.installTestSession(old)
+			model := "local/new"
+			_, err := srv.setProfile(context.Background(), protocol.SessionProfileSetParams{
+				SessionMutation: protocol.SessionMutation{
+					ExpectedHostEpoch: srv.hostEpoch, Target: target, ExpectedRuntimeEpoch: "runtime_test",
+				},
+				Patch: protocol.ProfilePatch{Model: &model},
+			})
+			var remoteErr *protocol.RemoteError
+			if !errors.As(err, &remoteErr) || remoteErr.Code != protocol.ErrSessionBusy {
+				t.Fatalf("setProfile error = %v, want SESSION_BUSY", err)
+			}
+			if built || old.closed {
+				t.Fatalf("active controller lifecycle changed: built=%v oldClosed=%v", built, old.closed)
+			}
+		})
+	}
+}
+
+func TestSetProfileRechecksActiveWorkBeforeSwap(t *testing.T) {
+	var old *profileFakeController
+	var replacement *profileFakeController
+	sessionDir := t.TempDir()
+	srv := New(Options{
+		Workspace: t.TempDir(), SessionDir: sessionDir,
+		BuildController: func(_ context.Context, model string, _ *string, _ event.Sink) (SessionController, error) {
+			old.status.BackgroundJobs = 1
+			replacement = &profileFakeController{persistentFakeController: &persistentFakeController{
+				fakeController: &fakeController{model: model}, sessionDir: sessionDir,
+			}}
+			return replacement, nil
+		},
+	})
+	old = &profileFakeController{persistentFakeController: &persistentFakeController{
+		fakeController: &fakeController{model: "local/old"}, sessionDir: sessionDir,
+	}}
+	target := srv.installTestSession(old)
+	model := "local/new"
+	_, err := srv.setProfile(context.Background(), protocol.SessionProfileSetParams{
+		SessionMutation: protocol.SessionMutation{
+			ExpectedHostEpoch: srv.hostEpoch, Target: target, ExpectedRuntimeEpoch: "runtime_test",
+		},
+		Patch: protocol.ProfilePatch{Model: &model},
+	})
+	var remoteErr *protocol.RemoteError
+	if !errors.As(err, &remoteErr) || remoteErr.Code != protocol.ErrSessionBusy {
+		t.Fatalf("setProfile error = %v, want SESSION_BUSY", err)
+	}
+	srv.mu.Lock()
+	sess := srv.sessions[target.SessionID]
+	srv.mu.Unlock()
+	if replacement == nil || !replacement.closed || sess == nil || sess.ctrl != old || old.closed {
+		t.Fatalf("swap was not failure-atomic: replacementClosed=%v oldInstalled=%v oldClosed=%v", replacement != nil && replacement.closed, sess != nil && sess.ctrl == old, old.closed)
+	}
+}
+
+func TestCloseSessionRetainsPromptAndBackgroundWork(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status control.RuntimeStatus
+	}{
+		{name: "pending prompt", status: control.RuntimeStatus{PendingPrompt: true}},
+		{name: "background job", status: control.RuntimeStatus{BackgroundJobs: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := New(Options{Workspace: t.TempDir(), SessionDir: t.TempDir()})
+			old := &profileFakeController{persistentFakeController: &persistentFakeController{
+				fakeController: &fakeController{model: "local/old", status: tc.status}, sessionDir: t.TempDir(),
+			}}
+			target := srv.installTestSession(old)
+			result, err := srv.closeSession(protocol.SessionCloseParams{SessionMutation: protocol.SessionMutation{
+				ExpectedHostEpoch: srv.hostEpoch, Target: target, ExpectedRuntimeEpoch: "runtime_test",
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Disposition != protocol.SessionRetainedActive || old.closed {
+				t.Fatalf("close result = %+v, oldClosed=%v", result, old.closed)
+			}
+			srv.mu.Lock()
+			installed := srv.sessions[target.SessionID] != nil
+			srv.mu.Unlock()
+			if !installed {
+				t.Fatal("active session was removed")
+			}
+		})
+	}
+}
+
 func TestSessionRotationRegistryFailureReturnsCommittedEpoch(t *testing.T) {
 	newFixture := func(t *testing.T) (*Server, *session, *rotatingFakeController, protocol.RuntimeTarget, *strings.Builder) {
 		t.Helper()
@@ -786,6 +1017,7 @@ func TestSessionRotationRegistryFailureReturnsCommittedEpoch(t *testing.T) {
 			RegistryPath: t.TempDir(), // AtomicWriteFile cannot replace this directory.
 			Logger:       log,
 		})
+		t.Cleanup(srv.snapshotAndClose)
 		ctrl := &rotatingFakeController{
 			persistentFakeController: &persistentFakeController{
 				fakeController: &fakeController{model: "local/test", history: []provider.Message{{Role: provider.RoleUser, Content: "old"}}},
@@ -840,6 +1072,85 @@ func TestSessionRotationRegistryFailureReturnsCommittedEpoch(t *testing.T) {
 			t.Fatalf("registry failure was not logged: %q", log.String())
 		}
 	})
+}
+
+func TestSessionRotationLeaseFailureRetiresSession(t *testing.T) {
+	for _, operation := range []string{"new", "clear"} {
+		t.Run(operation, func(t *testing.T) {
+			sessionDir := t.TempDir()
+			srv := New(Options{
+				Workspace:    t.TempDir(),
+				SessionDir:   sessionDir,
+				RegistryPath: filepath.Join(t.TempDir(), "remote-sessions.json"),
+			})
+			t.Cleanup(srv.snapshotAndClose)
+
+			oldPath := filepath.Join(sessionDir, "old.jsonl")
+			rotatedPath := filepath.Join(sessionDir, operation+".jsonl")
+			ctrl := &rotatingFakeController{
+				persistentFakeController: &persistentFakeController{
+					fakeController: &fakeController{model: "local/test"},
+					sessionDir:     sessionDir,
+					sessionPath:    oldPath,
+				},
+				newPath: rotatedPath, clearPath: rotatedPath,
+			}
+			target := srv.installTestSession(ctrl)
+			srv.registryRead = true
+			srv.mu.Lock()
+			sess := srv.sessions[target.SessionID]
+			srv.subs["subscription_test"] = &subscription{sessionID: sess.id}
+			srv.mu.Unlock()
+
+			leases := control.NewSessionLeaseKeeper()
+			if err := leases.Rebind(oldPath); err != nil {
+				t.Fatalf("bind old session lease: %v", err)
+			}
+			sess.leases = leases
+			blocker, err := agent.TryAcquireSessionLease(rotatedPath)
+			if err != nil {
+				t.Fatalf("hold rotated session lease: %v", err)
+			}
+			t.Cleanup(blocker.Release)
+
+			previousEpoch := sess.runtimeEpoch
+			switch operation {
+			case "new":
+				_, err = srv.newSession(protocol.SessionNewParams{SessionMutation: protocol.SessionMutation{
+					ExpectedHostEpoch: srv.hostEpoch, Target: target, ExpectedRuntimeEpoch: previousEpoch,
+				}})
+			case "clear":
+				_, err = srv.clearSession(protocol.SessionClearParams{SessionMutation: protocol.SessionMutation{
+					ExpectedHostEpoch: srv.hostEpoch, Target: target, ExpectedRuntimeEpoch: previousEpoch,
+				}})
+			}
+			if err == nil {
+				t.Fatalf("%s session succeeded despite rotated-path lease conflict", operation)
+			}
+
+			srv.mu.Lock()
+			_, sessionExists := srv.sessions[sess.id]
+			_, subscriptionExists := srv.subs["subscription_test"]
+			srv.mu.Unlock()
+			if sessionExists || subscriptionExists {
+				t.Fatalf("retired session remains published: session=%v subscription=%v", sessionExists, subscriptionExists)
+			}
+			if !ctrl.closed {
+				t.Fatal("controller was not closed after lease failure")
+			}
+			if got := leases.HeldPath(); got != "" {
+				t.Fatalf("old lease remained held after retirement: %q", got)
+			}
+			oldLease, err := agent.TryAcquireSessionLease(oldPath)
+			if err != nil {
+				t.Fatalf("old session lease was not released after retirement: %v", err)
+			}
+			oldLease.Release()
+			if sess.runtimeEpoch != previousEpoch {
+				t.Fatalf("runtime epoch changed on failed rotation: got %q want %q", sess.runtimeEpoch, previousEpoch)
+			}
+		})
+	}
 }
 
 func TestTurnDoneClearsPendingPromptAndReplayEvents(t *testing.T) {
@@ -1208,6 +1519,7 @@ func TestRuntimeControllerUsesDesktopBrokerWithoutHostKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := New(Options{Workspace: workspace, Version: "test", SourceRevision: revision})
+	t.Cleanup(srv.snapshotAndClose)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	hostSide, desktopSide := net.Pipe()

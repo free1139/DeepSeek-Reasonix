@@ -82,15 +82,17 @@ func TestDesktopPackagesPreserveNativePlatformLaunchers(t *testing.T) {
 		`[ "$bundle_executable" = "$BINNAME" ]`,
 		`Print :CFBundleIconFile`,
 		`Contents/Resources/$bundle_icon`,
-		`cp "$portable" "$staging/$BINNAME.exe"`,
 		`-H windowsgui`,
 		`stamp_windows_executable "$guard_out" "Reasonix Guard"`,
 		`stamp_windows_executable "$launcher_out" "Reasonix Launcher"`,
 		`stamp_windows_executable "build/windows/installer/$UPDATE_HELPER" "Reasonix Update Helper"`,
-		`cp "$launcher_out" "$staging/${APPNAME}.exe"`,
-		`cp "$guard_out" "$staging/$GUARDNAME.exe"`,
-		`cp "build/windows/installer/$WINDOWS_CLINAME.exe" "$staging/$WINDOWS_CLINAME.exe"`,
-		`"$ROOT/scripts/verify-windows-portable.sh" "$staging"`,
+		`payload_dir="$ROOT/desktop/build/windows/signing-payload"`,
+		`cp "build/bin/$BINNAME.exe" "$payload_dir/$BINNAME.exe"`,
+		`cp "$launcher_out" "$payload_dir/$LAUNCHERNAME.exe"`,
+		`cp "$guard_out" "$payload_dir/$GUARDNAME.exe"`,
+		`cp "build/windows/installer/$WINDOWS_CLINAME.exe" "$payload_dir/$WINDOWS_CLINAME.exe"`,
+		`cp "build/windows/installer/reasonix-uninstall.exe" "$payload_dir/reasonix-uninstall.exe"`,
+		`"$ROOT/scripts/package-windows-desktop.sh" "$arch" "$payload_dir"`,
 		`"$BINNAME" "$GUARDNAME" "$CLINAME"`,
 	} {
 		if !strings.Contains(build, want) {
@@ -101,9 +103,9 @@ func TestDesktopPackagesPreserveNativePlatformLaunchers(t *testing.T) {
 		t.Fatal("macOS package must not replace the native Wails bundle executable with Guard")
 	}
 	launcherStamp := strings.Index(build, `stamp_windows_executable "$launcher_out" "Reasonix Launcher"`)
-	portableCopy := strings.Index(build, `cp "$launcher_out" "$staging/${APPNAME}.exe"`)
-	if launcherStamp < 0 || portableCopy < 0 || launcherStamp > portableCopy {
-		t.Fatalf("portable Reasonix.exe must copy the already-stamped launcher (stamp=%d copy=%d)", launcherStamp, portableCopy)
+	payloadCopy := strings.Index(build, `cp "$launcher_out" "$payload_dir/$LAUNCHERNAME.exe"`)
+	if launcherStamp < 0 || payloadCopy < 0 || launcherStamp > payloadCopy {
+		t.Fatalf("Windows payload must copy the already-stamped launcher (stamp=%d copy=%d)", launcherStamp, payloadCopy)
 	}
 	if strings.Contains(build, `"$staging/$CLINAME.exe"`) {
 		t.Fatal("Windows package must not collide reasonix.exe with the Reasonix.exe launcher")
@@ -151,12 +153,39 @@ func TestDesktopPackagesPreserveNativePlatformLaunchers(t *testing.T) {
 	}
 	for _, want := range []string{
 		"/usr/bin/reasonix",
+		"/usr/lib/reasonix/reasonix-update-helper",
+		"/usr/share/polkit-1/actions/io.reasonix.desktop.update.policy",
 		"/usr/share/applications/reasonix.desktop",
 		"/usr/share/pixmaps/reasonix-desktop.png",
 		"/usr/share/icons/hicolor/scalable/apps/reasonix-desktop.svg",
+		"pkexec",
 	} {
 		if !strings.Contains(nfpm, want) {
 			t.Errorf("Linux package missing desktop identity asset %q", want)
+		}
+	}
+	if _, err := os.Stat("build/linux/io.reasonix.desktop.update.policy"); err != nil {
+		t.Errorf("Polkit policy file missing: %v", err)
+	}
+	for _, want := range []string{
+		`./cmd/update-helper`,
+		`reasonix-update-helper`,
+		`deb_version=`,
+		`dpkg-deb --contents`,
+		`dpkg-deb --field`,
+	} {
+		if !strings.Contains(build, want) {
+			t.Errorf("desktop-build.sh missing Linux deb helper contract %q", want)
+		}
+	}
+	for _, unsafe := range []string{
+		`dpkg-deb --field "$deb_path" Package | grep -qx`,
+		`dpkg-deb --field "$deb_path" Version | grep -qx`,
+		`dpkg-deb --field "$deb_path" Depends | grep -Fq`,
+		`dpkg-deb --contents "$deb_path" | grep -Eq`,
+	} {
+		if strings.Contains(build, unsafe) {
+			t.Errorf("desktop-build.sh uses early-exit grep under pipefail: %q", unsafe)
 		}
 	}
 
@@ -167,6 +196,8 @@ func TestDesktopPackagesPreserveNativePlatformLaunchers(t *testing.T) {
 	windows := string(windowsData)
 	for _, want := range []string{
 		`File "/oname=${REASONIX_CLI}" "${REASONIX_CLI}"`,
+		`!uninstfinalize 'cmd.exe /C copy /Y "%1" "reasonix-uninstall.exe" >NUL'`,
+		`File "/oname=uninstall.exe" "${ARG_REASONIX_SIGNED_UNINSTALLER}"`,
 		`CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${REASONIX_LAUNCHER}" "launch --detach" "$INSTDIR\${PRODUCT_EXECUTABLE}" 0`,
 		`CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${REASONIX_LAUNCHER}" "launch --detach" "$INSTDIR\${PRODUCT_EXECUTABLE}" 0`,
 	} {

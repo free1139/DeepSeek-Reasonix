@@ -28,6 +28,7 @@ var ChineseTraditional = Messages{
 	ChatTip:             "對話上下文將跨輪保留。輸入 'exit' 或按 Ctrl-D 退出。",
 	TurnCancelled:       "已取消 — 回到提示符",
 	InterruptedRecovery: "本輪已中斷。部分輸出會永久保留供查看；只有完整工具呼叫及結果和有界恢復摘要會進入模型下一輪。繼續或回復前請先檢查目前工作區。",
+	RecoveryPaused:      "已暫停自動重試。Reasonix 已停止重複嘗試，並保留已完成的工作。傳送「繼續」即可開始新一輪，也可以補充要求來調整方向。",
 	NoSessionToResume:   "沒有可恢復的會話 — 用 `reasonix` 開一個新的",
 	ResumeRequiresTTY:   "--resume 需要互動式終端；用 --continue 直接恢復最近一次",
 	PickSessionLabel:    "恢復哪個會話？",
@@ -61,8 +62,9 @@ var ChineseTraditional = Messages{
 	ChatStatusBalanceLabel:                 "餘額",
 	ChatStatusCacheNowFmt:                  "本次命中 %s",
 	ChatStatusCacheAvgFmt:                  "平均 %s",
-	ChatStatusPlanApproval:                 "Enter/y 核准並執行 · n/Esc 繼續規劃 · PgUp/PgDn 捲動",
-	PlanApprovalPrompt:                     "計畫已生成（見上方）— Enter/y 核准執行,n/Esc 繼續規劃",
+	ChatStatusPlanApproval:                 "1 開始執行 · 2 修改計畫 · 3 暫不執行並退出 · n/Esc 繼續規劃 · PgUp/PgDn 捲動",
+	PlanApprovalPrompt:                     "計畫已生成（見上方）— 請選擇下一步操作",
+	PlanApprovalChoices:                    "1. 開始執行\n2. 修改計畫（繼續規劃）\n3. 暫不執行，退出計畫模式\n選擇 [1/2/3]（y 開始執行；n/Esc 繼續規劃）",
 	ChatStatusToolApproval:                 "1 本次允許 · 2 本會話允許此範圍 · 提供時 3/4 為前綴或儲存 · n/Esc 拒絕 · Ctrl-C 取消本輪",
 	AskTypeSomething:                       "自己輸入",
 	AskTypingHint:                          "輸入後按 Enter 確認",
@@ -264,7 +266,6 @@ var ChineseTraditional = Messages{
 	ArgMcpList:          "顯示已設定的伺服器",
 	ArgMcpConnected:     "已連線",
 	ArgHooksList:        "列出生效的 hooks",
-	ArgHooksTrust:       "信任本專案的 hooks",
 	ArgModelCurrent:     "當前",
 	ArgEffortAuto:       "使用模型預設值",
 	ArgEffortLow:        "較輕推理",
@@ -284,7 +285,7 @@ var ChineseTraditional = Messages{
 	ListSkillsHeaderFmt: "skills（%d 個）",
 	ListSkillsNone:      "暫無 skill — 呼叫內建的（如 /init），或用 install_skill 建立一個",
 	ListHooksHeaderFmt:  "hooks（生效 %d 個）",
-	ListHooksNone:       "無生效 hooks — 在 .reasonix/settings.json（專案，需信任後）或 <Reasonix home>/settings.json（全域）設定",
+	ListHooksNone:       "無生效 hooks — 在 .reasonix/settings.json（專案）或 <Reasonix home>/settings.json（全域）設定",
 	ListMcpHeader:       "MCP 伺服器",
 	ListMcpNone:         "未連線 MCP 伺服器 — 在 reasonix.toml（[[plugins]]）或專案 .mcp.json 中新增",
 
@@ -298,7 +299,7 @@ var ChineseTraditional = Messages{
 	QuickRememberEmpty:        "沒有要記錄的內容",
 	QuickRememberDoneFmt:      "已記住 → %s",
 	ModelSwitchUnavailable:    "本會話不支援切換模型",
-	ModelSwitchBusy:           "請先完成或取消當前這一輪再切換模型",
+	ModelSwitchBusy:           "請先完成或取消目前工作，並停止背景任務後再切換模型",
 	ModelAlreadyOnFmt:         "已經在使用 %s",
 	ModelSwitchingFmt:         "正在切換到 %s…",
 	ModelSwitchedFmt:          "已切換到 %s（會保留當前對話，但提示詞快取會重新計算）",
@@ -459,6 +460,7 @@ var ChineseTraditional = Messages{
   reasonix [--model NAME] [-c|--continue] [-r|--resume [QUERY]] [--permission-mode MODE] [--effort LEVEL] [--add-dir PATH]   互動式會話
   reasonix -p|--print [--model NAME] [--output-format text|json|stream-json] [--allowed-tools RULES] [--add-dir PATH] <task>
   reasonix run [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] [--output-format FORMAT] <task>
+  reasonix run --events-jsonl [--model NAME] <task>      輸出脫敏結構化事件 JSONL
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI 程式碼審查（基於本機 diff）
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  透過 HTTP+SSE 提供服務（支援可選認證）
   reasonix acp [--model NAME]                           透過 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
@@ -469,6 +471,11 @@ var ChineseTraditional = Messages{
   reasonix init                                         查看如何產生專案記憶（AGENTS.md）
   reasonix doctor [--json]                              輸出脫敏的本機診斷資訊
   reasonix doctor session <branch-id> [--zip] [--out PATH]  匯出會話衝突診斷 zip
+  reasonix session list --json [--dir PATH]             為機器客戶列出脫敏會話
+  reasonix session show|status <machine-session-id> --json [--dir PATH]  查詢單一脫敏會話
+  reasonix session recovery [<machine-session-id>] --json [--dir PATH]  查詢脫敏復原狀態
+  reasonix hook list|status --json [--dir PATH]         檢視脫敏 Hook 狀態
+  reasonix task list|show --json [--dir PATH]           檢視脫敏 Task 狀態
   reasonix bot start|doctor|weixin-login                多管道 IM bot 閘道
   reasonix upgrade [--check] [--force]                   自更新至最新版本（也可用：reasonix update）
   reasonix version

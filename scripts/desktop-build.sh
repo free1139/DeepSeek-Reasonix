@@ -9,8 +9,8 @@
 #            Reasonix-darwin-universal.dmg               (drag-to-install; human download)
 #   Windows: Reasonix-windows-<arch>-installer.exe       (NSIS per-user installer; updater channel)
 #            Reasonix-windows-<arch>.zip                 (portable human download)
-#   Linux:   Reasonix-linux-<arch>.tar.gz                (desktop + guard + CLI; updater channel)
-#            Reasonix-linux-<arch>.deb                   (Debian/Ubuntu package; human download)
+#   Linux:   Reasonix-linux-<arch>.tar.gz                (desktop + guard + CLI; portable updater)
+#            Reasonix-linux-<arch>.deb                   (Debian/Ubuntu package; native updater)
 #
 # Usage: scripts/desktop-build.sh <os/arch> <version> [channel]
 #   e.g. scripts/desktop-build.sh darwin/arm64 v1.1.0
@@ -126,6 +126,9 @@ if [ "$os" = windows ]; then
 	cli_out="$ROOT/desktop/build/windows/installer/$WINDOWS_CLINAME.exe"
 	build_cli
 	stamp_windows_executable "$cli_out" "Reasonix CLI" "$WINDOWS_CLINAME" "$WINDOWS_CLINAME.exe"
+	# The first NSIS pass must regenerate this release's uninstaller; a stale
+	# preserved file must never enter the signing payload.
+	rm -f "build/windows/installer/reasonix-uninstall.exe"
 fi
 build_args=()
 [ "${DESKTOP_BUILD_CLEAN:-1}" != "0" ] && build_args+=(-clean)
@@ -238,28 +241,19 @@ darwin)
 	rm -rf "$staging"
 	;;
 windows)
-	# `wails build -nsis` writes the installer under build/bin; its exact name
-	# varies, so glob for it and copy to a stable, platform-keyed name.
-	installer=$(ls build/bin/*installer*.exe 2>/dev/null | head -n1 || true)
-	[ -n "$installer" ] || { echo "no NSIS installer found in build/bin" >&2; exit 1; }
-	cp "$installer" "$ROOT/dist/${APPNAME}-windows-${arch}-installer.exe"
-	portable=$(find build/bin -maxdepth 1 -type f -name "*.exe" ! -name "*installer*.exe" | head -n1 || true)
-	[ -n "$portable" ] || { echo "no portable Windows exe found in build/bin" >&2; exit 1; }
-	staging=$(mktemp -d)
-	cp "$portable" "$staging/$BINNAME.exe"
-	helper="build/windows/installer/$UPDATE_HELPER"
-	if [ -f "$helper" ]; then
-		cp "$helper" "$staging/$UPDATE_HELPER"
-	fi
-	cp "$launcher_out" "$staging/${APPNAME}.exe"
-	cp "$launcher_out" "$staging/$LAUNCHERNAME.exe"
-	cp "$guard_out" "$staging/$GUARDNAME.exe"
-	cp "build/windows/installer/$WINDOWS_CLINAME.exe" "$staging/$WINDOWS_CLINAME.exe"
-	"$ROOT/scripts/verify-windows-portable.sh" "$staging"
-	staging_win=$(cygpath -w "$staging")
-	zip_win=$(cygpath -w "$ROOT/dist/${APPNAME}-windows-${arch}.zip")
-	powershell.exe -NoProfile -Command "Compress-Archive -Force -Path '$staging_win\\*' -DestinationPath '$zip_win'"
-	rm -rf "$staging"
+	# Keep one canonical flat payload for SignPath. The release workflow signs
+	# these files, then calls package-windows-desktop.sh again so both the
+	# portable archive and the files embedded by NSIS carry Authenticode.
+	payload_dir="$ROOT/desktop/build/windows/signing-payload"
+	rm -rf -- "$payload_dir"
+	mkdir -p "$payload_dir"
+	cp "build/bin/$BINNAME.exe" "$payload_dir/$BINNAME.exe"
+	cp "build/windows/installer/$UPDATE_HELPER" "$payload_dir/$UPDATE_HELPER"
+	cp "$launcher_out" "$payload_dir/$LAUNCHERNAME.exe"
+	cp "$guard_out" "$payload_dir/$GUARDNAME.exe"
+	cp "build/windows/installer/$WINDOWS_CLINAME.exe" "$payload_dir/$WINDOWS_CLINAME.exe"
+	cp "build/windows/installer/reasonix-uninstall.exe" "$payload_dir/reasonix-uninstall.exe"
+	"$ROOT/scripts/package-windows-desktop.sh" "$arch" "$payload_dir"
 	;;
 linux)
 	for desktop_contract in \
@@ -269,13 +263,34 @@ linux)
 		grep -F -x -q "$desktop_contract" build/linux/reasonix.desktop || { echo "Linux desktop entry missing: $desktop_contract" >&2; exit 1; }
 	done
 	tar -czf "$ROOT/dist/${APPNAME}-linux-${arch}.tar.gz" -C build/bin "$BINNAME" "$GUARDNAME" "$CLINAME"
-	# Also build a .deb for Debian/Ubuntu users (goreleaser/nfpm; see
-	# desktop/build/linux/nfpm.yaml). Human-download only: the Linux updater channel
-	# stays the tarball and cmd/sign's manifest skips .deb files. nfpm reads
-	# $DEB_VERSION/$DEB_ARCH — dpkg wants a strict numeric version, so reuse numver.
-	DEB_VERSION="$numver" DEB_ARCH="$arch" \
+	# Build the privileged update helper shipped inside the .deb. Portable tarball
+	# installs do not need it; only the dpkg package installs helper + Polkit policy.
+	echo "==> go build reasonix-update-helper"
+	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$VERSION" \
+		-o "build/bin/reasonix-update-helper" ./cmd/update-helper
+	# .deb for Debian/Ubuntu. Portable updater still uses the tarball under
+	# platforms[]; .deb is published under native_packages. Debian versions use
+	# "~" for prereleases so 1.18.0~rc.1 < 1.18.0 (policy version ordering).
+	# Extra "-" inside the prerelease label becomes "." (Debian policy).
+	ver_body="${VERSION#v}"
+	if [[ "$ver_body" == *-* ]]; then
+		deb_base="${ver_body%%-*}"
+		deb_pre="${ver_body#*-}"
+		deb_pre="${deb_pre//-/.}"
+		deb_version="${deb_base}~${deb_pre}"
+	else
+		deb_version="$ver_body"
+	fi
+	DEB_VERSION="$deb_version" DEB_ARCH="$arch" \
 		nfpm package --config build/linux/nfpm.yaml --packager deb \
 		--target "$ROOT/dist/${APPNAME}-linux-${arch}.deb"
+	# Contract smoke: helper, policy, package identity, and pkexec dependency.
+	deb_path="$ROOT/dist/${APPNAME}-linux-${arch}.deb"
+	dpkg-deb --field "$deb_path" Package | grep -x 'reasonix-desktop' >/dev/null
+	dpkg-deb --field "$deb_path" Version | grep -x "$deb_version" >/dev/null
+	dpkg-deb --field "$deb_path" Depends | grep -F 'pkexec' >/dev/null
+	dpkg-deb --contents "$deb_path" | grep -E 'usr/lib/reasonix/reasonix-update-helper' >/dev/null
+	dpkg-deb --contents "$deb_path" | grep -E 'usr/share/polkit-1/actions/io.reasonix.desktop.update.policy' >/dev/null
 	;;
 *)
 	echo "unsupported os: $os" >&2

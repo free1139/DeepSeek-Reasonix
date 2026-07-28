@@ -69,6 +69,20 @@ branch.
 
 ### Fixed
 
+- Fixed Desktop sessions incorrectly locking themselves during Goal + Delivery
+  mode changes, controller rebuilds, duplicate-tab restore, and background
+  reattachment. Desktop now keeps one process-local runtime owner per canonical
+  session, fences stale controller events by runtime epoch, blocks sends until
+  that runtime is ready, and scopes single-instance ownership to
+  `REASONIX_HOME` instead of the executable path. Switching saved sessions is
+  now transactional: a target build, restore, or lease failure leaves the
+  current controller, lease, path, mode profile, and runtime epoch untouched.
+- Stabilized the desktop rich composer caret after skill and plugin invocation
+  tags. DOM→model and model→DOM selection mapping now treat invocation chips as
+  zero-length atoms while still counting user text that lands inside the NBSP
+  caret anchor (common on Windows WebView2), restore both selection ends, and
+  recover the insertion point from a `beforeinput` snapshot when the browser
+  temporarily loses selection — so mid-text edits no longer jump to the end.
 - Isolated the Windows desktop WebView2 shell from stale system proxies, so an
   exited proxy client cannot leave the embedded UI hidden during startup. If
   WebView2 still does not reach DOM-ready within 15 seconds, Reasonix now shows

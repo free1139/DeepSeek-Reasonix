@@ -13,6 +13,8 @@ package jobs
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"reasonix/internal/event"
@@ -29,15 +32,25 @@ import (
 )
 
 var renamePath = os.Rename
+var repairArtifactMeta = writeMeta
+
+var (
+	managerOwnerSeq   atomic.Uint64
+	liveManagerOwners = struct {
+		sync.RWMutex
+		ids map[string]struct{}
+	}{ids: map[string]struct{}{}}
+)
 
 // Status is a job's lifecycle state.
 type Status string
 
 const (
-	Running Status = "running"
-	Done    Status = "done"
-	Failed  Status = "failed"
-	Killed  Status = "killed"
+	Running     Status = "running"
+	Done        Status = "done"
+	Failed      Status = "failed"
+	Killed      Status = "killed"
+	Interrupted Status = "interrupted"
 )
 
 // DefaultTeardownGrace bounds Close and destroy waits for non-cooperative jobs.
@@ -141,6 +154,12 @@ type Manager struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	onJobStart func(done <-chan struct{})
+	ownerID    string
+	ownerDone  sync.Once
+	// sessionOwnershipProbe authorizes destructive repair of persisted running
+	// artifacts. A nil probe is conservative: an observer that cannot prove it
+	// owns the transcript must never publish an interrupted tombstone.
+	sessionOwnershipProbe func(path string) bool
 
 	mu           sync.Mutex
 	seq          int
@@ -193,6 +212,13 @@ func WithJobStartObserver(observer func(done <-chan struct{})) Option {
 	return func(m *Manager) { m.onJobStart = observer }
 }
 
+// WithSessionOwnershipProbe supplies the runtime ownership check used when
+// loading persisted Running artifacts. The probe must return true only when the
+// current runtime owns the session transcript for writing.
+func WithSessionOwnershipProbe(probe func(path string) bool) Option {
+	return func(m *Manager) { m.sessionOwnershipProbe = probe }
+}
+
 // TeardownGrace reports the manager's configured close/destroy wait window.
 func (m *Manager) TeardownGrace() time.Duration { return m.teardownGrace }
 
@@ -216,13 +242,55 @@ func NewManager(sink event.Sink, opts ...Option) *Manager {
 		loaded:        map[string]bool{},
 		tempRoot:      tempRoot,
 		teardownGrace: DefaultTeardownGrace,
+		ownerID:       newManagerOwnerID(),
 	}
+	registerManagerOwner(m.ownerID)
 	for _, opt := range opts {
 		if opt != nil {
 			opt(m)
 		}
 	}
 	return m
+}
+
+func newManagerOwnerID() string {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err == nil {
+		return hex.EncodeToString(token[:])
+	}
+	return fmt.Sprintf("%d-%d-%d", os.Getpid(), time.Now().UnixNano(), managerOwnerSeq.Add(1))
+}
+
+func registerManagerOwner(ownerID string) {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return
+	}
+	liveManagerOwners.Lock()
+	liveManagerOwners.ids[ownerID] = struct{}{}
+	liveManagerOwners.Unlock()
+}
+
+func managerOwnerIsLive(ownerID string) bool {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" {
+		return false
+	}
+	liveManagerOwners.RLock()
+	_, ok := liveManagerOwners.ids[ownerID]
+	liveManagerOwners.RUnlock()
+	return ok
+}
+
+func (m *Manager) releaseOwner() {
+	if m == nil {
+		return
+	}
+	m.ownerDone.Do(func() {
+		liveManagerOwners.Lock()
+		delete(liveManagerOwners.ids, m.ownerID)
+		liveManagerOwners.Unlock()
+	})
 }
 
 // jobWriter appends a job's streamed output under its lock so a concurrent
@@ -283,6 +351,12 @@ func (m *Manager) StartForSession(parentSession, kind, label string, run func(ct
 	m.jobs[key] = j
 	m.order = append(m.order, key)
 	m.mu.Unlock()
+	j.mu.Lock()
+	if err := m.writeJobMetaLocked(j, Running); err != nil {
+		j.artifactComplete = false
+		j.artifactErr = err.Error()
+	}
+	j.mu.Unlock()
 	if m.onJobStart != nil {
 		m.onJobStart(j.done)
 	}
@@ -436,10 +510,11 @@ func (m *Manager) writeJobMetaLocked(j *Job, st Status) error {
 		Kind:             j.Kind,
 		Label:            j.Label,
 		SessionID:        j.SessionID,
+		OwnerID:          m.ownerID,
 		Status:           st,
 		StartedAt:        j.startedAt,
 		FinishedAt:       j.finishedAt,
-		ArtifactComplete: j.artifactComplete && j.artifactErr == "",
+		ArtifactComplete: st != Running && j.artifactComplete && j.artifactErr == "",
 		ArtifactError:    j.artifactErr,
 		LogPath:          filepath.Base(j.artifactPath),
 	}
@@ -1073,7 +1148,7 @@ func (m *Manager) SetActiveSessionPath(parentSession, sessionPath string) {
 		}
 	}
 	if !loaded {
-		m.loadSessionArtifacts(parentSession, newDir)
+		m.loadSessionArtifacts(parentSession, sessionPath, newDir)
 	}
 }
 
@@ -1305,7 +1380,7 @@ func copyArtifactFile(src, dst string) error {
 	return nil
 }
 
-func (m *Manager) loadSessionArtifacts(parentSession, dir string) {
+func (m *Manager) loadSessionArtifacts(parentSession, sessionPath, dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		m.mu.Lock()
@@ -1314,18 +1389,50 @@ func (m *Manager) loadSessionArtifacts(parentSession, dir string) {
 		return
 	}
 	var loaded []*Job
+	deferredLiveOwner := false
+	var repairErrors []string
 	maxSeq := 0
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != jobMetaExt {
 			continue
 		}
-		meta, err := readMeta(filepath.Join(dir, entry.Name()))
+		metaPath := filepath.Join(dir, entry.Name())
+		meta, err := readMeta(metaPath)
 		if err != nil || strings.TrimSpace(meta.ID) == "" {
 			continue
 		}
 		id := strings.TrimSpace(meta.ID)
 		if seq := maxJobSeq(id); seq > maxSeq {
 			maxSeq = seq
+		}
+		// A persisted Running record may belong to another manager in this
+		// process or to another Reasonix process entirely. Only the runtime that
+		// owns the session lease may repair an abandoned record as Interrupted.
+		// Observers without proof of ownership defer the artifact and leave the
+		// session reloadable for a later owned bind.
+		if meta.Status == Running {
+			if managerOwnerIsLive(meta.OwnerID) {
+				deferredLiveOwner = true
+				continue
+			}
+			if m.sessionOwnershipProbe == nil || !m.sessionOwnershipProbe(sessionPath) {
+				deferredLiveOwner = true
+				continue
+			}
+			meta.Status = Interrupted
+			if meta.FinishedAt == 0 {
+				meta.FinishedAt = nowMs()
+			}
+			meta.ArtifactComplete = false
+			if err := repairArtifactMeta(metaPath, meta); err != nil {
+				// Do not publish an in-memory Interrupted tombstone when the durable
+				// state still says Running. Keep the session reloadable so a later bind
+				// can retry the repair, and surface the failure instead of letting live
+				// and machine-facing status silently disagree.
+				deferredLiveOwner = true
+				repairErrors = append(repairErrors, fmt.Sprintf("repair job %s metadata: %v", id, err))
+				continue
+			}
 		}
 		done := make(chan struct{})
 		close(done)
@@ -1351,6 +1458,14 @@ func (m *Manager) loadSessionArtifacts(parentSession, dir string) {
 			evidence:         mutationEvidenceFromArtifact(meta),
 		})
 	}
+	if len(repairErrors) > 0 {
+		m.sink.Emit(event.Event{
+			Kind:   event.Notice,
+			Level:  event.LevelWarn,
+			Text:   "Background job recovery did not complete.",
+			Detail: strings.Join(repairErrors, "; "),
+		})
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, j := range loaded {
@@ -1364,7 +1479,7 @@ func (m *Manager) loadSessionArtifacts(parentSession, dir string) {
 	if maxSeq > m.seq {
 		m.seq = maxSeq
 	}
-	m.loaded[parentSession] = true
+	m.loaded[parentSession] = !deferredLiveOwner
 }
 
 // BeginDestroySession marks a parent session as being removed from active use
@@ -1479,6 +1594,7 @@ func (m *Manager) CloseAsync() {
 	m.cancel()
 	go func() {
 		m.wg.Wait()
+		m.releaseOwner()
 		m.removeTempRoot()
 	}()
 }
@@ -1490,6 +1606,7 @@ func (m *Manager) CloseWithGrace(grace time.Duration) TeardownResult {
 	done := make(chan struct{})
 	go func() {
 		m.wg.Wait()
+		m.releaseOwner()
 		close(done)
 	}()
 	result, timedOut := waitTeardownTargets(context.Background(), m.closeTargets(), grace, done)
