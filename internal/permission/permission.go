@@ -31,6 +31,7 @@ func SandboxBypass(ctx context.Context) bool {
 	v, _ := ctx.Value(sandboxBypassCtx{}).(bool)
 	return v
 }
+
 // add end
 
 // Decision is the outcome of evaluating a tool call against a Policy.

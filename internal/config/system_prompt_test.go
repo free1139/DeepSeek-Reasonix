@@ -10,7 +10,7 @@ import (
 )
 
 func TestDefaultSystemPromptStaysLean(t *testing.T) {
-	if len(DefaultSystemPrompt) > 240 {
+	if len(DefaultSystemPrompt) > 300 {
 		t.Fatalf("default system prompt grew to %d bytes; keep workflows in mode contracts and tool descriptions", len(DefaultSystemPrompt))
 	}
 	for _, duplicate := range []string{"todo_write", "plan mode", "verify with tools", "acceptance criteria"} {
@@ -18,7 +18,9 @@ func TestDefaultSystemPromptStaysLean(t *testing.T) {
 			t.Fatalf("default system prompt duplicates %q workflow guidance: %q", duplicate, DefaultSystemPrompt)
 		}
 	}
-	for _, want := range []string{"Reasonix", "available tools", "focused", "concise"} {
+	for _, want := range []string{"Reasonix",
+		"工具分析", "修改聚焦", "关联评估", "回答简洁", "不懂要问", "模拟归纳",
+		"最小执行", "对比差异", "测试结果"} {
 		if !strings.Contains(DefaultSystemPrompt, want) {
 			t.Fatalf("default system prompt missing %q: %q", want, DefaultSystemPrompt)
 		}

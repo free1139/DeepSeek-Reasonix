@@ -360,11 +360,14 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Output style: fold the selected persona/tone block into the base prompt
-	// before language/memory/skills append, so a "replace" style (keep-coding
-	// false) still keeps those. Applied once, into the cache-stable prefix.
-	if st, ok := outputstyle.Resolve(cfg.Agent.OutputStyle, outputstyle.Dirs()); ok {
-		sysPrompt = outputstyle.Apply(sysPrompt, st)
+	// Output style: fold the selected persona/tone block only when using the
+	// built-in default system prompt. A user-custom system_prompt or
+	// system_prompt_file is their own content; appending a learning style on
+	// top would override their intent. Applied once, into the cache-stable prefix.
+	if sysPrompt == config.DefaultSystemPrompt {
+		if st, ok := outputstyle.Resolve(cfg.Agent.OutputStyle, outputstyle.Dirs()); ok {
+			sysPrompt = outputstyle.Apply(sysPrompt, st)
+		}
 	}
 	sysPrompt += "\n\n" + config.UserDecisionPolicy
 	sysPrompt += "\n\n" + config.LanguagePolicy
