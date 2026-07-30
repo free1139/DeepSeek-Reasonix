@@ -43,9 +43,10 @@ var assets embed.FS
 // prompts to update.
 var version = "dev"
 
-// channel selects which updater pointer this build polls, injected via
-// `-X main.channel=canary`. Default "stable" tracks the public release; "canary"
-// tracks the opt-in pre-release line and never crosses over to stable.
+// channel records the build's release line, injected via
+// `-X main.channel=preview`. Default "stable" tracks the public release;
+// "preview" tracks the opt-in test line. Legacy "canary" builds are treated as
+// preview for compatibility.
 var channel = "stable"
 
 // macSelfUpdate is injected as "true" only for Developer ID signed + notarized
@@ -75,7 +76,7 @@ func windowsWebview2GPUDisabled() bool {
 			return false
 		}
 	}
-	return channel == "canary"
+	return channel == "preview" || channel == "canary"
 }
 
 func linuxWebviewGpuPolicy(pattern string) linux.WebviewGpuPolicy {
@@ -97,6 +98,11 @@ func main() {
 	// SSH_ASKPASS helper. Handle that one-time capability before configuration,
 	// startup tracking, single-instance setup, Wails, or any logging/persistence.
 	if handled, exitCode := RunRemoteAskPassHelper(context.Background(), os.Args[1:], os.Getenv, os.Stdout); handled {
+		os.Exit(exitCode)
+	}
+	// Detached macOS self-update child: wait for the old PID, hold the shared
+	// repair mutation lock, then swap the .app bundle. Must run before Wails.
+	if handled, exitCode := maybeRunMacUpdateHandoff(os.Args[1:]); handled {
 		os.Exit(exitCode)
 	}
 	capturePreviousFatalCrash()
@@ -124,9 +130,13 @@ func main() {
 	startupState, _ := tracker.Begin(version, launch.SafeMode)
 	trackerOwned := startupState.PID == os.Getpid()
 	installProfile := telemetryInstallProfile()
-	updateFrom, updateTo := "", ""
+	updateFrom, updateTo, healthyUpdateCreatedAt, healthyUpdateTransactionID := "", "", "", ""
 	if tx, err := repair.ReadPendingUpdate(); err == nil {
 		updateFrom, updateTo = tx.FromVersion, tx.ToVersion
+		if strings.TrimSpace(tx.ToVersion) == strings.TrimSpace(version) {
+			healthyUpdateCreatedAt = tx.CreatedAt
+			healthyUpdateTransactionID = repair.UpdateTransactionID(tx)
+		}
 	}
 	if trackerOwned {
 		_ = tracker.MarkLaunchContext(installProfile, updateFrom, updateTo)
@@ -139,6 +149,8 @@ func main() {
 
 	app := NewApp()
 	app.previousRun = previousRun
+	app.healthyUpdateCreatedAt = healthyUpdateCreatedAt
+	app.healthyUpdateTransactionID = healthyUpdateTransactionID
 	if trackerOwned {
 		app.startupTracker = tracker
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/xml"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -50,6 +51,7 @@ func TestWindowsReleaseSignsPayloadBeforeRepackaging(t *testing.T) {
 		"name: Upload unsigned Windows payload for SignPath",
 		"name: Submit Windows payload for Authenticode signing",
 		"name: Approve and download signed Windows payload",
+		"name: Bind signed Windows payload to release manifest",
 		"name: Rebuild Windows packages from signed payload",
 		"name: Upload unsigned installer for SignPath",
 		"name: Submit installer for Authenticode signing",
@@ -71,21 +73,36 @@ func TestWindowsReleaseSignsPayloadBeforeRepackaging(t *testing.T) {
 	}
 	for _, want := range []string{
 		`artifact-configuration-slug: windows-payload`,
-		`(inputs.production_signing_smoke || steps.ver.outputs.channel != 'canary') && 'windows-installer-v2' || 'windows-installer-test-v2'`,
+		`artifact-configuration-slug: windows-installer-v2`,
 		`path: desktop/build/windows/signing-payload/*.exe`,
 		`path: desktop/build/windows/installer-signing-bundle/*.exe`,
 		`github.repository == 'esengine/DeepSeek-Reasonix'`,
-		`SIGNPATH_API_TOKEN is required for official Windows releases`,
-		`signing-policy-slug: ${{ (inputs.production_signing_smoke || steps.ver.outputs.channel != 'canary') && 'release-signing' || 'test-signing-ci-approval' }}`,
-		`needs.build.result == 'success' && !inputs.production_signing_smoke`,
+		`SIGNPATH_API_TOKEN is required for public Windows Preview and Stable releases`,
+		`SIGNPATH_RELEASE_SIGNING_ATTESTATION does not match the current protected signing contract`,
+		`signing-policy-slug: release-signing`,
+		`needs.build.result == 'success' && !inputs.production_signing_smoke && !inputs.signing_preflight`,
+		`go run ./cmd/signpath-contract fingerprint`,
 		`wait-for-completion: false`,
 		`steps.submit-windows-payload.outputs.signing-request-id`,
 		`steps.submit-windows-installer.outputs.signing-request-id`,
 		`scripts/complete-signpath-request.ps1`,
 		`-WaitForExternalApproval:$waitForExternalApproval`,
+		`go run ./cmd/sign windows-payload ../signed-payload "${{ needs.resolve.outputs.version }}"`,
+		`go run ./cmd/sign sign ../signed-payload/reasonix-payload.json`,
+		`go run ./cmd/sign verify ../signed-payload/reasonix-payload.json`,
+		`REASONIX_REQUIRE_PAYLOAD_MANIFEST: "1"`,
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Errorf("desktop release workflow is missing signing contract %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		`signing-policy-slug: test-signing`,
+		`artifact-configuration-slug: windows-installer-test-v2`,
+		`steps.ver.outputs.channel == 'canary'`,
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Errorf("public desktop release workflow contains legacy Canary signing contract %q", forbidden)
 		}
 	}
 
@@ -105,6 +122,10 @@ func TestWindowsReleaseSignsPayloadBeforeRepackaging(t *testing.T) {
 		`cp "$PAYLOAD/$LAUNCHERNAME.exe" "$INSTALLER_DIR/$LAUNCHERNAME.exe"`,
 		`cp "$PAYLOAD/$UPDATE_HELPER" "$INSTALLER_DIR/$UPDATE_HELPER"`,
 		`cp "$PAYLOAD/$WINDOWS_CLINAME.exe" "$INSTALLER_DIR/$WINDOWS_CLINAME.exe"`,
+		`rm -f -- "$INSTALLER_DIR/$PAYLOAD_MANIFEST" "$INSTALLER_DIR/$PAYLOAD_SIGNATURE"`,
+		`cp "$PAYLOAD/$PAYLOAD_MANIFEST" "$INSTALLER_DIR/$PAYLOAD_MANIFEST"`,
+		`cp "$PAYLOAD/$PAYLOAD_SIGNATURE" "$INSTALLER_DIR/$PAYLOAD_SIGNATURE"`,
+		`REASONIX_REQUIRE_PAYLOAD_MANIFEST`,
 		`"-DARG_REASONIX_SIGNED_UNINSTALLER=${uninstaller_path}"`,
 		`cp "$PAYLOAD/$LAUNCHERNAME.exe" "$portable_staging/$APPNAME.exe"`,
 		`"$ROOT/scripts/verify-windows-portable.sh" "$portable_staging"`,
@@ -149,6 +170,51 @@ func TestWindowsReleaseSignsPayloadBeforeRepackaging(t *testing.T) {
 	}
 }
 
+func TestWindowsPackagerRejectsMissingOrPartialRequiredPayloadManifest(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		manifest  bool
+		signature bool
+		want      string
+	}{
+		{name: "missing", want: "signed Windows packaging requires"},
+		{name: "manifest only", manifest: true, want: "must be provided together"},
+		{name: "signature only", signature: true, want: "must be provided together"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := t.TempDir()
+			for _, name := range []string{
+				"reasonix-desktop.exe",
+				"reasonix-guard.exe",
+				"reasonix-launcher.exe",
+				"reasonix-update-helper.exe",
+				"reasonix-cli.exe",
+				"reasonix-uninstall.exe",
+			} {
+				if err := os.WriteFile(filepath.Join(payload, name), []byte(name), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.manifest {
+				if err := os.WriteFile(filepath.Join(payload, "reasonix-payload.json"), []byte("{}"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.signature {
+				if err := os.WriteFile(filepath.Join(payload, "reasonix-payload.json.minisig"), []byte("sig"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("bash", "../scripts/package-windows-desktop.sh", "amd64", payload)
+			cmd.Env = append(os.Environ(), "REASONIX_REQUIRE_PAYLOAD_MANIFEST=1")
+			output, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), tc.want) {
+				t.Fatalf("packager error = %v, output = %q, want %q", err, output, tc.want)
+			}
+		})
+	}
+}
+
 func TestProductionSigningRunsOnlyFromProtectedControlPlane(t *testing.T) {
 	stable := readTestFile(t, "../.github/workflows/release-stable.yml")
 	desktop := readTestFile(t, "../.github/workflows/release-desktop.yml")
@@ -158,6 +224,9 @@ func TestProductionSigningRunsOnlyFromProtectedControlPlane(t *testing.T) {
 	for _, want := range []string{
 		`ALLOW_STABLE_RECOVERY: ${{ inputs.allow_recovery }}`,
 		`allow_recovery: 'false'`,
+		`signing_preflight: true`,
+		`signing_preflight_verified: true`,
+		`needs: [authorize, signpath-preflight]`,
 	} {
 		if !strings.Contains(stable+"\n"+readTestFile(t, "../.github/workflows/release-stable-trigger.yml"), want) {
 			t.Errorf("stable relay is missing normal-release recovery guard %q", want)
