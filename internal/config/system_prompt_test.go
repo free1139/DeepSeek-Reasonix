@@ -19,7 +19,7 @@ func TestDefaultSystemPromptStaysLean(t *testing.T) {
 		}
 	}
 	for _, want := range []string{"Reasonix",
-		"工具分析", "修改聚焦", "关联评估", "回答简洁", "不懂要问", "模拟归纳",
+		"工具分析", "修改聚焦", "关联评估", "回答简洁", "不懂要问", "归纳模拟",
 		"最小执行", "对比差异", "测试结果"} {
 		if !strings.Contains(DefaultSystemPrompt, want) {
 			t.Fatalf("default system prompt missing %q: %q", want, DefaultSystemPrompt)
