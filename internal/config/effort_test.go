@@ -5,6 +5,52 @@ import (
 	"testing"
 )
 
+func TestDeepSeekV4FlashEffortCapabilityIncludesLow(t *testing.T) {
+	flash := &ProviderEntry{Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash"}
+	cap := EffortCapabilityForEntry(flash)
+	want := []string{"auto", "disabled", "low", "high", "max"}
+	if !cap.Supported || len(cap.Levels) != len(want) {
+		t.Fatalf("Flash capability = %+v, want %v", cap, want)
+	}
+	for i := range want {
+		if cap.Levels[i] != want[i] {
+			t.Fatalf("Flash levels[%d] = %q, want %q", i, cap.Levels[i], want[i])
+		}
+	}
+	if cap.Default != "high" {
+		t.Fatalf("Flash default = %q, want high", cap.Default)
+	}
+	if got, err := NormalizeEffort(flash, "low"); err != nil || got != "low" {
+		t.Fatalf("Flash low = %q/%v, want low/nil", got, err)
+	}
+	if got, err := NormalizeEffort(flash, "xhigh"); err != nil || got != "high" {
+		t.Fatalf("Flash xhigh = %q/%v, want high/nil", got, err)
+	}
+	flash.ReasoningProtocol = ReasoningProtocolDeepSeek
+	if got := EffortCapabilityForEntry(flash); len(got.Levels) != len(want) || got.Levels[2] != "low" {
+		t.Fatalf("explicit DeepSeek Flash capability = %+v, want model-specific low", got)
+	}
+	if got, err := NormalizeEffort(flash, "low"); err != nil || got != "low" {
+		t.Fatalf("explicit DeepSeek Flash low = %q/%v, want low/nil", got, err)
+	}
+	if got, err := NormalizeEffort(flash, "xhigh"); err != nil || got != "high" {
+		t.Fatalf("explicit DeepSeek Flash xhigh = %q/%v, want high/nil", got, err)
+	}
+
+	pro := &ProviderEntry{Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-pro"}
+	if got, err := NormalizeEffort(pro, "low"); err != nil || got != "high" {
+		t.Fatalf("Pro low = %q/%v, want existing high mapping", got, err)
+	}
+	if got, err := NormalizeEffort(pro, "xhigh"); err != nil || got != "max" {
+		t.Fatalf("Pro xhigh = %q/%v, want max/nil", got, err)
+	}
+	for _, level := range EffortCapabilityForEntry(pro).Levels {
+		if level == "low" {
+			t.Fatalf("Pro capability unexpectedly exposes low: %+v", EffortCapabilityForEntry(pro))
+		}
+	}
+}
+
 func TestIsMiniMaxEntry(t *testing.T) {
 	for _, tc := range []struct {
 		baseURL string
@@ -113,6 +159,64 @@ func TestEffortCapabilityZhipu(t *testing.T) {
 	}
 	if cap.Default != "enabled" {
 		t.Errorf("default = %q, want enabled (GLM ships with thinking on)", cap.Default)
+	}
+}
+
+func TestEffortCapabilityExplicitGLMProtocolOnGateway(t *testing.T) {
+	e := &ProviderEntry{
+		Name:              "glm-gateway",
+		Kind:              "openai",
+		BaseURL:           "https://gateway.example.com/v1",
+		Model:             "glm-5.2",
+		ReasoningProtocol: ReasoningProtocolGLM,
+	}
+	cap := EffortCapabilityForEntry(e)
+	want := []string{"auto", "enabled", "disabled"}
+	if !cap.Supported || cap.Default != "enabled" || len(cap.Levels) != len(want) {
+		t.Fatalf("explicit GLM capability = %+v, want levels %v default enabled", cap, want)
+	}
+	for i := range want {
+		if cap.Levels[i] != want[i] {
+			t.Fatalf("explicit GLM levels[%d] = %q, want %q", i, cap.Levels[i], want[i])
+		}
+	}
+	if got, err := NormalizeEffort(e, "disabled"); err != nil || got != "disabled" {
+		t.Fatalf("explicit GLM disabled = %q/%v, want disabled/nil", got, err)
+	}
+	if got, err := NormalizeEffort(e, "high"); err != nil || got != "enabled" {
+		t.Fatalf("explicit GLM legacy high = %q/%v, want enabled/nil", got, err)
+	}
+}
+
+func TestGLMModelRegistryUpgradesLegacyGatewayConfig(t *testing.T) {
+	for _, model := range []string{"glm-5", "glm-5.1", "glm-5.2"} {
+		t.Run(model, func(t *testing.T) {
+			// This is the shape persisted by an older Token Rhythm installation:
+			// no reasoning_protocol and no model_overrides metadata.
+			e := &ProviderEntry{
+				Name:    "token-rhythm",
+				Kind:    "openai",
+				BaseURL: "https://tokenrhythm.studio/v1",
+				Model:   model,
+			}
+			if got := ReasoningProtocolForEntry(e); got != ReasoningProtocolGLM {
+				t.Fatalf("ReasoningProtocolForEntry() = %q, want %q", got, ReasoningProtocolGLM)
+			}
+			cap := EffortCapabilityForEntry(e)
+			want := []string{"auto", "enabled", "disabled"}
+			if !cap.Supported || cap.Default != "enabled" || !stringSlicesEqual(cap.Levels, want) {
+				t.Fatalf("legacy gateway GLM capability = %+v, want levels %v default enabled", cap, want)
+			}
+		})
+	}
+
+	nonGLM := &ProviderEntry{Kind: "openai", BaseURL: "https://tokenrhythm.studio/v1", Model: "my-glm-5.2-alias"}
+	if got := ReasoningProtocolForEntry(nonGLM); got != "" {
+		t.Fatalf("non-exact GLM alias protocol = %q, want empty without explicit override", got)
+	}
+	otherGateway := &ProviderEntry{Kind: "openai", BaseURL: "https://opencode.ai/zen/go/v1", Model: "glm-5.2"}
+	if got := ReasoningProtocolForEntry(otherGateway); got != "" {
+		t.Fatalf("unrelated gateway GLM protocol = %q, want empty without explicit override", got)
 	}
 }
 

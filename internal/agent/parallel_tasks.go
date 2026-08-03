@@ -75,6 +75,12 @@ type parallelTaskItem struct {
 
 type parallelTaskStatus string
 
+// parallelTasksMaxTasks bounds the request before any task-sized slices,
+// channels, or goroutines are allocated. The scheduler limits how many
+// children run simultaneously, but without an input cap a single model call
+// could still reserve unbounded memory and queue unbounded API work (#6933).
+const parallelTasksMaxTasks = 64
+
 const (
 	parallelTaskPending   parallelTaskStatus = "pending"
 	parallelTaskCompleted parallelTaskStatus = "completed"
@@ -97,6 +103,9 @@ func (p *ParallelTasksTool) Execute(ctx context.Context, args json.RawMessage) (
 	}
 	if len(params.Tasks) == 1 {
 		return "", fmt.Errorf("parallel_tasks with a single task is equivalent to task; use task instead")
+	}
+	if len(params.Tasks) > parallelTasksMaxTasks {
+		return "", fmt.Errorf("parallel_tasks accepts at most %d tasks; got %d", parallelTasksMaxTasks, len(params.Tasks))
 	}
 	if err := validateParallelTaskItems(params.Tasks); err != nil {
 		return "", err
@@ -173,6 +182,7 @@ func (p *ParallelTasksTool) Execute(ctx context.Context, args json.RawMessage) (
 			defer releaseSlot()
 
 			modelRef, effortRef := p.taskTool.effectiveProfile(t.Model, t.Effort)
+			usageModelRef := p.taskTool.usageModelRef(modelRef, effortRef)
 			childDepth, depthErr := p.taskTool.nextSubagentDepth(ctx)
 			if depthErr != nil {
 				sink.Emit(event.Event{
@@ -200,6 +210,7 @@ func (p *ParallelTasksTool) Execute(ctx context.Context, args json.RawMessage) (
 			// default system prompt — profile-aware batches use fleet instead.
 			sess := NewSession(DefaultReadOnlyTaskSystemPrompt)
 			opts := p.taskTool.subagentOptions(ctx, max, pricing, ctxWin, childDepth, "subagent:"+subID)
+			opts.ModelRef = usageModelRef
 			// Same contract as runSubSession: capture the pristine task before
 			// host framing is prepended so delivery intent classification judges
 			// the task, not the wrapper.

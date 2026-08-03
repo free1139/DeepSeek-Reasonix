@@ -106,7 +106,7 @@ func (a *App) withWorkbenchLocalNavigation(run func() (TabMeta, error)) (meta Ta
 			}
 			a.emitWorkbenchTarget("disconnected", id, gen, seq, "")
 			a.emitReady(a.ctx, tabID)
-			a.emitRuntimeEvent("runtime:rebuilt", tabID)
+			a.emitWorkbenchLocalRuntimeRebuilt(tabID)
 		}
 		k.transitionMu.Unlock()
 	}()
@@ -186,7 +186,7 @@ func (a *App) WorkbenchSwitchLocal() map[string]any {
 	a.emitWorkbenchTarget("disconnected", id, gen, seq, "")
 	tabID := a.workbenchProjectionTabID()
 	a.emitReady(a.ctx, tabID)
-	a.emitRuntimeEvent("runtime:rebuilt", tabID)
+	a.emitWorkbenchLocalRuntimeRebuilt(tabID)
 	return map[string]any{"kind": string(id.Kind), "identityGen": gen, "requestSeq": seq}
 }
 
@@ -229,7 +229,7 @@ func (a *App) WorkbenchConnectRemote(hostID, workspace string) error {
 		go a.workbenchRefreshCatalog(remote.Generation)
 		a.emitWorkbenchTarget("connected", activeID, activeGen, requestSeq, "")
 		a.emitReady(a.ctx, tabID)
-		a.emitRuntimeEvent("runtime:rebuilt", tabID)
+		a.emitWorkbenchRuntimeRebuilt(tabID, string(cli.State().RuntimeEpoch))
 		return nil
 	}
 	_, gen, err := k.targets.BeginRemoteConnect(hostID, workspace)
@@ -269,6 +269,11 @@ func (a *App) WorkbenchConnectRemote(hostID, workspace string) error {
 	if err != nil {
 		return fail(err)
 	}
+	currentBuild := protocol.CurrentBuildID(version)
+	remoteBinary, err := a.workbenchEnsureRemoteCLI(hostID, entry, currentBuild)
+	if err != nil {
+		return fail(err)
+	}
 	refs := localProviderRefs(cfg)
 	if len(refs) == 0 {
 		return fail(fmt.Errorf("no configured local chat model is available for Remote Workbench"))
@@ -305,7 +310,7 @@ func (a *App) WorkbenchConnectRemote(hostID, workspace string) error {
 	// Bind the attach transport to the workspace selected for this connection,
 	// not a possibly stale default from the persisted host entry.
 	entry.Workspace = workspace
-	factory, err := a.workbenchTransportFactory(hostID, entry)
+	factory, err := a.workbenchTransportFactory(hostID, entry, remoteBinary)
 	if err != nil {
 		return fail(err)
 	}
@@ -328,10 +333,15 @@ func (a *App) WorkbenchConnectRemote(hostID, workspace string) error {
 			if err != nil {
 				return nil, err
 			}
-			return openLocalProviderStream(ctx, current, ref, effort, req)
+			requestCtx := provider.WithRequestAttemptCounter(ctx)
+			stream, err := openLocalProviderStream(requestCtx, current, ref, effort, req)
+			if err != nil {
+				recordRemoteProviderUsage(requestCtx, remoteStatsRecorder(), ref, nil)
+				return nil, err
+			}
+			return recordRemoteProviderStream(requestCtx, ref, stream), nil
 		},
 	}
-	currentBuild := protocol.CurrentBuildID(version)
 	buildID := map[string]any{
 		"productVersion": currentBuild.ProductVersion, "sourceRevision": currentBuild.SourceRevision,
 		"protocolVersion": currentBuild.ProtocolVersion, "schemaHash": currentBuild.SchemaHash,
@@ -413,6 +423,10 @@ func (a *App) WorkbenchConnectRemote(hostID, workspace string) error {
 		k.sessionCatalog = sessionCatalog
 		k.mu.Unlock()
 		k.targets.SetRemoteBusy(result.Snapshot.Runtime.Running || result.Snapshot.Runtime.CurrentOperation != nil)
+		// Publish the Remote authority while SubscribeCommitted still holds the
+		// client projection fence. Pending-prompt replay and live events cannot
+		// overtake this epoch transition and be rejected as Local events.
+		a.emitWorkbenchRuntimeRebuilt(tabID, string(result.Snapshot.RuntimeEpoch))
 		return nil
 	})
 	if err != nil {
@@ -428,8 +442,19 @@ func (a *App) WorkbenchConnectRemote(hostID, workspace string) error {
 	committed = true
 	a.emitWorkbenchTarget("connected", activeID, activeGen, requestSeq, "")
 	a.emitReady(a.ctx, tabID)
-	a.emitRuntimeEvent("runtime:rebuilt", tabID)
 	return nil
+}
+
+func (a *App) workbenchEnsureRemoteCLI(hostID string, entry config.RemoteHostEntry, expected protocol.BuildID) (string, error) {
+	rt, err := a.remoteRT()
+	if err != nil {
+		return "", err
+	}
+	manager, ok := rt.(*desktopRemoteManager)
+	if !ok {
+		return "", fmt.Errorf("remote manager cannot provision the Workbench CLI")
+	}
+	return manager.EnsureWorkbenchCLI(a.bootContext(), hostID, entry, expected)
 }
 
 type workbenchPeerIdentitySource interface {
@@ -471,6 +496,9 @@ func (a *App) WorkbenchDisconnectRemote() error {
 	k.mu.Unlock()
 	id, gen, seq := k.targets.Active()
 	a.emitWorkbenchTarget("disconnected", id, gen, seq, "")
+	tabID := a.workbenchProjectionTabID()
+	a.emitReady(a.ctx, tabID)
+	a.emitWorkbenchLocalRuntimeRebuilt(tabID)
 	return nil
 }
 
@@ -662,7 +690,7 @@ func (a *App) workbenchHostIdentity(hostID string) (fingerprint, keyType, hostLa
 	return fingerprint, keyType, hostLabel, nil
 }
 
-func (a *App) workbenchTransportFactory(hostID string, entry config.RemoteHostEntry) (transport.Factory, error) {
+func (a *App) workbenchTransportFactory(hostID string, entry config.RemoteHostEntry, remoteBinary ...string) (transport.Factory, error) {
 	// Windows: system OpenSSH. Other platforms: Go SSH stdio session.
 	rt, err := a.remoteRT()
 	if err != nil {
@@ -672,7 +700,11 @@ func (a *App) workbenchTransportFactory(hostID string, entry config.RemoteHostEn
 	if !ok {
 		return nil, fmt.Errorf("remote manager cannot service SSH authentication prompts")
 	}
-	return newWorkbenchSSHFactory(entry, manager.workbenchAskPassHandler(hostID, entry))
+	binary := ""
+	if len(remoteBinary) > 0 {
+		binary = remoteBinary[0]
+	}
+	return newWorkbenchSSHFactoryForBinary(entry, binary, manager.workbenchAskPassHandler(hostID, entry))
 }
 
 func (a *App) emitWorkbenchTarget(state string, id target.Identity, gen, seq uint64, errText string) {

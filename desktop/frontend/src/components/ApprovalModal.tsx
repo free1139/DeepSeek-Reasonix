@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import gsap from "gsap";
 import { useT, type Translator } from "../lib/i18n";
@@ -7,6 +7,7 @@ import {
   DecisionConfirmBar,
   PromptAction,
   PromptBadge,
+  PromptDescriptionToggle,
   PromptHeaderAction,
   PromptShelf,
 } from "./PromptShelf";
@@ -107,23 +108,35 @@ function localizeApprovalSubject(tool: string, subject: string, t: Translator): 
 }
 
 function localizeApprovalReason(tool: string, reason: string | undefined, t: Translator): string {
-  const trimmed = reason?.trim() ?? "";
+  let trimmed = reason?.trim() ?? "";
+  let matchedRule = "";
+  const matchedRulePrefix = "Matched permission rule: ";
+  if (trimmed.startsWith(matchedRulePrefix)) {
+    const [ruleLine, ...remainingLines] = trimmed.split(/\r?\n/);
+    matchedRule = t("approval.matchedPermissionRule", { rule: ruleLine.slice(matchedRulePrefix.length).trim() });
+    trimmed = remainingLines.join("\n").trim();
+  }
+  let localized = trimmed;
+  if (tool === "bash" && trimmed.includes("nested or indirect shell execution")) {
+    localized = t("approval.dynamicBashReason");
+  }
   if (tool === "config_write") {
-    if (!trimmed || trimmed.includes("Reasonix-managed configuration file")) return t("approval.configWriteReason");
-    return trimmed;
+    localized = !trimmed || trimmed.includes("Reasonix-managed configuration file") ? t("approval.configWriteReason") : trimmed;
   }
-  if (tool !== "sandbox_escape") return trimmed;
-  if (trimmed.includes("could not wrap this command") || trimmed.includes("does not provide an OS-level Bash sandbox")) {
-    return t("approval.sandboxEscapeWrapReason");
+  if (tool === "sandbox_escape") {
+    if (trimmed.includes("could not wrap this command") || trimmed.includes("does not provide an OS-level Bash sandbox")) {
+      localized = t("approval.sandboxEscapeWrapReason");
+    } else if (
+      trimmed.includes("failed while starting this command") ||
+      trimmed.includes("could not start this command") ||
+      trimmed.includes("Run this command unconfined once?")
+    ) {
+      localized = t("approval.sandboxEscapeRuntimeReason");
+    } else {
+      localized ||= t("approval.sandboxEscapeRuntimeReason");
+    }
   }
-  if (
-    trimmed.includes("failed while starting this command") ||
-    trimmed.includes("could not start this command") ||
-    trimmed.includes("Run this command unconfined once?")
-  ) {
-    return t("approval.sandboxEscapeRuntimeReason");
-  }
-  return trimmed || t("approval.sandboxEscapeRuntimeReason");
+  return [matchedRule, localized].filter(Boolean).join(" ");
 }
 
 function localizePlanModeApprovalReason(tool: string, reason: string, t: Translator): string {
@@ -280,12 +293,15 @@ export function ApprovalModal({
   // Immediate Plan/Auto decisions have no hidden selection. Ordinary tool
   // approvals retain select-then-confirm and default to Allow once.
   const [selectedIndex, setSelectedIndex] = useState(() => (isPlanApproval || isRecoveryApproval ? -1 : 0));
+  const [expandedDescriptionId, setExpandedDescriptionId] = useState<string | null>(null);
+  const [descriptionTruncated, setDescriptionTruncated] = useState(false);
   const [revisionOpen, setRevisionOpen] = useState(false);
   const [revisionText, setRevisionText] = useState("");
   const [recoveryGuidanceOpen, setRecoveryGuidanceOpen] = useState(false);
   const [recoveryGuidanceText, setRecoveryGuidanceText] = useState("");
   const [grantSimilarForTask, setGrantSimilarForTask] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const instanceId = useId();
   const cardRef = useRef<HTMLDivElement | null>(null);
   const shelfRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -463,6 +479,10 @@ export function ApprovalModal({
   const selectedIndexRef = useRef(selectedIndex);
   selectedIndexRef.current = selectedIndex;
   const selectedAction = toolActions[Math.min(selectedIndex, actionCount - 1)] ?? toolActions[0];
+  const selectedDescriptionId = !isPlanApproval && !isRecoveryApproval && selectedIndex >= 0
+    ? `${instanceId}-description-${selectedIndex}`
+    : undefined;
+  const descriptionExpanded = selectedDescriptionId !== undefined && expandedDescriptionId === selectedDescriptionId;
 
   useEffect(() => {
     cardRef.current?.focus();
@@ -476,6 +496,10 @@ export function ApprovalModal({
     setSubmitting(false);
     closingRef.current = false;
   }, [approval.id, isPlanApproval, isRecoveryApproval, reason]);
+
+  useEffect(() => {
+    setExpandedDescriptionId(null);
+  }, [approval.id]);
 
   const confirmSelected = useCallback(() => {
     if (submitting || closingRef.current) return;
@@ -786,6 +810,14 @@ export function ApprovalModal({
                   keyLabel={action.key}
                   label={action.label}
                   description={action.desc}
+                  descriptionId={`${instanceId}-description-${index}`}
+                  descriptionDisclosure
+                  descriptionExpanded={!isPlanApproval && !isRecoveryApproval && selectedIndex === index
+                    ? descriptionExpanded
+                    : undefined}
+                  onDescriptionOverflowChange={!isPlanApproval && !isRecoveryApproval && selectedIndex === index
+                    ? setDescriptionTruncated
+                    : undefined}
                   onClick={() => {
                     activateAction(action, index);
                   }}
@@ -835,7 +867,14 @@ export function ApprovalModal({
           </>
         }
         note={
-          isRecoveryApproval ? (
+          !isPlanApproval && !isRecoveryApproval && selectedDescriptionId && descriptionTruncated ? (
+            <PromptDescriptionToggle
+              descriptionId={selectedDescriptionId}
+              expanded={descriptionExpanded}
+              onToggle={() => setExpandedDescriptionId((current) => current === selectedDescriptionId ? null : selectedDescriptionId)}
+              disabled={submitting}
+            />
+          ) : isRecoveryApproval ? (
             recoveryGuidanceOpen ? (
               <div className="recovery-guidance">
                 <textarea

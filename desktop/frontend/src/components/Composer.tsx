@@ -23,6 +23,7 @@ import {
 } from "../lib/invocationDisplay";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
 import { createRafResizeUpdater } from "../lib/resizeDrag";
+import { observeComposerMenuViewport } from "../lib/composerMenuViewport";
 import { useToast } from "../lib/toast";
 import { type CollaborationMode, type CommandInfo, type ComposerInsertRequest, type ContextInfo, type DirEntry, type EffortInfo, type HistoryMessage, type Mode, type PromptHistoryEntry, type SessionMeta, type SessionReference, type SlashArgItem, type SlashArgsResult, type TokenMode, type ToolApprovalMode, type BalanceInfo } from "../lib/types";
 import {
@@ -704,6 +705,7 @@ export function Composer({
   const [pendingGuidance, setPendingGuidance] = useState<PendingGuidance[]>([]);
   const [guidanceExpanded, setGuidanceExpanded] = useState(false);
   const [guidanceSendingId, setGuidanceSendingId] = useState<number | null>(null);
+  const [guidanceRetryNonce, setGuidanceRetryNonce] = useState(0);
   const [guidanceDraftKey, setGuidanceDraftKey] = useState(draftKey);
   const pendingGuidanceRef = useRef<PendingGuidance[]>([]);
   const guidanceExpandedRef = useRef(false);
@@ -730,6 +732,7 @@ export function Composer({
   const editHistoryByDraftRef = useRef<Record<string, ComposerEditHistory>>({});
   const pendingNativeInputTypeRef = useRef<string | undefined>(undefined);
   const composerCardRef = useRef<HTMLDivElement>(null);
+  const composerWrapRef = useRef<HTMLDivElement>(null);
   const contentMenuAnchorRef = useRef<HTMLButtonElement>(null);
   const intentMenuAnchorRef = useRef<HTMLButtonElement>(null);
   const profileMenuAnchorRef = useRef<HTMLButtonElement>(null);
@@ -737,6 +740,10 @@ export function Composer({
   const intentCloseTimerRef = useRef<number | null>(null);
   const profileCloseTimerRef = useRef<number | null>(null);
   const moreCloseTimerRef = useRef<number | null>(null);
+  // Creation chrome: hover-open task/profile menus (same pattern as ContextWindowRing).
+  const intentHoverTimerRef = useRef<number | null>(null);
+  const profileHoverTimerRef = useRef<number | null>(null);
+  const creationChrome = showContextWindowRing;
   const wasRunningByDraftRef = useRef<Record<string, boolean>>({ [draftKey]: running });
   const composingRef = useRef(false);
   const lastCompositionEndAt = useRef(0);
@@ -1175,7 +1182,7 @@ export function Composer({
     if (guidanceDraftKey !== draftKey || running || submitDisabled || suspendedByDecision) return;
     const next = pendingGuidance[0];
     if (next) void sendQueuedGuidance(next, draftKey);
-  }, [draftKey, guidanceDraftKey, running, submitDisabled, pendingGuidance, suspendedByDecision]);
+  }, [draftKey, guidanceDraftKey, guidanceRetryNonce, running, submitDisabled, pendingGuidance, suspendedByDecision]);
 
   useEffect(() => {
     if (guidanceDraftKey !== draftKey || !running || !guidanceQueuePreviewKey) return;
@@ -1421,6 +1428,13 @@ export function Composer({
           : atRaw !== null && !dismissed
             ? "at"
             : null;
+  const menuOpen = menuMode !== null;
+  useLayoutEffect(() => {
+    if (!menuOpen) return;
+    const anchor = composerWrapRef.current;
+    if (!anchor) return;
+    return observeComposerMenuViewport(anchor);
+  }, [menuOpen]);
   const countBase =
     menuMode === "slash"
       ? slashMatches.length
@@ -1842,8 +1856,29 @@ export function Composer({
     intentCloseTimerRef.current = null;
   }, []);
 
+  const clearProfileCloseTimer = useCallback(() => {
+    if (profileCloseTimerRef.current === null) return;
+    window.clearTimeout(profileCloseTimerRef.current);
+    profileCloseTimerRef.current = null;
+  }, []);
+
+  // Hover timers only touch refs — no useCallback cross-deps (avoids TDZ on HMR).
+  const clearHoverTimer = (timerRef: { current: number | null }) => {
+    if (timerRef.current == null) return;
+    window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+  };
+
   const openIntentMenu = useCallback(() => {
     clearIntentCloseTimer();
+    clearHoverTimer(intentHoverTimerRef);
+    clearHoverTimer(profileHoverTimerRef);
+    if (profileCloseTimerRef.current != null) {
+      window.clearTimeout(profileCloseTimerRef.current);
+      profileCloseTimerRef.current = null;
+    }
+    setProfileMenuOpen(false);
+    setProfileMenuClosing(false);
     setContentMenuOpen(false);
     setDirectPastChats(false);
     setDismissed(true);
@@ -1853,6 +1888,7 @@ export function Composer({
 
   const closeIntentMenu = useCallback((afterClose?: () => void) => {
     clearIntentCloseTimer();
+    clearHoverTimer(intentHoverTimerRef);
     setIntentMenuClosing(true);
     window.requestAnimationFrame(() => setIntentMenuOpen(false));
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -1863,16 +1899,16 @@ export function Composer({
     }, reduceMotion ? 0 : ANCHORED_POPOVER_CLOSE_MS);
   }, [clearIntentCloseTimer]);
 
-  useEffect(() => () => clearIntentCloseTimer(), [clearIntentCloseTimer]);
-
-  const clearProfileCloseTimer = useCallback(() => {
-    if (profileCloseTimerRef.current === null) return;
-    window.clearTimeout(profileCloseTimerRef.current);
-    profileCloseTimerRef.current = null;
-  }, []);
-
   const openProfileMenu = useCallback(() => {
     clearProfileCloseTimer();
+    clearHoverTimer(profileHoverTimerRef);
+    clearHoverTimer(intentHoverTimerRef);
+    if (intentCloseTimerRef.current != null) {
+      window.clearTimeout(intentCloseTimerRef.current);
+      intentCloseTimerRef.current = null;
+    }
+    setIntentMenuOpen(false);
+    setIntentMenuClosing(false);
     setContentMenuOpen(false);
     setDirectPastChats(false);
     setDismissed(true);
@@ -1882,6 +1918,7 @@ export function Composer({
 
   const closeProfileMenu = useCallback((afterClose?: () => void) => {
     clearProfileCloseTimer();
+    clearHoverTimer(profileHoverTimerRef);
     setProfileMenuClosing(true);
     window.requestAnimationFrame(() => setProfileMenuOpen(false));
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -1892,7 +1929,60 @@ export function Composer({
     }, reduceMotion ? 0 : ANCHORED_POPOVER_CLOSE_MS);
   }, [clearProfileCloseTimer]);
 
-  useEffect(() => () => clearProfileCloseTimer(), [clearProfileCloseTimer]);
+  useEffect(() => () => {
+    clearIntentCloseTimer();
+    clearHoverTimer(intentHoverTimerRef);
+    clearProfileCloseTimer();
+    clearHoverTimer(profileHoverTimerRef);
+  }, [clearIntentCloseTimer, clearProfileCloseTimer]);
+
+  const onIntentHoverEnter = useCallback(() => {
+    if (!creationChrome || disabled || running) return;
+    clearHoverTimer(intentHoverTimerRef);
+    intentHoverTimerRef.current = window.setTimeout(() => {
+      intentHoverTimerRef.current = null;
+      openIntentMenu();
+    }, 120);
+  }, [creationChrome, disabled, openIntentMenu, running]);
+
+  const onIntentHoverLeave = useCallback(() => {
+    if (!creationChrome) return;
+    clearHoverTimer(intentHoverTimerRef);
+    if (!intentMenuOpen && !intentMenuClosing) return;
+    intentHoverTimerRef.current = window.setTimeout(() => {
+      intentHoverTimerRef.current = null;
+      closeIntentMenu();
+    }, 140);
+  }, [closeIntentMenu, creationChrome, intentMenuClosing, intentMenuOpen]);
+
+  const onIntentPopoverEnter = useCallback(() => {
+    if (!creationChrome) return;
+    clearHoverTimer(intentHoverTimerRef);
+  }, [creationChrome]);
+
+  const onProfileHoverEnter = useCallback(() => {
+    if (!creationChrome || disabled || running) return;
+    clearHoverTimer(profileHoverTimerRef);
+    profileHoverTimerRef.current = window.setTimeout(() => {
+      profileHoverTimerRef.current = null;
+      openProfileMenu();
+    }, 120);
+  }, [creationChrome, disabled, openProfileMenu, running]);
+
+  const onProfileHoverLeave = useCallback(() => {
+    if (!creationChrome) return;
+    clearHoverTimer(profileHoverTimerRef);
+    if (!profileMenuOpen && !profileMenuClosing) return;
+    profileHoverTimerRef.current = window.setTimeout(() => {
+      profileHoverTimerRef.current = null;
+      closeProfileMenu();
+    }, 140);
+  }, [closeProfileMenu, creationChrome, profileMenuClosing, profileMenuOpen]);
+
+  const onProfilePopoverEnter = useCallback(() => {
+    if (!creationChrome) return;
+    clearHoverTimer(profileHoverTimerRef);
+  }, [creationChrome]);
 
   const clearMoreCloseTimer = useCallback(() => {
     if (moreCloseTimerRef.current === null) return;
@@ -2041,18 +2131,21 @@ export function Composer({
     const displayText = item.text.trim();
     const submitText = item.submitText.trim() || displayText;
     if (!displayText || !submitText) return;
+    const attemptedSteer = running && onSteer !== undefined;
+    let retryRejectedSteer = false;
     const selfDispatched = selfDispatchedGuidanceByDraftRef.current[targetDraftKey] ?? [];
     selfDispatched.push(submitText);
     selfDispatchedGuidanceByDraftRef.current[targetDraftKey] = selfDispatched;
     updateGuidanceSendingIdForDraft(targetDraftKey, item.id);
     try {
-      if (running && onSteer) await onSteer(submitText, targetTabId);
+      if (attemptedSteer) await onSteer(submitText, targetTabId);
       else await onSend(displayText, submitText, targetTabId, item.structured);
       updatePendingGuidanceForDraft(targetDraftKey, (items) => items.filter((queued) => queued.id !== item.id));
       window.setTimeout(() => {
         takeSelfDispatchedGuidance(submitText, targetDraftKey);
       }, 5000);
     } catch (error) {
+      retryRejectedSteer = attemptedSteer;
       takeSelfDispatchedGuidance(submitText, targetDraftKey);
       showToast(error instanceof Error ? error.message : String(error), "warn");
     } finally {
@@ -2060,6 +2153,13 @@ export function Composer({
         ? guidanceSendingIdRef.current
         : draftsBySessionRef.current[targetDraftKey]?.guidanceSendingId;
       if (current === item.id) updateGuidanceSendingIdForDraft(targetDraftKey, null);
+      // TurnDone may render while TrySteer is still pending. That render cannot
+      // auto-send because the guidance item is marked in flight, so re-run the
+      // idle-queue effect after a rejected steer settles. Ordinary onSend
+      // failures intentionally do not re-arm, avoiding an automatic retry loop.
+      if (retryRejectedSteer && targetDraftKey === activeDraftKeyRef.current) {
+        setGuidanceRetryNonce((value) => value + 1);
+      }
     }
   };
 
@@ -3628,6 +3728,7 @@ export function Composer({
 
   return (
     <div
+      ref={composerWrapRef}
       className={`composer-wrap${decisionPending ? " composer-wrap--decision-pending" : ""}`}
       style={{ "--wails-drop-target": "drop" } as CSSProperties}
       onDropCapture={onFileDropCapture}
@@ -3699,7 +3800,13 @@ export function Composer({
         className="composer-access-menu composer-intent-menu"
         align="start"
       >
-        <div className="composer-access-menu__section" role="menu" aria-label={t("composer.intentMenuTitle")}>
+        <div
+          className="composer-access-menu__section"
+          role="menu"
+          aria-label={t("composer.intentMenuTitle")}
+          onMouseEnter={creationChrome ? onIntentPopoverEnter : undefined}
+          onMouseLeave={creationChrome ? onIntentHoverLeave : undefined}
+        >
           <div className="composer-access-menu__label">{t("composer.intentMenuTitle")}</div>
           <button
             type="button"
@@ -3767,7 +3874,13 @@ export function Composer({
         className="composer-access-menu composer-profile-menu"
         align="start"
       >
-        <div className="composer-access-menu__section" role="menu" aria-label={t("composer.runtimeProfileTitle")}>
+        <div
+          className="composer-access-menu__section"
+          role="menu"
+          aria-label={t("composer.runtimeProfileTitle")}
+          onMouseEnter={creationChrome ? onProfilePopoverEnter : undefined}
+          onMouseLeave={creationChrome ? onProfileHoverLeave : undefined}
+        >
           <div className="composer-access-menu__label">{t("composer.runtimeProfileTitle")}</div>
           {([
             ["economy", Gauge, "composer.runtimeProfileEconomy", "composer.runtimeProfileEconomyDesc"],
@@ -4354,17 +4467,19 @@ export function Composer({
               </Tooltip>
             </div>
             <div className="composer-meta__control composer-meta__control--intent">
-              <Tooltip label={taskModeTooltipLabel} disabled={intentMenuOpen || intentMenuClosing}>
+              <Tooltip label={taskModeTooltipLabel} disabled={intentMenuOpen || intentMenuClosing || creationChrome}>
                 <button
                   ref={intentMenuAnchorRef}
                   type="button"
                   className={`composer-task-mode-trigger${intentMenuOpen || intentMenuClosing ? " composer-task-mode-trigger--open" : ""}`}
                   onClick={() => (intentMenuOpen || intentMenuClosing ? closeIntentMenu() : openIntentMenu())}
+                  onMouseEnter={creationChrome ? onIntentHoverEnter : undefined}
+                  onMouseLeave={creationChrome ? onIntentHoverLeave : undefined}
                   disabled={disabled || running}
                   aria-haspopup="menu"
                   aria-expanded={intentMenuOpen && !intentMenuClosing}
                   aria-label={taskModeTriggerLabel}
-                  title={intentMenuOpen || intentMenuClosing ? undefined : taskModeTriggerLabel}
+                  title={intentMenuOpen || intentMenuClosing || creationChrome ? undefined : taskModeTriggerLabel}
                 >
                   <TaskModeIcon size={14} aria-hidden="true" />
                   <span className="composer-task-mode-trigger__value">{t(taskModeShortKey)}</span>
@@ -4373,18 +4488,20 @@ export function Composer({
               </Tooltip>
             </div>
             <div className="composer-meta__control composer-meta__control--profile">
-              <Tooltip label={runtimeProfileTooltipLabel} disabled={profileMenuOpen || profileMenuClosing}>
+              <Tooltip label={runtimeProfileTooltipLabel} disabled={profileMenuOpen || profileMenuClosing || creationChrome}>
                 <button
                   ref={profileMenuAnchorRef}
                   type="button"
                   data-profile={tokenMode}
                   className={`composer-profile-trigger${profileMenuOpen || profileMenuClosing ? " composer-profile-trigger--open" : ""}`}
                   onClick={() => (profileMenuOpen || profileMenuClosing ? closeProfileMenu() : openProfileMenu())}
+                  onMouseEnter={creationChrome ? onProfileHoverEnter : undefined}
+                  onMouseLeave={creationChrome ? onProfileHoverLeave : undefined}
                   disabled={disabled || running}
                   aria-haspopup="menu"
                   aria-expanded={profileMenuOpen && !profileMenuClosing}
                   aria-label={runtimeProfileTriggerLabel}
-                  title={profileMenuOpen || profileMenuClosing ? undefined : runtimeProfileTriggerLabel}
+                  title={profileMenuOpen || profileMenuClosing || creationChrome ? undefined : runtimeProfileTriggerLabel}
                 >
                   <RuntimeProfileIcon size={14} strokeWidth={1.75} aria-hidden="true" />
                   <span className="composer-profile-trigger__label">

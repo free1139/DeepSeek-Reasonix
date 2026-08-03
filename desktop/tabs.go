@@ -247,18 +247,33 @@ type readFileRecord struct {
 }
 
 type sessionUsageStats struct {
-	PromptTokens     int                         `json:"promptTokens"`
-	CompletionTokens int                         `json:"completionTokens"`
-	TotalTokens      int                         `json:"totalTokens"`
-	ReasoningTokens  int                         `json:"reasoningTokens"`
-	CacheHitTokens   int                         `json:"cacheHitTokens"`
-	CacheMissTokens  int                         `json:"cacheMissTokens"`
-	RequestCount     int                         `json:"requestCount"`
-	ElapsedMs        int64                       `json:"elapsedMs"`
-	SessionCost      float64                     `json:"sessionCost,omitempty"`
-	SessionCurrency  string                      `json:"sessionCurrency,omitempty"`
-	SessionCostUsd   float64                     `json:"sessionCostUsd,omitempty"`
-	Sources          map[string]usageSourceStats `json:"sources,omitempty"`
+	PromptTokens     int  `json:"promptTokens"`
+	CompletionTokens int  `json:"completionTokens"`
+	TotalTokens      int  `json:"totalTokens"`
+	ReasoningTokens  int  `json:"reasoningTokens"`
+	CacheHitTokens   int  `json:"cacheHitTokens"`
+	CacheMissTokens  int  `json:"cacheMissTokens"`
+	Estimated        bool `json:"estimated,omitempty"`
+	// LastUsedTokens is the executor-reported context fill (prompt+completion)
+	// from the most recent turn. It is persisted so the status bar / context
+	// panel can show a meaningful fill percentage after a session rebind
+	// rebuilds the controller (which resets the in-memory executor state).
+	LastUsedTokens int `json:"lastUsedTokens,omitempty"`
+	// Per-turn token breakdown from the most recent turn. Persisted separately
+	// from the cumulative totals above so the context-panel donut chart and
+	// type breakdown survive a session rebind (which resets executor.LastUsage).
+	LastPromptTokens     int                         `json:"lastPromptTokens,omitempty"`
+	LastCompletionTokens int                         `json:"lastCompletionTokens,omitempty"`
+	LastReasoningTokens  int                         `json:"lastReasoningTokens,omitempty"`
+	LastCacheHitTokens   int                         `json:"lastCacheHitTokens,omitempty"`
+	LastCacheMissTokens  int                         `json:"lastCacheMissTokens,omitempty"`
+	LastEstimated        bool                        `json:"lastEstimated,omitempty"`
+	RequestCount         int                         `json:"requestCount"`
+	ElapsedMs            int64                       `json:"elapsedMs"`
+	SessionCost          float64                     `json:"sessionCost,omitempty"`
+	SessionCurrency      string                      `json:"sessionCurrency,omitempty"`
+	SessionCostUsd       float64                     `json:"sessionCostUsd,omitempty"`
+	Sources              map[string]usageSourceStats `json:"sources,omitempty"`
 
 	activeTurnStartedAt int64
 	sourceSessionCache  map[string]sourceSessionCacheCounters
@@ -271,6 +286,7 @@ type usageSourceStats struct {
 	ReasoningTokens  int     `json:"reasoningTokens"`
 	CacheHitTokens   int     `json:"cacheHitTokens"`
 	CacheMissTokens  int     `json:"cacheMissTokens"`
+	Estimated        bool    `json:"estimated,omitempty"`
 	RequestCount     int     `json:"requestCount"`
 	SessionCost      float64 `json:"sessionCost,omitempty"`
 	SessionCurrency  string  `json:"sessionCurrency,omitempty"`
@@ -931,7 +947,21 @@ func (t *WorkspaceTab) recordUsage(e event.Event) {
 	cacheHitTokens, cacheMissTokens := t.usageTelemetry.cacheTokenDelta(source, u, e.SessionHit, e.SessionMiss)
 	t.usageTelemetry.CacheHitTokens += cacheHitTokens
 	t.usageTelemetry.CacheMissTokens += cacheMissTokens
-	t.usageTelemetry.RequestCount++
+	t.usageTelemetry.Estimated = t.usageTelemetry.Estimated || u.Estimated
+	requestCount := u.RequestCount
+	if requestCount <= 0 {
+		requestCount = 1
+	}
+	t.usageTelemetry.RequestCount += requestCount
+	if source == event.UsageSourceExecutor {
+		t.usageTelemetry.LastUsedTokens = u.PromptTokens + u.CompletionTokens
+		t.usageTelemetry.LastPromptTokens = u.PromptTokens
+		t.usageTelemetry.LastCompletionTokens = u.CompletionTokens
+		t.usageTelemetry.LastReasoningTokens = u.ReasoningTokens
+		t.usageTelemetry.LastCacheHitTokens = cacheHitTokens
+		t.usageTelemetry.LastCacheMissTokens = cacheMissTokens
+		t.usageTelemetry.LastEstimated = u.Estimated
+	}
 	if t.usageTelemetry.Sources == nil {
 		t.usageTelemetry.Sources = map[string]usageSourceStats{}
 	}
@@ -942,7 +972,8 @@ func (t *WorkspaceTab) recordUsage(e event.Event) {
 	src.ReasoningTokens += u.ReasoningTokens
 	src.CacheHitTokens += cacheHitTokens
 	src.CacheMissTokens += cacheMissTokens
-	src.RequestCount++
+	src.Estimated = src.Estimated || u.Estimated
+	src.RequestCount += requestCount
 	if e.Pricing != nil {
 		currency := e.Pricing.Symbol()
 		if existing := strings.TrimSpace(t.usageTelemetry.SessionCurrency); existing != "" && existing != currency {
@@ -980,6 +1011,7 @@ func usageStatsAsProviderUsage(stats usageSourceStats) *provider.Usage {
 		ReasoningTokens:  stats.ReasoningTokens,
 		CacheHitTokens:   stats.CacheHitTokens,
 		CacheMissTokens:  stats.CacheMissTokens,
+		Estimated:        stats.Estimated,
 	}
 }
 
@@ -991,6 +1023,7 @@ func sessionStatsAsProviderUsage(stats sessionUsageStats) *provider.Usage {
 		ReasoningTokens:  stats.ReasoningTokens,
 		CacheHitTokens:   stats.CacheHitTokens,
 		CacheMissTokens:  stats.CacheMissTokens,
+		Estimated:        stats.Estimated,
 	}
 }
 
@@ -2380,6 +2413,10 @@ func (a *App) openTopicTabWithActivation(scope, workspaceRoot, topicID, sessionP
 			a.mu.Unlock()
 			return TabMeta{}, err
 		}
+		if err := pinNewEmptySessionBranchMeta(sessionPath, scope, actualRoot, topicID, topicTitle); err != nil {
+			a.mu.Unlock()
+			return TabMeta{}, err
+		}
 	}
 	profile := loadTabSessionProfile(sessionPath)
 	tab := &WorkspaceTab{
@@ -2639,6 +2676,12 @@ func (a *App) ensureBlankTab(scope, workspaceRoot, forcedTokenMode string) (TabM
 			a.mu.Unlock()
 			return TabMeta{}, err
 		}
+		if err := pinNewEmptySessionBranchMeta(prePath, scope, actualRoot, topicID, topicTitle); err != nil {
+			delete(a.tabs, tabID)
+			a.removeTabOrderLocked(tabID)
+			a.mu.Unlock()
+			return TabMeta{}, err
+		}
 		created.SessionPath = prePath
 		a.saveTabsLocked()
 		meta := a.tabMeta(created, true)
@@ -2684,6 +2727,12 @@ func (a *App) ensureBlankTab(scope, workspaceRoot, forcedTokenMode string) (TabM
 	a.activeTabID = tabID
 	prePath, err := createEmptySessionFile(desktopSessionDir(actualRoot), inheritedModel)
 	if err != nil {
+		delete(a.tabs, tabID)
+		a.removeTabOrderLocked(tabID)
+		a.mu.Unlock()
+		return TabMeta{}, err
+	}
+	if err := pinNewEmptySessionBranchMeta(prePath, scope, actualRoot, topicID, topicTitle); err != nil {
 		delete(a.tabs, tabID)
 		a.removeTabOrderLocked(tabID)
 		a.mu.Unlock()
@@ -2743,6 +2792,43 @@ func createEmptySessionFile(dir, model string) (string, error) {
 		return "", err
 	}
 	return "", fmt.Errorf("create empty session file: exhausted filename retries")
+}
+
+func pinNewEmptySessionBranchMeta(path, scope, workspaceRoot, topicID, topicTitle string) error {
+	if err := pinSessionBranchMeta(path, scope, workspaceRoot, topicID, topicTitle); err != nil {
+		pinErr := fmt.Errorf("pin empty session metadata: %w", err)
+		if cleanupErr := removeDesktopSessionArtifacts(path); cleanupErr != nil {
+			return errors.Join(pinErr, fmt.Errorf("clean up unbound empty session: %w", cleanupErr))
+		}
+		return pinErr
+	}
+	return nil
+}
+
+// pinSessionBranchMeta stores the workspace scope, root, and topic on a newly
+// created session before a controller can reconcile the tab against it.
+func pinSessionBranchMeta(sessionPath, scope, workspaceRoot, topicID, topicTitle string) error {
+	unlock := agent.LockSessionMetaPath(sessionPath)
+	defer unlock()
+	m, err := agent.EnsureBranchMeta(sessionPath)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(scope) == "project" {
+		workspaceRoot = normalizeProjectRoot(workspaceRoot)
+		if workspaceRoot == "" {
+			return fmt.Errorf("project workspace root is required")
+		}
+		scope = "project"
+	} else {
+		scope = "global"
+		workspaceRoot = ""
+	}
+	m.Scope = scope
+	m.WorkspaceRoot = workspaceRoot
+	m.TopicID = topicID
+	m.TopicTitle = topicTitle
+	return agent.SaveBranchMetaPreserveUpdated(sessionPath, m)
 }
 
 func blankTabSessionPathHasNoContent(tab *WorkspaceTab) bool {
@@ -2947,7 +3033,7 @@ func (a *App) SetActiveTab(tabID string) error {
 	if switched {
 		a.emitWorkbenchTarget("disconnected", targetID, targetGen, targetSeq, "")
 		a.emitReady(a.ctx, tabID)
-		a.emitRuntimeEvent("runtime:rebuilt", tabID)
+		a.emitWorkbenchLocalRuntimeRebuilt(tabID)
 	}
 	a.kickDeferredRebuildRetry()
 	return nil
@@ -2982,6 +3068,10 @@ func (a *App) ReorderTabs(tabIDs []string) error {
 // background work, the controller is detached so closing a view does not destroy
 // the session runtime.
 func (a *App) CloseTab(tabID string) error {
+	return a.closeTab(tabID, true)
+}
+
+func (a *App) closeTab(tabID string, allowDetach bool) error {
 	defer a.lockRuntimeMutation("close-tab")()
 	a.sessionRemovalMu.Lock()
 	defer a.sessionRemovalMu.Unlock()
@@ -3031,6 +3121,10 @@ func (a *App) CloseTab(tabID string) error {
 		a.mu.Unlock()
 		return fmt.Errorf("cannot close the last tab")
 	}
+	if !allowDetach && tab.hasActiveRuntimeWork() {
+		a.mu.Unlock()
+		return fmt.Errorf("task still has active work")
+	}
 	if tab.Ctrl == nil || !tab.hasActiveRuntimeWork() {
 		a.markTabRemovedLocked(tab)
 	}
@@ -3072,7 +3166,7 @@ func (a *App) CloseTab(tabID string) error {
 	// before the tab binding was removed.
 	discardPath, discardTransientBlank := a.transientBlankSessionArtifactPath(tab)
 	if closeCtrl != nil {
-		if controllerHasActiveRuntimeWork(closeCtrl) && a.detachSessionRuntime(tab) {
+		if allowDetach && controllerHasActiveRuntimeWork(closeCtrl) && a.detachSessionRuntime(tab) {
 			// Detached runtimes keep running and must keep saving: do not
 			// clear the path or drain for them.
 			return nil
@@ -3666,6 +3760,7 @@ func (a *App) buildTabControllerWithContextAdmissionHeld(tab *WorkspaceTab, load
 		Model:                    model,
 		RequireKey:               false,
 		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
+		StatsSource:              "desktop",
 		Sink:                     sink,
 		WorkspaceRoot:            root,
 		SessionDir:               sessionDir,
@@ -3742,21 +3837,55 @@ func (a *App) buildTabControllerWithContextAdmissionHeld(tab *WorkspaceTab, load
 		}
 		var path string
 		var resumeSession *agent.Session
+		var resumeLoadErr error
 		// Prefer the exact session file persisted for this tab. Topic lookup is a
 		// compatibility fallback for older desktop-tabs.json files that only stored
 		// topicId and could pick the wrong session when one topic had multiple files.
-		if loaded, pinnedPath, ok := loadPinnedTabSessionWithPreload(dir, tabSessionPath, loadedSession); ok {
+		if loaded, pinnedPath, ok, loadErr := loadPinnedTabSessionWithPreload(dir, tabSessionPath, loadedSession); loadErr != nil {
+			resumeLoadErr = loadErr
+		} else if ok {
 			path = pinnedPath
 			resumeSession = loaded
 		}
-		if path == "" && tabTopicID != "" {
+		if resumeLoadErr == nil && path == "" && tabTopicID != "" {
 			existingPath := findTopicSession(dir, tabTopicID)
 			if existingPath != "" {
 				if loaded, err := loadResumableSession(existingPath); err == nil {
 					path = existingPath
 					resumeSession = loaded
+				} else {
+					resumeLoadErr = err
 				}
 			}
+		}
+		if resumeLoadErr != nil {
+			resumeLoadErr = friendlySessionLoadError(resumeLoadErr)
+			leaseHeld := false
+			a.mu.Lock()
+			if a.tabBuildSupersededLocked(tab, buildGeneration) {
+				a.mu.Unlock()
+				a.abandonSupersededBuild(tab, ctrl, rootKey, "")
+				return
+			}
+			leaseHeld = setTabStartupError(tab, resumeLoadErr)
+			tab.Ready = false
+			if leaseHeld {
+				a.setSessionRuntimePhaseLocked(tab, sessionRuntimeLeaseBlocked, resumeLoadErr)
+			} else {
+				a.setSessionRuntimePhaseLocked(tab, sessionRuntimeFailed, resumeLoadErr)
+			}
+			hostKey := takeTabSharedHostKey(tab)
+			tab.releaseSessionLease()
+			a.mu.Unlock()
+			ctrl.Close()
+			if hostKey != "" {
+				a.releaseSharedHost(hostKey)
+			}
+			if leaseHeld {
+				a.scheduleDeferredStartupBuild(tab.ID)
+			}
+			a.emitReady(wailsCtx, tab.ID)
+			return
 		}
 		if path == "" {
 			path = agent.NewSessionPath(dir, ctrl.Label())
@@ -4734,13 +4863,6 @@ func (a *App) saveTabsCollectLocked() (string, []desktopTabEntry, string, uint64
 // writes must be serialized because every save uses the same destination and
 // fixed .tmp path.
 func (a *App) saveTabsWrite(dir string, entries []desktopTabEntry, activeID string, version uint64) {
-	// Safe Mode runs on a temporary tab set that must never persist: writing it
-	// would replace desktop-tabs.json and destroy the saved layout the next
-	// normal boot restores. This is the single choke point every tab-snapshot
-	// write funnels through, so gating here covers build, close, and GC paths.
-	if config.SafeModeRequested() {
-		return
-	}
 	a.tabsSaveMu.Lock()
 	defer a.tabsSaveMu.Unlock()
 	if version < a.tabsLastWrittenVersion {
@@ -7957,20 +8079,22 @@ func unixMilliOrZero(t time.Time) int64 {
 
 // ContextPanelInfo is the right-side panel's data for one tab.
 type ContextPanelInfo struct {
-	UsedTokens       int `json:"usedTokens"`
-	WindowTokens     int `json:"windowTokens"`
-	PromptTokens     int `json:"promptTokens"`
-	CompletionTokens int `json:"completionTokens"`
-	TotalTokens      int `json:"totalTokens"`
-	ReasoningTokens  int `json:"reasoningTokens"`
-	CacheHitTokens   int `json:"cacheHitTokens"`
-	CacheMissTokens  int `json:"cacheMissTokens"`
+	UsedTokens       int  `json:"usedTokens"`
+	WindowTokens     int  `json:"windowTokens"`
+	PromptTokens     int  `json:"promptTokens"`
+	CompletionTokens int  `json:"completionTokens"`
+	TotalTokens      int  `json:"totalTokens"`
+	ReasoningTokens  int  `json:"reasoningTokens"`
+	CacheHitTokens   int  `json:"cacheHitTokens"`
+	CacheMissTokens  int  `json:"cacheMissTokens"`
+	Estimated        bool `json:"estimated,omitempty"`
 	// Session-cumulative token counts (from telemetry, atomic snapshot).
 	// Separate from the per-turn fields above so existing consumers (status bar
 	// turn tokens, donut chart) are unaffected.
 	SessionCacheHitTokens   int                         `json:"sessionCacheHitTokens"`
 	SessionCacheMissTokens  int                         `json:"sessionCacheMissTokens"`
 	SessionCompletionTokens int                         `json:"sessionCompletionTokens"`
+	SessionEstimated        bool                        `json:"sessionEstimated,omitempty"`
 	RequestCount            int                         `json:"requestCount"`
 	ElapsedMs               int64                       `json:"elapsedMs"`
 	SessionCost             float64                     `json:"sessionCost"`
@@ -8014,6 +8138,14 @@ func (a *App) ContextPanel(tabID string) ContextPanelInfo {
 		used, window := ctrl.ContextSnapshot()
 		info.UsedTokens = used
 		info.WindowTokens = window
+		// Session rebind rebuilds the controller: the fresh executor has no
+		// per-turn usage yet, so ContextSnapshot reports used=0. Fall back to
+		// the telemetry-persisted last-used value from the most recent turn.
+		if used == 0 {
+			if snap := tab.telemetrySnapshot(); snap.Usage.LastUsedTokens > 0 {
+				info.UsedTokens = snap.Usage.LastUsedTokens
+			}
+		}
 		// Per-turn token breakdown from LastUsage (same snapshot as UsedTokens)
 		// so the donut segments are proportional to the current context fill,
 		// not inflated by cumulative session totals.
@@ -8023,6 +8155,18 @@ func (a *App) ContextPanel(tabID string) ContextPanelInfo {
 			info.ReasoningTokens = u.ReasoningTokens
 			info.CacheHitTokens = u.CacheHitTokens
 			info.CacheMissTokens = u.CacheMissTokens
+			info.Estimated = u.Estimated
+		} else {
+			// Executor rebuilt (session rebind): fall back to the telemetry-
+			// persisted per-turn breakdown so the donut chart and type
+			// breakdown show the last turn's composition instead of "other".
+			snap := tab.telemetrySnapshot()
+			info.PromptTokens = snap.Usage.LastPromptTokens
+			info.CompletionTokens = snap.Usage.LastCompletionTokens
+			info.ReasoningTokens = snap.Usage.LastReasoningTokens
+			info.CacheHitTokens = snap.Usage.LastCacheHitTokens
+			info.CacheMissTokens = snap.Usage.LastCacheMissTokens
+			info.Estimated = snap.Usage.LastEstimated
 		}
 	}
 
@@ -8041,6 +8185,7 @@ func (a *App) ContextPanel(tabID string) ContextPanelInfo {
 	info.SessionCacheHitTokens = usage.CacheHitTokens
 	info.SessionCacheMissTokens = usage.CacheMissTokens
 	info.SessionCompletionTokens = usage.CompletionTokens
+	info.SessionEstimated = usage.Estimated
 
 	// Gather workspace changes for this tab's root.
 	if ctrl != nil && tab.WorkspaceRoot != "" {
@@ -8439,46 +8584,46 @@ func globalTabWorkspaceRoot() string {
 	return root
 }
 
-func loadPinnedTabSession(dir, sessionPath string) (*agent.Session, string, bool) {
+func loadPinnedTabSession(dir, sessionPath string) (*agent.Session, string, bool, error) {
 	return loadPinnedTabSessionWithPreloadAndMigrationFallback(dir, sessionPath, loadedTabSession{}, true)
 }
 
-func loadPinnedTabSessionWithPreload(dir, sessionPath string, preloaded loadedTabSession) (*agent.Session, string, bool) {
+func loadPinnedTabSessionWithPreload(dir, sessionPath string, preloaded loadedTabSession) (*agent.Session, string, bool, error) {
 	return loadPinnedTabSessionWithPreloadAndMigrationFallback(dir, sessionPath, preloaded, false)
 }
 
-func loadPinnedTabSessionWithPreloadAndMigrationFallback(dir, sessionPath string, preloaded loadedTabSession, allowMigrationFallback bool) (*agent.Session, string, bool) {
+func loadPinnedTabSessionWithPreloadAndMigrationFallback(dir, sessionPath string, preloaded loadedTabSession, allowMigrationFallback bool) (*agent.Session, string, bool, error) {
 	path, ok := pinnedTabSessionPath(dir, sessionPath)
 	if !ok && allowMigrationFallback {
 		path, ok = migratedPinnedTabSessionPath(dir, sessionPath)
 	}
 	if !ok {
-		return nil, "", false
+		return nil, "", false, nil
 	}
 	if agent.IsCleanupPending(path) {
-		return nil, "", false
+		return nil, "", false, nil
 	}
 	if preloaded.matches(path) {
 		if preloaded.Session != nil && len(preloaded.Session.Snapshot()) == 0 {
-			return nil, path, true
+			return nil, path, true, nil
 		}
-		return preloaded.Session, path, true
+		return preloaded.Session, path, true, nil
 	}
 	loaded, err := agent.LoadSession(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, path, true
+			return nil, path, true, nil
 		}
-		return nil, "", false
+		return nil, path, true, err
 	}
 	// An empty file (0 messages) is a pre-created placeholder, not a real
 	// session to resume.  Treating it as valid would make ctrl.Resume replace
 	// the executor's live session (with system prompt) with the empty one,
 	// causing the saved transcript to lack the agent identity contract.
 	if len(loaded.Snapshot()) == 0 {
-		return nil, path, true
+		return nil, path, true, nil
 	}
-	return loaded, path, true
+	return loaded, path, true, nil
 }
 
 func migratedPinnedTabSessionPath(dir, sessionPath string) (string, bool) {

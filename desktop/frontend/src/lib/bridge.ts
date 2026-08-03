@@ -33,6 +33,8 @@ import type {
   RemoteServerView,
   RemoteForwardsEvent,
   BalanceInfo,
+  UsageStatsRange,
+  UsageStatsRequest,
   BotConnectionDiagnostic,
   BotInstallPollResult,
   BotInstallStartResult,
@@ -57,6 +59,10 @@ import type {
   HookConfigView,
   HooksSettingsView,
   JobView,
+  ActiveWorkView,
+  BackgroundRuntimeView,
+  JobCancelBatchView,
+  WorkspaceConflictView,
   MCPMarketplaceEntry,
   MCPServerInput,
   MCPInstallResult,
@@ -75,6 +81,7 @@ import type {
   ProjectNode,
   PromptHistoryEntry,
   PromptHistoryResult,
+  ProviderModelCatalogUpdate,
   ProviderPresetView,
   ProviderView,
   QuestionAnswer,
@@ -94,7 +101,6 @@ import type {
   TerminalWorkspaceView,
   TopicMeta,
   ToolApprovalMode,
-  UpdateDownloadResult,
   UpdateInfo,
   UpdateProgress,
   WireEvent,
@@ -260,8 +266,18 @@ export interface AppBindings {
   ContextUsageForTab(tabID: string): Promise<ContextInfo>;
   Balance(): Promise<BalanceInfo>;
   BalanceForTab(tabID: string): Promise<BalanceInfo>;
+  UsageStats(req: UsageStatsRequest): Promise<UsageStatsRange>;
   Jobs(): Promise<JobView[]>;
   JobsForTab(tabID: string): Promise<JobView[]>;
+  CancelJob(jobID: string): Promise<boolean>;
+  CancelJobForTab(tabID: string, jobID: string): Promise<boolean>;
+  CancelJobsForTab(tabID: string, jobIDs: string[]): Promise<JobCancelBatchView>;
+  ActiveWorkForTab(tabID: string): Promise<ActiveWorkView>;
+  BackgroundRuntimes(): Promise<BackgroundRuntimeView[]>;
+  RevealBackgroundRuntime(tabID: string): Promise<TabMeta>;
+  WorkspaceConflictForTab(tabID: string): Promise<WorkspaceConflictView>;
+  RevealWorkspaceWriterForTab(tabID: string): Promise<TabMeta>;
+  CloseTabWithPolicy(tabID: string, policy: "keep_running" | "stop_and_close"): Promise<void>;
   ToolResultForTab(tabID: string, toolID: string): Promise<{ args: string; output: string } | null>;
   Meta(): Promise<Meta>;
   MetaForTab(tabID: string): Promise<Meta>;
@@ -388,11 +404,13 @@ export interface AppBindings {
   SetDefaultAutoRecoveryCheckpoint(enabled: boolean): Promise<void>;
 
   SaveProvider(p: ProviderView): Promise<void>;
+  SaveProviderModelCatalogs(updates: ProviderModelCatalogUpdate[]): Promise<string[]>;
   SaveProviderWithKey(p: ProviderView, key: string): Promise<string>;
   AddOfficialProviderAccess(kind: string, key: string): Promise<string>;
   AddProviderPresetAccess(id: string, key: string): Promise<string>;
   ResetProviderPresetAccess(id: string): Promise<void>;
   FetchProviderModels(p: ProviderView): Promise<string[]>;
+  FetchAllProviderModels(providers: ProviderView[]): Promise<Record<string, string[]>>;
   DeleteProvider(name: string): Promise<void>;
   RemoveProviderAccess(name: string): Promise<void>;
   SaveProviderKey(apiKeyEnv: string, value: string): Promise<string>;
@@ -420,6 +438,7 @@ export interface AppBindings {
   SetDesktopLanguage(lang: string): Promise<void>;
   SetDesktopCurrency(currency: string): Promise<void>;
   SetDesktopAppearance(theme: string, style: string): Promise<void>;
+  SetDesktopTerminalTheme(theme: string): Promise<void>;
   ListThemePacks(): Promise<import("./themePack").ThemePackView[]>;
   GetActiveThemePack(): Promise<import("./themePack").ThemeActiveView>;
   GetThemeExperience(): Promise<import("./themeExperience").ThemeExperienceView>;
@@ -447,6 +466,7 @@ export interface AppBindings {
   MigrateDesktopPreferences(language: string, theme: string, style: string): Promise<void>;
   SetAgentParams(temperature: number, maxSteps: number, plannerMaxSteps: number, systemPrompt: string): Promise<void>;
   SetColdResumePrune(enabled: boolean): Promise<void>;
+  SetCompactRatio(ratio: number): Promise<void>;
   SetReasoningLanguage(lang: string): Promise<void>;
   SetTrayLocale(locale: "en" | "zh" | "zh-TW"): Promise<void>;
   // SetBypass is the legacy Wails name for YOLO/full-access tool auto-approval
@@ -455,12 +475,11 @@ export interface AppBindings {
   SetBypass(on: boolean): Promise<void>;
   Version(): Promise<string>;
   CheckUpdate(channel: string): Promise<UpdateInfo | null>;
-  DownloadUpdate(channel: string): Promise<UpdateDownloadResult | null>;
-  DownloadUpdateRequest(channel: string, expectedVersion: string, requestId: string): Promise<UpdateDownloadResult | null>;
-  InstallUpdate(channel: string): Promise<void>;
-  InstallUpdateRequest(channel: string, expectedVersion: string, requestId: string): Promise<void>;
-  ApplyUpdate(): Promise<void>;
+  /** v1.20+ single-action update: download, verify, install, relaunch. */
+  ApplyUpdateRequest(channel: string, expectedVersion: string, requestId: string): Promise<void>;
   OpenDownloadPage(): Promise<void>;
+  OpenUserConfigPath?(): Promise<void>;
+  ReloadUserConfig?(): Promise<{ configWarnings?: string[]; configPath?: string } | null>;
   NeedsOnboarding(): Promise<boolean>;
   ConnectKey(apiKey: string): Promise<string>;
   // Crash overlay "Send report" (desktop/crash_app.go): scrubs user paths, attaches
@@ -887,11 +906,11 @@ function bridgeBreadcrumb(method: string): string {
     return `turn ${method}`;
   if (/^(SetModel|SetEffort|SetTokenMode|SetDefaultModel|SetPlannerModel|SetSubagentModel|SetSubagentEffort|SetMaxSubagentDepth|SetMaxSubagentConcurrency|SetMaxParallelWriters)/.test(method))
     return `model ${method}`;
-  if (/^(SetDesktop|SetCloseBehavior|SetDisplayMode|SetStatusBar|SetExpandThinking|SetAutoPlan|SetDefaultToolApprovalMode|SetReasoningLanguage)/.test(method))
+  if (/^(SetDesktop|SetCloseBehavior|SetDisplayMode|SetStatusBar|SetExpandThinking|SetAutoPlan|SetDefaultToolApprovalMode|SetCompactRatio|SetReasoningLanguage)/.test(method))
     return `settings ${method}`;
-  if (/^(SaveProvider|AddOfficialProviderAccess|AddProviderPresetAccess|ResetProviderPresetAccess|RemoveProviderAccess|DeleteProvider|SaveProviderKey|SetProviderKey|ClearProviderKey|FetchProviderModels|ConnectKey)/.test(method))
+  if (/^(SaveProvider|SaveProviderModelCatalogs|AddOfficialProviderAccess|AddProviderPresetAccess|ResetProviderPresetAccess|RemoveProviderAccess|DeleteProvider|SaveProviderKey|SetProviderKey|ClearProviderKey|FetchProviderModels|FetchAllProviderModels|ConnectKey)/.test(method))
     return `provider ${method}`;
-  if (/^(CheckUpdate|DownloadUpdate|DownloadUpdateRequest|InstallUpdate|InstallUpdateRequest|ApplyUpdate|OpenDownloadPage)/.test(method)) return `update ${method}`;
+  if (/^(CheckUpdate|ApplyUpdateRequest|OpenDownloadPage|OpenUserConfigPath|ReloadUserConfig)/.test(method)) return `update ${method}`;
   if (/^(AddMCPServer|InstallMCPServer|UpdateMCPServer|RemoveMCPServer|AuthorizeAndConnectMCPServer|ReconnectMCPServer|ClearMCPServerAuthentication|SetMCPServer)/.test(method))
     return `mcp ${method}`;
   if (/^(AddSkillPath|RemoveSkillPath|RefreshSkills|SetSkillEnabled|AcceptSkillSuggestion|AvailableSubagentTools|CreateSubagentProfile|UpdateSubagentProfile|DeleteSubagentProfile|SetSubagentProfileModel|SetSubagentProfileEffort|TrySubagentProfile|CancelTrySubagentProfile)/.test(method))
@@ -1075,6 +1094,12 @@ function mockPreset(id: string, label: string, description: string, keyEnv: stri
 
 const mockKimiAPIModels = ["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5"];
 const mockLongCatModels = ["LongCat-2.0"];
+const mockTokenRhythmModels = ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5", "glm-5.1", "minimax-m2.7", "kimi-k2.5", "kimi-k2.6", "minimax-m2.5", "mimo-v2.5-pro", "qwen3.7-max", "kimi-k2.7-code", "glm-5.2", "qwen3.8-max", "deepseek-v4-flash-0731"];
+const mockTokenRhythmModelOverrides = mockTokenRhythmModels.flatMap((model) => {
+  if (model.startsWith("glm-")) return [{ model, reasoningProtocol: "glm", supportedEfforts: ["enabled", "disabled"], defaultEffort: "enabled" }];
+  if (model.startsWith("deepseek-")) return [{ model, reasoningProtocol: "deepseek", supportedEfforts: model === "deepseek-v4-pro" ? ["disabled", "high", "max"] : ["disabled", "low", "high", "max"], defaultEffort: "high" }];
+  return [];
+});
 const mockMiMoV25Models = ["mimo-v2.5-pro", "mimo-v2.5"];
 const mockMiniMaxModels = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"];
 const mockGLMAPIModels = ["glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"];
@@ -1093,8 +1118,11 @@ const mockVercelModels = ["anthropic/claude-sonnet-4.6", "anthropic/claude-opus-
 const mockOllamaCloudModels = ["glm-5.2", "kimi-k2.7-code", "deepseek-v4-pro", "deepseek-v4-flash", "minimax-m3", "nemotron-3-nano:30b", "qwen3-coder-next"];
 
 const mockProviderPresetTemplates: MockProviderPresetTemplate[] = [
+  mockPreset("deepseek-responses", "DeepSeek Responses API", "DeepSeek official stateless Responses API for deepseek-v4-flash.", "DEEPSEEK_API_KEY", mockProviderTemplate({ name: "deepseek-responses", kind: "responses", baseUrl: "https://api.deepseek.com", models: ["deepseek-v4-flash"], default: "deepseek-v4-flash", apiKeyEnv: "DEEPSEEK_API_KEY", balanceUrl: "https://api.deepseek.com/user/balance", contextWindow: 1000000, supportedEfforts: ["low", "high", "max"], defaultEffort: "high" })),
+  mockPreset("deepseek-anthropic", "DeepSeek Anthropic", "Optional official DeepSeek Anthropic-compatible endpoint; Chat Completions remains the default.", "DEEPSEEK_API_KEY", mockProviderTemplate({ name: "deepseek-anthropic", kind: "anthropic", baseUrl: "https://api.deepseek.com/anthropic", models: ["deepseek-v4-flash", "deepseek-v4-pro"], default: "deepseek-v4-flash", apiKeyEnv: "DEEPSEEK_API_KEY", balanceUrl: "https://api.deepseek.com/user/balance", thinking: "enabled", contextWindow: 1000000, modelOverrides: [{ model: "deepseek-v4-flash", reasoningProtocol: "", supportedEfforts: ["disabled", "low", "high", "max"], defaultEffort: "high" }, { model: "deepseek-v4-pro", reasoningProtocol: "", supportedEfforts: ["disabled", "high", "max"], defaultEffort: "high" }] })),
   mockPreset("longcat-openai", "LongCat OpenAI", "LongCat Platform OpenAI-compatible endpoint for LongCat-2.0.", "LONGCAT_API_KEY", mockProviderTemplate({ name: "longcat-openai", kind: "openai", baseUrl: "https://api.longcat.chat/openai/v1", modelsUrl: "https://api.longcat.chat/openai/v1/models", models: mockLongCatModels, default: "LongCat-2.0", apiKeyEnv: "LONGCAT_API_KEY", contextWindow: 131072, thinking: "enabled", supportedEfforts: ["enabled", "disabled"], defaultEffort: "enabled" })),
   mockPreset("longcat-anthropic", "LongCat Anthropic", "LongCat Platform Anthropic-compatible Messages endpoint for LongCat-2.0.", "LONGCAT_API_KEY", mockProviderTemplate({ name: "longcat-anthropic", kind: "anthropic", baseUrl: "https://api.longcat.chat/anthropic", modelsUrl: "https://api.longcat.chat/anthropic/v1/models", models: mockLongCatModels, default: "LongCat-2.0", apiKeyEnv: "LONGCAT_API_KEY", authHeader: true, contextWindow: 131072, thinking: "enabled", supportedEfforts: ["enabled", "disabled"], defaultEffort: "enabled" })),
+  mockPreset("token-rhythm", "Token Rhythm", "Token Rhythm (基元律动) multi-model OpenAI-compatible gateway.", "TOKEN_RHYTHM_API_KEY", mockProviderTemplate({ name: "token-rhythm", kind: "openai", baseUrl: "https://tokenrhythm.studio/v1", modelsUrl: "https://tokenrhythm.studio/v1/models", models: mockTokenRhythmModels, visionModels: ["kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code"], default: "deepseek-v4-flash", apiKeyEnv: "TOKEN_RHYTHM_API_KEY", contextWindow: 1000000, modelOverrides: mockTokenRhythmModelOverrides })),
   mockPreset("kimi-cn", "Kimi CN API", "Moonshot Kimi China OpenAI-compatible API.", "KIMI_API_KEY", mockProviderTemplate({ name: "kimi-cn", kind: "openai", baseUrl: "https://api.moonshot.cn/v1", models: mockKimiAPIModels, visionModels: mockKimiAPIModels, default: "kimi-k2.7-code", apiKeyEnv: "KIMI_API_KEY", balanceUrl: "https://api.moonshot.cn/v1/users/me/balance", contextWindow: 262144, reasoningProtocol: "none", modelOverrides: [{ model: "kimi-k3", reasoningProtocol: "openai", supportedEfforts: ["low", "high", "max"], defaultEffort: "max", contextWindow: 1048576 }] })),
   mockPreset("kimi-global", "Kimi Global API", "Moonshot Kimi international OpenAI-compatible API.", "MOONSHOT_API_KEY", mockProviderTemplate({ name: "kimi-global", kind: "openai", baseUrl: "https://api.moonshot.ai/v1", models: mockKimiAPIModels, visionModels: mockKimiAPIModels, default: "kimi-k2.7-code", apiKeyEnv: "MOONSHOT_API_KEY", balanceUrl: "https://api.moonshot.ai/v1/users/me/balance", contextWindow: 262144, reasoningProtocol: "none", modelOverrides: [{ model: "kimi-k3", reasoningProtocol: "openai", supportedEfforts: ["low", "high", "max"], defaultEffort: "max", contextWindow: 1048576 }] })),
   mockPreset("kimi-coding-plan", "Kimi Coding Plan", "Kimi Coding Plan via its dedicated Anthropic-compatible endpoint.", "KIMI_CODING_API_KEY", mockProviderTemplate({ name: "kimi-coding-plan", kind: "anthropic", baseUrl: "https://api.kimi.com/coding/", models: ["kimi-for-coding"], visionModels: ["kimi-for-coding"], default: "kimi-for-coding", apiKeyEnv: "KIMI_CODING_API_KEY", headers: { "User-Agent": "claude-code/0.1.0" }, thinking: "adaptive", contextWindow: 262144 })),
@@ -1113,9 +1141,9 @@ const mockProviderPresetTemplates: MockProviderPresetTemplate[] = [
   mockPreset("glm-cn", "GLM CN API", "Zhipu GLM China OpenAI-compatible API with thinking controls.", "GLM_API_KEY", mockProviderTemplate({ name: "glm-cn", kind: "openai", baseUrl: "https://open.bigmodel.cn/api/paas/v4", models: mockGLMAPIModels, visionModels: ["glm-5v-turbo"], default: "glm-5.2", apiKeyEnv: "GLM_API_KEY", contextWindow: 1000000, thinking: "enabled", supportedEfforts: ["enabled", "disabled"], defaultEffort: "enabled" })),
   mockPreset("zai-global", "Z.AI Global API", "Z.AI international OpenAI-compatible GLM API.", "ZAI_API_KEY", mockProviderTemplate({ name: "zai-global", kind: "openai", baseUrl: "https://api.z.ai/api/paas/v4", models: mockGLMAPIModels, visionModels: ["glm-5v-turbo"], default: "glm-5.2", apiKeyEnv: "ZAI_API_KEY", contextWindow: 1000000, thinking: "enabled", supportedEfforts: ["enabled", "disabled"], defaultEffort: "enabled" })),
   mockPreset("glm-coding-plan-cn", "GLM Coding Plan CN", "Zhipu GLM China coding-plan endpoint.", "GLM_PLAN_API_KEY", mockProviderTemplate({ name: "glm-coding-plan-cn", kind: "openai", baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4", models: mockGLMCodingModels, default: "glm-5.2", apiKeyEnv: "GLM_PLAN_API_KEY", contextWindow: 1000000, thinking: "enabled", supportedEfforts: ["enabled", "disabled"], defaultEffort: "enabled" })),
-  mockPreset("glm-coding-plan-cn-anthropic", "GLM Coding Plan CN Anthropic", "Zhipu GLM China coding-plan Anthropic-compatible endpoint.", "GLM_PLAN_API_KEY", mockProviderTemplate({ name: "glm-coding-plan-cn-anthropic", kind: "anthropic", baseUrl: "https://open.bigmodel.cn/api/anthropic", models: mockGLMAnthropicModels, default: "glm-5.2[1m]", apiKeyEnv: "GLM_PLAN_API_KEY", authHeader: true, thinking: "adaptive", contextWindow: 1000000 })),
+  mockPreset("glm-coding-plan-cn-anthropic", "GLM Coding Plan CN Anthropic", "Zhipu GLM China coding-plan Anthropic-compatible endpoint.", "GLM_PLAN_API_KEY", mockProviderTemplate({ name: "glm-coding-plan-cn-anthropic", kind: "anthropic", baseUrl: "https://open.bigmodel.cn/api/anthropic", models: mockGLMAnthropicModels, default: "glm-5.2", apiKeyEnv: "GLM_PLAN_API_KEY", authHeader: true, thinking: "adaptive", contextWindow: 1000000 })),
   mockPreset("zai-coding-plan-global", "Z.AI Coding Plan Global", "Z.AI international coding-plan endpoint.", "ZAI_CODING_API_KEY", mockProviderTemplate({ name: "zai-coding-plan-global", kind: "openai", baseUrl: "https://api.z.ai/api/coding/paas/v4", models: mockGLMCodingModels, default: "glm-5.2", apiKeyEnv: "ZAI_CODING_API_KEY", contextWindow: 1000000, thinking: "enabled", supportedEfforts: ["enabled", "disabled"], defaultEffort: "enabled" })),
-  mockPreset("zai-coding-plan-global-anthropic", "Z.AI Coding Plan Global Anthropic", "Z.AI international coding-plan Anthropic-compatible endpoint.", "ZAI_CODING_API_KEY", mockProviderTemplate({ name: "zai-coding-plan-global-anthropic", kind: "anthropic", baseUrl: "https://api.z.ai/api/anthropic", models: mockGLMAnthropicModels, default: "glm-5.2[1m]", apiKeyEnv: "ZAI_CODING_API_KEY", authHeader: true, thinking: "adaptive", contextWindow: 1000000 })),
+  mockPreset("zai-coding-plan-global-anthropic", "Z.AI Coding Plan Global Anthropic", "Z.AI international coding-plan Anthropic-compatible endpoint.", "ZAI_CODING_API_KEY", mockProviderTemplate({ name: "zai-coding-plan-global-anthropic", kind: "anthropic", baseUrl: "https://api.z.ai/api/anthropic", models: mockGLMAnthropicModels, default: "glm-5.2", apiKeyEnv: "ZAI_CODING_API_KEY", authHeader: true, thinking: "adaptive", contextWindow: 1000000 })),
   mockPreset("opencode-go", "OpenCode Go", "OpenCode Go relay with per-model capability overrides.", "OPENCODE_GO_API_KEY", mockProviderTemplate({ name: "opencode-go", kind: "openai", baseUrl: "https://opencode.ai/zen/go/v1", models: mockOpenCodeGoModels, visionModels: ["kimi-k3"], default: "glm-5.2", apiKeyEnv: "OPENCODE_GO_API_KEY", contextWindow: 128000, modelOverrides: [{ model: "kimi-k3", reasoningProtocol: "openai", supportedEfforts: ["high", "max"], defaultEffort: "max", contextWindow: 1048576 }] })),
   mockPreset("opencode-go-anthropic", "OpenCode Go Anthropic", "OpenCode Go subscription Anthropic-compatible route for Qwen and MiniMax models.", "OPENCODE_GO_API_KEY", mockProviderTemplate({ name: "opencode-go-anthropic", kind: "anthropic", baseUrl: "https://opencode.ai/zen/go", models: mockOpenCodeGoAnthropicModels, visionModels: ["qwen3.7-plus", "qwen3.6-plus"], default: "qwen3.7-plus", apiKeyEnv: "OPENCODE_GO_API_KEY", thinking: "adaptive", contextWindow: 262144 })),
   mockPreset("opencode-zen-anthropic", "OpenCode Zen Anthropic", "OpenCode Zen Anthropic-compatible route for Claude and Qwen models.", "OPENCODE_API_KEY", mockProviderTemplate({ name: "opencode-zen-anthropic", kind: "anthropic", baseUrl: "https://opencode.ai/zen", models: mockOpenCodeZenAnthropicModels, visionModels: ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"], default: "claude-sonnet-4-6", apiKeyEnv: "OPENCODE_API_KEY", contextWindow: 262144 })),
@@ -1154,8 +1182,11 @@ function mockProviderPresetViews(): ProviderPresetView[] {
 }
 
 function mockProviderPresetDisplayRank(id: string): number {
+  if (id === "deepseek-responses") return -1;
+  if (id === "deepseek-anthropic") return 0;
   if (id === "glm-cn" || id === "zai-global" || id.startsWith("glm-coding-plan-") || id.startsWith("zai-coding-plan-")) return 0;
   if (id.startsWith("longcat-")) return 1;
+  if (id === "token-rhythm") return 1;
   if (id.startsWith("kimi-")) return 2;
   if (id.startsWith("minimax-")) return 3;
   return 4;
@@ -1463,7 +1494,7 @@ function makeMockApp(): AppBindings {
       noProxy: "",
       proxy: { type: "socks5", server: "127.0.0.1", port: 7890, username: "", password: "" },
     },
-    agent: { temperature: 0.2, maxSteps: 0, plannerMaxSteps: 0, maxSubagentDepth: 2, maxSubagentConcurrency: 6, maxParallelWriters: 3, systemPrompt: "You are Reasonix, a coding agent.", coldResumePrune: true, reasoningLanguage: "auto" },
+    agent: { temperature: 0.2, maxSteps: 0, plannerMaxSteps: 0, maxSubagentDepth: 2, maxSubagentConcurrency: 6, maxParallelWriters: 3, systemPrompt: "You are Reasonix, a coding agent.", coldResumePrune: true, reasoningLanguage: "auto", compactRatio: 0.8 },
     bot: {
       enabled: !freshMock,
       model: "",
@@ -1603,6 +1634,7 @@ function makeMockApp(): AppBindings {
     desktopLayoutStyle: "workbench",
     desktopTheme: "auto",
     desktopThemeStyle: "graphite",
+    desktopTerminalTheme: "auto",
     conversationWidth: "standard",
     closeBehavior: "background",
     displayMode: "compact",
@@ -2922,11 +2954,46 @@ function makeMockApp(): AppBindings {
         async BalanceForTab() {
           return this.Balance();
         },
+        async UsageStats() {
+          // Browser dev mock has no stats files; the panel does not consume
+          // provider aggregates, so keep this initial-bundle fallback lean.
+          return { from: "", to: "", tokens: 0, requests: 0, turns: 0, cacheHit: 0, cacheMiss: 0, activeDays: 0, topModel: "", daily: [], models: [] } as unknown as UsageStatsRange;
+        },
         async Jobs() {
           return []; // browser dev mock has no background jobs
         },
         async JobsForTab() {
           return this.Jobs();
+        },
+        async CancelJob() {
+          return false;
+        },
+        async CancelJobForTab(_tabID, jobID) {
+          return this.CancelJob(jobID);
+        },
+        async CancelJobsForTab(_tabID, jobIDs) {
+          return { cancelled: [], notRunning: [...jobIDs] };
+        },
+        async ActiveWorkForTab() {
+          return { running: false, pendingPrompt: false, cancellable: false, jobs: [] };
+        },
+        async BackgroundRuntimes() {
+          return [];
+        },
+        async RevealBackgroundRuntime() {
+          throw new Error("background runtime is unavailable in browser preview");
+        },
+        async WorkspaceConflictForTab() {
+          return {
+            state: "none", ownerWork: { running: false, pendingPrompt: false, cancellable: false, jobs: [] },
+            canReveal: false, canCreateWorktree: false,
+          };
+        },
+        async RevealWorkspaceWriterForTab() {
+          throw new Error("workspace writer is unavailable in browser preview");
+        },
+        async CloseTabWithPolicy(tabID) {
+          return this.CloseTab(tabID);
         },
         async ToolResultForTab() {
           return null;
@@ -3901,13 +3968,14 @@ function makeMockApp(): AppBindings {
       return this.SaveDoc(path, body);
     },
     async DesktopStartupSettings() {
-      const { bot, desktopLanguage, desktopLayoutStyle, desktopTheme, desktopThemeStyle, displayMode, statusBarStyle, statusBarItems, checkUpdates, conversationWidth } = settings;
+      const { bot, desktopLanguage, desktopLayoutStyle, desktopTheme, desktopThemeStyle, desktopTerminalTheme, displayMode, statusBarStyle, statusBarItems, checkUpdates, conversationWidth } = settings;
       return JSON.parse(JSON.stringify({
         bot,
         desktopLanguage,
         desktopLayoutStyle,
         desktopTheme,
         desktopThemeStyle,
+        desktopTerminalTheme,
         displayMode,
         statusBarStyle,
         statusBarItems,
@@ -3977,6 +4045,24 @@ function makeMockApp(): AppBindings {
       if (i >= 0) settings.providers[i] = p;
       else settings.providers.push(p);
     },
+    async SaveProviderModelCatalogs(updates: ProviderModelCatalogUpdate[]) {
+      const applied: string[] = [];
+      for (const update of updates) {
+        const i = settings.providers.findIndex((provider) => provider.name === update.name);
+        if (i < 0) continue;
+        const current = settings.providers[i];
+        if (!update.expectedFingerprint || current.modelCatalogFingerprint !== update.expectedFingerprint) continue;
+        settings.providers[i] = {
+          ...current,
+          models: [...update.models],
+          default: update.default,
+          visionModels: [...update.visionModels],
+          modelCatalogFingerprint: `${update.expectedFingerprint}:updated`,
+        };
+        applied.push(update.name);
+      }
+      return applied;
+    },
     async SaveProviderWithKey(p: ProviderView, key: string) {
       p.added = true;
       p.keySet = Boolean(key.trim()) || p.keySet;
@@ -4038,6 +4124,17 @@ function makeMockApp(): AppBindings {
       if (p.baseUrl.includes("token-plan")) return ["mimo-v2.5", "mimo-v2.5-pro"];
       if (p.baseUrl.includes("xiaomimimo")) return ["mimo-v2.5-pro", "mimo-v2.5"];
       return ["gpt-5", "gpt-5-mini", "qwen3-coder"];
+    },
+    async FetchAllProviderModels(providers: ProviderView[]) {
+      const out: Record<string, string[]> = {};
+      for (const p of providers) {
+        try {
+          out[p.name] = await this.FetchProviderModels(p);
+        } catch {
+          out[p.name] = [];
+        }
+      }
+      return out;
     },
     async DeleteProvider(name: string) {
       settings.providers = settings.providers.filter((p) => p.name !== name);
@@ -4209,6 +4306,9 @@ function makeMockApp(): AppBindings {
             mockBaseStyle = style;
           }
         },
+        async SetDesktopTerminalTheme(theme: string) {
+          settings.desktopTerminalTheme = theme === "dark" || theme === "light" ? theme : "auto";
+        },
         async ListThemePacks() {
           const baseActive = !mockActiveThemeId;
           return mockThemePacks.map((p) => {
@@ -4224,7 +4324,7 @@ function makeMockApp(): AppBindings {
           const pack = mockActiveThemeId && !["graphite","aurora","slate","carbon","nocturne","amber"].includes(mockActiveThemeId)
             ? mockThemePacks.find((p) => p.id === mockActiveThemeId)
             : null;
-          return { activeThemeId: pack ? mockActiveThemeId : "", pack: pack ? { ...pack, active: true } : null, safeMode: false };
+          return { activeThemeId: pack ? mockActiveThemeId : "", pack: pack ? { ...pack, active: true } : null };
         },
         async GetThemeExperience() {
           const pack = mockActiveThemeId && !["graphite","aurora","slate","carbon","nocturne","amber"].includes(mockActiveThemeId)
@@ -4236,7 +4336,6 @@ function makeMockApp(): AppBindings {
             effectiveStyle: pack?.baseStyle || mockBaseStyle,
             activeThemeId: pack ? mockActiveThemeId : "",
             activePack: pack ? { ...pack, active: true } : null,
-            safeMode: false,
           };
         },
         async ActivateThemePack(id: string) {
@@ -4341,7 +4440,8 @@ function makeMockApp(): AppBindings {
           settings.checkUpdates = enabled;
         },
         async SetDesktopUpdateChannel(channel: string) {
-          settings.updateChannel = channel === "preview" ? "preview" : "stable";
+          void channel;
+          settings.updateChannel = "stable";
         },
         async SetDesktopTelemetry(enabled: boolean) {
           settings.telemetry = enabled;
@@ -4366,6 +4466,10 @@ function makeMockApp(): AppBindings {
     async SetColdResumePrune(enabled: boolean) {
       settings.agent = { ...settings.agent, coldResumePrune: enabled };
     },
+    async SetCompactRatio(ratio: number) {
+      if (!Number.isFinite(ratio) || ratio < 0.65 || ratio > 0.85) throw new Error("compact ratio must be between 0.65 and 0.85");
+      settings.agent = { ...settings.agent, compactRatio: ratio };
+    },
     async SetReasoningLanguage(lang: string) {
       const normalized = lang === "zh" || lang === "en" ? lang : "auto";
       settings.agent = { ...settings.agent, reasoningLanguage: normalized };
@@ -4387,6 +4491,7 @@ function makeMockApp(): AppBindings {
       return "v1.0.0 (browser dev)";
     },
     async CheckUpdate(channel: string) {
+      void channel;
       // Keep the default browser preview focused on the primary product surface.
       // Updater methods remain mocked for explicit updater-flow tests.
       return {
@@ -4394,7 +4499,7 @@ function makeMockApp(): AppBindings {
         current: "v1.0.0",
         latest: "v1.0.0",
         notes: "",
-        channel: channel === "preview" ? "preview" : "stable",
+        channel: "stable",
         canSelfUpdate: false,
         manualOnly: true,
         installMode: "manual",
@@ -4404,42 +4509,28 @@ function makeMockApp(): AppBindings {
         assetSize: 0,
       };
     },
-    async DownloadUpdate(channel: string) {
-      const expectedVersion = channel === "preview" ? "v1.1.0-preview.1" : "v1.1.0";
-      return this.DownloadUpdateRequest(channel, expectedVersion, "mock-legacy-download");
-    },
-    async DownloadUpdateRequest(channel: string, expectedVersion: string, requestId: string) {
-      const selectedChannel = channel === "preview" ? "preview" : "stable";
+    async ApplyUpdateRequest(channel: string, expectedVersion: string, requestId: string) {
+      void channel;
+      const selectedChannel = "stable";
       const total = 12_345_678;
       for (let r = 0; r <= total; r += 1_800_000) {
         emitUpdater({ requestId, version: expectedVersion, channel: selectedChannel, phase: "downloading", received: Math.min(r, total), total });
         await delay(120);
       }
       emitUpdater({ requestId, version: expectedVersion, channel: selectedChannel, phase: "verifying", received: total, total });
-      await delay(500);
-      emitUpdater({ requestId, version: expectedVersion, channel: selectedChannel, phase: "downloaded", received: total, total });
-      return { requestId, version: expectedVersion, channel: selectedChannel, path: "/tmp/reasonix-update", size: total, sha256: "mock" };
-    },
-    async InstallUpdate(channel: string) {
-      const expectedVersion = channel === "preview" ? "v1.1.0-preview.1" : "v1.1.0";
-      await this.InstallUpdateRequest(channel, expectedVersion, "mock-legacy-install");
-    },
-    async InstallUpdateRequest(channel: string, expectedVersion: string, requestId: string) {
-      const selectedChannel = channel === "preview" ? "preview" : "stable";
-      const total = 12_345_678;
+      await delay(300);
       emitUpdater({ requestId, version: expectedVersion, channel: selectedChannel, phase: "installing", received: total, total });
-      await delay(500);
-      emitUpdater({ requestId, version: expectedVersion, channel: selectedChannel, phase: "done", received: total, total });
-      // The real shell relaunches here; the mock just stops.
-    },
-    async ApplyUpdate() {
-      await this.DownloadUpdateRequest("stable", "v1.1.0", "mock-apply-download");
-      await this.InstallUpdateRequest("stable", "v1.1.0", "mock-apply-install");
+      await delay(300);
+      emitUpdater({ requestId, version: expectedVersion, channel: selectedChannel, phase: "relaunching", received: 0, total: 0 });
     },
     async OpenDownloadPage() {
       if (typeof window !== "undefined") {
         window.open("https://reasonix.io/?download=desktop#start", "_blank", "noopener");
       }
+    },
+    async OpenUserConfigPath() {},
+    async ReloadUserConfig() {
+      return { configWarnings: [], configPath: "" };
     },
     // Dev seam: match the backend's provider-agnostic onboarding predicate.
     async NeedsOnboarding() {
