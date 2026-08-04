@@ -1187,7 +1187,12 @@ func chatREPL(args []string, version string) int {
 	}
 
 	m := newChatTUI(ctrl, missing, eventCh, termW)
-	m.planMode = permissions.plan
+	// Plan-first is the startup default for the interactive TUI; the approval
+	// axis still follows --permission-mode. applyPermissionMode above already
+	// synced the controller from the permission flags, so set the plan axis
+	// here on both the TUI mirror and the controller.
+	m.planMode = true
+	m.ctrl.SetPlanMode(true)
 	m.leases = leases
 	if cfg, err := config.Load(); err == nil {
 		m.outputStyle = cfg.Agent.OutputStyle    // shown as the active entry in /output-style
