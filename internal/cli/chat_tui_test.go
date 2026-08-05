@@ -1020,11 +1020,12 @@ func TestApprovalChoicesPreserveDecisionSemantics(t *testing.T) {
 
 func TestPlanApprovalActionsSynchronizeTUIAndControllerMode(t *testing.T) {
 	tests := []struct {
-		name     string
-		key      tea.KeyPressMsg
-		wantPlan bool
+		name       string
+		key        tea.KeyPressMsg
+		wantPlan   bool
+		wantResume bool
 	}{
-		{name: "start execution", key: tea.KeyPressMsg{Code: '1'}},
+		{name: "start execution", key: tea.KeyPressMsg{Code: '1'}, wantResume: true},
 		{name: "revise plan", key: tea.KeyPressMsg{Code: '2'}, wantPlan: true},
 		{name: "exit without executing", key: tea.KeyPressMsg{Code: '3'}},
 		{name: "legacy n keeps planning", key: tea.KeyPressMsg{Code: 'n'}, wantPlan: true},
@@ -1048,7 +1049,56 @@ func TestPlanApprovalActionsSynchronizeTUIAndControllerMode(t *testing.T) {
 			if m.planMode != tt.wantPlan || m.ctrl.PlanMode() != tt.wantPlan {
 				t.Fatalf("plan mode = tui %v/controller %v, want %v", m.planMode, m.ctrl.PlanMode(), tt.wantPlan)
 			}
+			if m.planResumeAfterTurn != tt.wantResume {
+				t.Fatalf("planResumeAfterTurn = %v, want %v", m.planResumeAfterTurn, tt.wantResume)
+			}
 		})
+	}
+}
+
+func TestPlanExecutionTurnDoneReturnsToPlanMode(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	t.Cleanup(ctrl.Close)
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+	m.planMode = true
+	m.ctrl.SetPlanMode(true)
+	m.pendingApproval = &event.Approval{ID: "plan", Tool: planApprovalTool}
+
+	// Start execution: plan turns off for the run and the resume flag arms.
+	next, _ := m.handleApprovalKey(tea.KeyPressMsg{Code: '1'})
+	m = next.(chatTUI)
+	if m.planMode || m.ctrl.PlanMode() || !m.planResumeAfterTurn {
+		t.Fatalf("after Start execution: plan=tui %v/controller %v resume=%v, want off/off/true", m.planMode, m.ctrl.PlanMode(), m.planResumeAfterTurn)
+	}
+
+	// The turn settles: plan-first comes back for the next prompt.
+	m.ingestEvent(event.Event{Kind: event.TurnDone})
+	if !m.planMode || !m.ctrl.PlanMode() || m.planResumeAfterTurn {
+		t.Fatalf("after TurnDone: plan=tui %v/controller %v resume=%v, want on/on/false", m.planMode, m.ctrl.PlanMode(), m.planResumeAfterTurn)
+	}
+}
+
+func TestPlanExitWithoutExecutingStaysOutOfPlanMode(t *testing.T) {
+	ctrl := control.New(control.Options{})
+	t.Cleanup(ctrl.Close)
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+	m.planMode = true
+	m.ctrl.SetPlanMode(true)
+	m.pendingApproval = &event.Approval{ID: "plan", Tool: planApprovalTool}
+
+	// Exit without executing: plan off, no resume flag.
+	next, _ := m.handleApprovalKey(tea.KeyPressMsg{Code: '3'})
+	m = next.(chatTUI)
+	if m.planMode || m.ctrl.PlanMode() || m.planResumeAfterTurn {
+		t.Fatalf("after exit: plan=tui %v/controller %v resume=%v, want off/off/false", m.planMode, m.ctrl.PlanMode(), m.planResumeAfterTurn)
+	}
+
+	// A settled turn must not bring plan mode back.
+	m.ingestEvent(event.Event{Kind: event.TurnDone})
+	if m.planMode || m.ctrl.PlanMode() || m.planResumeAfterTurn {
+		t.Fatalf("after TurnDone: plan=tui %v/controller %v resume=%v, want off/off/false", m.planMode, m.ctrl.PlanMode(), m.planResumeAfterTurn)
 	}
 }
 

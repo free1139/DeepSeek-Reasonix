@@ -108,6 +108,11 @@ type chatTUI struct {
 	// marker rides in outgoing user messages so the cache-stable prompt prefix is
 	// left untouched.
 	planMode bool
+	// planResumeAfterTurn is set when the user approves a plan for execution
+	// ("Start execution"). The turn runs outside plan mode, and when it settles
+	// (TurnDone) the TUI re-enters plan mode so the next prompt starts planning
+	// again instead of dropping into Auto.
+	planResumeAfterTurn bool
 	// sessionSwitch is set by replayActiveBranch to suppress the ClearScreen
 	// flicker when the viewport content is completely rebuilt during a session
 	// switch (#5441). Cleared after one Update cycle.
@@ -2686,9 +2691,16 @@ func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.pendingApproval = nil
 			return m, nil
 		}
-		if m.pendingApproval.Tool == planApprovalTool && (allow || choice.exitPlan) {
+		if m.pendingApproval.Tool == planApprovalTool && choice.exitPlan {
+			// "Exit without executing": leave plan mode for good.
 			m.planMode = false
 			m.ctrl.SetPlanMode(false)
+		} else if m.pendingApproval.Tool == planApprovalTool && allow {
+			// "Start execution": run this turn outside plan mode, then
+			// re-enter plan mode once the turn settles (see event.TurnDone).
+			m.planMode = false
+			m.ctrl.SetPlanMode(false)
+			m.planResumeAfterTurn = true
 		}
 		m.ctrl.Approve(m.pendingApproval.ID, allow, session, persist)
 		m.pendingApproval = nil
@@ -3915,6 +3927,13 @@ func (m *chatTUI) ingestEvent(e event.Event) {
 		// Plan-mode approval is now driven by the controller (it emits an
 		// ApprovalRequest when a plan-mode turn produces a proposal), so there's
 		// nothing to detect here.
+		if m.planResumeAfterTurn {
+			// The user approved a plan for execution; the turn has settled, so
+			// jump back into plan-first for the next prompt.
+			m.planResumeAfterTurn = false
+			m.planMode = true
+			m.ctrl.SetPlanMode(true)
+		}
 	}
 }
 

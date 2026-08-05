@@ -134,6 +134,7 @@ func (m *chatTUI) replayActiveBranch(title string) {
 	// running Goal so the loaded session starts planning, not executing.
 	m.planMode = true
 	m.ctrl.SetPlanMode(true)
+	m.planResumeAfterTurn = false
 	if m.ctrl.GoalStatus() == control.GoalStatusRunning {
 		m.ctrl.ClearGoal()
 	}
