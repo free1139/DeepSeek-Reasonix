@@ -129,8 +129,14 @@ func (m *chatTUI) replayActiveBranch(title string) {
 	m.pendingApproval = nil
 	m.bubblePending = false
 	m.turnDiscarded = false
-	m.planMode = false
-	m.ctrl.SetPlanMode(false)
+	// Session navigation (/switch /resume /rewind /branch) lands on the same
+	// plan-first default as a fresh startup: re-enter Plan mode and drop any
+	// running Goal so the loaded session starts planning, not executing.
+	m.planMode = true
+	m.ctrl.SetPlanMode(true)
+	if m.ctrl.GoalStatus() == control.GoalStatusRunning {
+		m.ctrl.ClearGoal()
+	}
 	m.sessionSwitch = true
 
 	// Discard the previous session's transcript so the viewport only shows the

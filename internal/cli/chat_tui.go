@@ -3473,29 +3473,30 @@ func (m *chatTUI) growInputToFit() {
 	}
 }
 
-// cycleMode handles the Shift+Tab gesture through the same three safe modes
-// users see in Claude Code, with Plan placed before Auto: Ask → Plan → Auto →
-// Ask. YOLO stays outside this cycle and remains an explicit Ctrl+Y choice.
+// cycleMode handles the Shift+Tab gesture through the mode cycle
+// Plan → Auto → Auto+Approve → Plan: plan-first, then the plain Ask posture,
+// then the Ask posture with approval raised to Auto. YOLO stays outside this
+// cycle and remains an explicit Ctrl+Y choice.
 func (m *chatTUI) cycleMode() {
 	if m.ctrl == nil || m.ctrl.ToolApprovalMode() == control.ToolApprovalYolo {
 		return
 	}
 	switch {
 	case m.planMode:
-		// Plan → Auto: leave plan-first onto the Auto posture.
+		// Plan → Auto: leave plan-first back onto the Ask posture.
 		m.planMode = false
-		m.ctrl.SetToolApprovalMode(control.ToolApprovalAuto)
+		m.ctrl.SetToolApprovalMode(control.ToolApprovalAsk)
 	case m.ctrl.ToolApprovalMode() == control.ToolApprovalDontAsk:
 		m.ctrl.SetToolApprovalMode(control.ToolApprovalAsk)
 	case m.ctrl.ToolApprovalMode() == control.ToolApprovalAsk:
-		// Ask → Plan: enter plan-first (stays on Ask approval; clears any
-		// active Goal so the plan scope replaces it).
+		// Auto → Auto+Approve: raise the approval posture to Auto.
+		m.ctrl.SetToolApprovalMode(control.ToolApprovalAuto)
+	case m.ctrl.ToolApprovalMode() == control.ToolApprovalAuto:
+		// Auto+Approve → Plan: back to plan-first on Ask approval, clearing
+		// any active Goal so the plan scope replaces it.
 		m.planMode = true
 		m.ctrl.SetToolApprovalMode(control.ToolApprovalAsk)
 		m.ctrl.ClearGoal()
-	case m.ctrl.ToolApprovalMode() == control.ToolApprovalAuto:
-		// Auto → Ask.
-		m.ctrl.SetToolApprovalMode(control.ToolApprovalAsk)
 	}
 	m.ctrl.SetPlanMode(m.planMode)
 }

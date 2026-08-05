@@ -3021,17 +3021,17 @@ func TestChooserFreeTextWideInputChangeRequestsClearScreen(t *testing.T) {
 	}
 }
 
-func TestReplayActiveBranchClearsPlanModeAndMarksSessionSwitch(t *testing.T) {
+func TestReplayActiveBranchKeepsPlanModeAndMarksSessionSwitch(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{})
-	m.planMode = true
-	m.ctrl.SetPlanMode(true)
+	m.planMode = false
+	m.ctrl.SetPlanMode(false)
 	m.sessionSwitch = false
 
 	m.replayActiveBranch("switched branch")
 
-	if m.planMode || m.ctrl.PlanMode() {
-		t.Fatalf("replay should clear plan mode on both TUI and controller, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	if !m.planMode || !m.ctrl.PlanMode() {
+		t.Fatalf("replay should keep plan mode on both TUI and controller, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
 	}
 	if !m.sessionSwitch {
 		t.Fatal("replay should mark the next Update as a session switch")
@@ -3863,20 +3863,20 @@ func TestDesktopShortcutLayoutShiftTabCyclesSafeModes(t *testing.T) {
 	shiftTab := tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
 	out, _ := m.Update(shiftTab)
 	m = out.(chatTUI)
-	if m.planMode || m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAsk {
-		t.Fatalf("first Shift+Tab should enter ask, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
+	if !m.planMode || !m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAsk {
+		t.Fatalf("first Shift+Tab should enter plan, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
 	}
 
 	out, _ = m.Update(shiftTab)
 	m = out.(chatTUI)
-	if !m.planMode || !m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAsk {
-		t.Fatalf("second Shift+Tab should enter plan, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
+	if m.planMode || m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAsk {
+		t.Fatalf("second Shift+Tab should leave plan onto ask, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
 	}
 
 	out, _ = m.Update(shiftTab)
 	m = out.(chatTUI)
 	if m.planMode || m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAuto {
-		t.Fatalf("third Shift+Tab should enter auto, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
+		t.Fatalf("third Shift+Tab should raise approval to auto, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
 	}
 }
 
@@ -3891,6 +3891,8 @@ func TestDesktopShortcutLayoutShiftTabClearsGoalWhenEnteringPlan(t *testing.T) {
 
 	shiftTab := tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
 	out, _ := m.Update(shiftTab)
+	m = out.(chatTUI)
+	out, _ = m.Update(shiftTab)
 	m = out.(chatTUI)
 	if !m.planMode || !m.ctrl.PlanMode() {
 		t.Fatalf("Shift+Tab should enter plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
@@ -4028,13 +4030,13 @@ func TestShiftTabCyclesSafeModesUnderClassicShortcutLayout(t *testing.T) {
 
 	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
 	m = out.(chatTUI)
-	if !m.planMode || !m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAsk {
-		t.Fatalf("first Shift+Tab should enter plan, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
+	if m.planMode || m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAuto {
+		t.Fatalf("first Shift+Tab should raise approval to auto, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
 	}
 	out, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
 	m = out.(chatTUI)
-	if m.planMode || m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAuto {
-		t.Fatalf("second Shift+Tab should enter auto, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
+	if !m.planMode || !m.ctrl.PlanMode() || m.ctrl.ToolApprovalMode() != control.ToolApprovalAsk {
+		t.Fatalf("second Shift+Tab should enter plan, plan=%v approval=%q", m.planMode, m.ctrl.ToolApprovalMode())
 	}
 }
 
