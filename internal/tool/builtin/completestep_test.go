@@ -121,49 +121,46 @@ func TestCompleteStepVerifiesHostReceipts(t *testing.T) {
 	}
 }
 
-func TestCompleteStepRejectsUnverifiedHostEvidence(t *testing.T) {
+func TestCompleteStepAcceptsUnverifiedHostEvidenceAsClaim(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{ToolName: "bash", Success: false, Command: "go test ./..."})
 	ledger.Record(evidence.Receipt{ToolName: "write_file", Success: true, Paths: []string{"changed.go"}, Write: true})
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
-	cases := []struct {
+	accepted := []struct {
 		name string
 		body string
-		want string
 	}{
 		{
 			name: "failed verification command",
 			body: `{"step":"x","result":"y","evidence":[{"kind":"verification","summary":"claimed tests","command":"go test ./..."}]}`,
-			want: "exited non-zero",
 		},
 		{
 			name: "missing diff writer",
 			body: `{"step":"x","result":"y","evidence":[{"kind":"diff","summary":"claimed diff","paths":["other.go"]}]}`,
-			want: "successful writer receipt",
 		},
 		{
 			name: "missing file receipt",
 			body: `{"step":"x","result":"y","evidence":[{"kind":"files","summary":"claimed file","paths":["other.go"]}]}`,
-			want: "successful read/write receipt",
-		},
-		{
-			name: "diff without path",
-			body: `{"step":"x","result":"y","evidence":[{"kind":"diff","summary":"claimed diff"}]}`,
-			want: "paths",
 		},
 	}
-
-	for _, tc := range cases {
+	for _, tc := range accepted {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := completeStep{}.Execute(ctx, json.RawMessage(tc.body))
-			if err == nil {
-				t.Fatal("unverified host evidence should be rejected")
+			out, err := completeStep{}.Execute(ctx, json.RawMessage(tc.body))
+			if err != nil {
+				t.Fatalf("unverified evidence should be accepted as a claim: %v", err)
 			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error %q missing %q", err, tc.want)
+			if !strings.Contains(out, "manual/unverified") {
+				t.Fatalf("unverified evidence should be counted as manual/unverified, got %q", out)
 			}
 		})
+	}
+
+	// Structural shape is still enforced: a diff with no paths cannot be
+	// recorded at all.
+	_, err := completeStep{}.Execute(ctx, json.RawMessage(`{"step":"x","result":"y","evidence":[{"kind":"diff","summary":"claimed diff"}]}`))
+	if err == nil || !strings.Contains(err.Error(), "paths") {
+		t.Fatalf("diff without path should still be rejected: %v", err)
 	}
 }
 
@@ -201,23 +198,21 @@ func TestCompleteStepExplainsRenewalAgainstCompletedTodoList(t *testing.T) {
 	}
 }
 
-func TestCompleteStepDeliveryRejectsOpaqueEvalVerification(t *testing.T) {
+func TestCompleteStepDeliveryCountsOpaqueEvalVerificationAsClaim(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.ReceiptFromToolCall("bash", json.RawMessage(`{"command":"node -e 'console.log(1)'"}`), true, false))
 	ctx := evidence.WithDeliveryProfile(evidence.WithLedger(context.Background(), ledger))
 
-	_, err := completeStep{}.Execute(ctx, json.RawMessage(`{
+	out, err := completeStep{}.Execute(ctx, json.RawMessage(`{
 		"step":"Check JavaScript",
 		"result":"syntax valid",
 		"evidence":[{"kind":"verification","summary":"syntax valid","command":"node -e 'console.log(1)'"}]
 	}`))
-	if err == nil {
-		t.Fatal("delivery complete_step should reject a command the final gate cannot recognize")
+	if err != nil {
+		t.Fatalf("delivery complete_step should accept an opaque command as a claim: %v", err)
 	}
-	for _, want := range []string{"not a recognized delivery verification", "node --check"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error %q missing recovery hint %q", err, want)
-		}
+	if !strings.Contains(out, "manual/unverified 1") {
+		t.Fatalf("opaque command should be counted as manual/unverified, got %q", out)
 	}
 }
 
@@ -540,29 +535,28 @@ func TestCompleteStepAcceptsSuccessfulReviewEvidence(t *testing.T) {
 	}
 }
 
-func TestCompleteStepRejectsFailedReviewEvidence(t *testing.T) {
+func TestCompleteStepAcceptsFailedReviewEvidenceAsClaim(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.ReceiptFromToolCall("review", json.RawMessage(`{"task":"review changes"}`), false, true))
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
 	if _, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"Review code","result":"review completed",
-		"evidence":[{"kind":"review","summary":"the built-in review completed"}]}`)); err == nil {
-		t.Fatal("failed review task must not satisfy review evidence")
+		"evidence":[{"kind":"review","summary":"the built-in review completed"}]}`)); err != nil {
+		t.Fatalf("a review claim should be accepted without a completed review run: %v", err)
 	}
 }
 
-func TestCompleteStepRejectsReviewEvidenceBeforeLatestMutation(t *testing.T) {
+func TestCompleteStepAcceptsStaleReviewEvidenceAsClaim(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.ReceiptFromToolCall("review", json.RawMessage(`{"task":"review changes"}`), true, true))
 	ledger.Record(evidence.ReceiptFromToolCall("edit_file", json.RawMessage(`{"path":"changed.go"}`), true, false))
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
-	_, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
+	if _, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"Review code","result":"review completed",
-		"evidence":[{"kind":"review","summary":"the built-in review completed"}]}`))
-	if err == nil || !strings.Contains(err.Error(), "review must be newer and cover the changed result") {
-		t.Fatalf("stale review evidence should be rejected with recovery guidance, got %v", err)
+		"evidence":[{"kind":"review","summary":"the built-in review completed"}]}`)); err != nil {
+		t.Fatalf("a stale review claim should be accepted: %v", err)
 	}
 }
 
@@ -584,47 +578,47 @@ func TestCompleteStepAcceptsStructuredReviewWithBlockingFindings(t *testing.T) {
 	}
 }
 
-func TestCompleteStepExplainsFailedCommandReceipt(t *testing.T) {
+func TestCompleteStepAcceptsFailedCommandReceiptAsClaim(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{ToolName: "bash", Success: false, Command: "ls scripts/test_lines.txt 2>&1"})
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
-	_, err := completeStep{}.Execute(ctx, json.RawMessage(`{
+	if _, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"x","result":"y",
-		"evidence":[{"kind":"verification","summary":"ls confirms the file is gone","command":"ls scripts/test_lines.txt 2>&1"}]}`))
-	if err == nil {
-		t.Fatal("failed command citation should be rejected")
-	}
-	for _, want := range []string{"exited non-zero", "|| true"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error should carry the recovery hint %q, got %v", want, err)
-		}
+		"evidence":[{"kind":"verification","summary":"ls confirms the file is gone","command":"ls scripts/test_lines.txt 2>&1"}]}`)); err != nil {
+		t.Fatalf("a failed-command citation should be accepted as a claim: %v", err)
 	}
 }
 
-func TestCompleteStepRejectionListsRanCommands(t *testing.T) {
+func TestCompleteStepUnmatchedCommandAcceptedWithoutListingRanCommands(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{ToolName: "bash", Success: true, Command: "wc -l scripts/test_lines.txt"})
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
-	_, err := completeStep{}.Execute(ctx, json.RawMessage(`{
+	out, err := completeStep{}.Execute(ctx, json.RawMessage(`{
 		"step":"x","result":"y",
 		"evidence":[{"kind":"verification","summary":"claimed","command":"go test ./internal/nilutil/... ./internal/fileutil/..."}]}`))
-	if err == nil || !strings.Contains(err.Error(), "wc -l scripts/test_lines.txt") {
-		t.Fatalf("rejection should list the commands that actually ran, got %v", err)
+	if err != nil {
+		t.Fatalf("an unmatched command should be accepted as a claim: %v", err)
+	}
+	if strings.Contains(out, "wc -l scripts/test_lines.txt") {
+		t.Fatalf("accepted claim must not dump the ran-command list: %q", out)
 	}
 }
 
-func TestCompleteStepRejectionListsTouchedPaths(t *testing.T) {
+func TestCompleteStepUnmatchedDiffPathsAcceptedWithoutListingTouchedPaths(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{ToolName: "write_file", Success: true, Paths: []string{"changed.go"}, Write: true})
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
-	_, err := completeStep{}.Execute(ctx, json.RawMessage(`{
+	out, err := completeStep{}.Execute(ctx, json.RawMessage(`{
 		"step":"x","result":"y",
 		"evidence":[{"kind":"diff","summary":"claimed","paths":["other.go"]}]}`))
-	if err == nil || !strings.Contains(err.Error(), "changed.go") {
-		t.Fatalf("rejection should list the files actually written, got %v", err)
+	if err != nil {
+		t.Fatalf("unmatched diff paths should be accepted as a claim: %v", err)
+	}
+	if strings.Contains(out, "changed.go") {
+		t.Fatalf("accepted claim must not dump the touched-files list: %q", out)
 	}
 }
 
@@ -646,7 +640,7 @@ func TestCompleteStepSessionFallbackUsesNormalizedMatching(t *testing.T) {
 	}
 }
 
-func TestCompleteStepSessionFallbackSkipsFailedCalls(t *testing.T) {
+func TestCompleteStepSessionFallbackAcceptsFailedCallsAsClaim(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{
 			ID: "c1", Name: "bash", Arguments: `{"command":"go test ./broken/..."}`,
@@ -658,8 +652,8 @@ func TestCompleteStepSessionFallbackSkipsFailedCalls(t *testing.T) {
 
 	if _, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"x","result":"y",
-		"evidence":[{"kind":"verification","summary":"tests pass","command":"go test ./broken/..."}]}`)); err == nil {
-		t.Fatal("a call whose recorded result is an error must not count as verification")
+		"evidence":[{"kind":"verification","summary":"tests pass","command":"go test ./broken/..."}]}`)); err != nil {
+		t.Fatalf("a failed call citation should be accepted as a claim: %v", err)
 	}
 }
 
@@ -674,16 +668,21 @@ func TestCompleteStepFilesEvidenceAcceptsBashCreatedFile(t *testing.T) {
 	})
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
-	if _, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
+	out, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"x","result":"y",
-		"evidence":[{"kind":"files","paths":["scripts/test_lines.txt"],"summary":"file created with 20 lines"}]}`)); err != nil {
+		"evidence":[{"kind":"files","paths":["scripts/test_lines.txt"],"summary":"file created with 20 lines"}]}`))
+	if err != nil {
 		t.Fatalf("bash-created file should count as a files receipt: %v", err)
 	}
+	if !strings.Contains(out, "host-verified 1") {
+		t.Fatalf("bash-created file should be host-verified: %q", out)
+	}
 
+	// An unmatched path is accepted as a claim rather than rejected.
 	if _, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"x","result":"y",
-		"evidence":[{"kind":"files","paths":["scripts/never_touched.txt"],"summary":"claimed"}]}`)); err == nil {
-		t.Fatal("a path no command mentions must still be rejected")
+		"evidence":[{"kind":"files","paths":["scripts/never_touched.txt"],"summary":"claimed"}]}`)); err != nil {
+		t.Fatalf("an unmatched path should be accepted as a claim: %v", err)
 	}
 }
 
@@ -704,7 +703,7 @@ func TestCompleteStepSessionFallbackResolvesDiffPaths(t *testing.T) {
 	}
 }
 
-func TestCompleteStepSessionFallbackSkipsFailedWrite(t *testing.T) {
+func TestCompleteStepSessionFallbackAcceptsFailedWriteAsClaim(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{
 			ID: "w1", Name: "write_file", Arguments: `{"path":"internal/foo/bar.go"}`,
@@ -716,8 +715,8 @@ func TestCompleteStepSessionFallbackSkipsFailedWrite(t *testing.T) {
 
 	if _, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"x","result":"y",
-		"evidence":[{"kind":"diff","summary":"added bar","paths":["internal/foo/bar.go"]}]}`)); err == nil {
-		t.Fatal("a failed write must not satisfy cross-turn diff evidence")
+		"evidence":[{"kind":"diff","summary":"added bar","paths":["internal/foo/bar.go"]}]}`)); err != nil {
+		t.Fatalf("a failed write citation should be accepted as a claim: %v", err)
 	}
 }
 

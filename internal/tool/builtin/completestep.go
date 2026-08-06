@@ -45,7 +45,7 @@ var validEvidenceKinds = map[string]bool{
 func (completeStep) Name() string { return "complete_step" }
 
 func (completeStep) Description() string {
-	return "Record the evidence-backed completion of ONE step of an approved plan. Call it as you finish each step instead of silently moving on: it signs the step off with PROOF it is done — the verification you ran (command + result), a completed built-in review that is fresh for any later changes, the diff/files you changed, or a manual check. A completion with no evidence is REJECTED, so don't claim a step is done until you can show why. The host advances the task list for you when you sign off — it marks this step completed and moves the next to in_progress, so you don't need a separate todo_write to mark completions. Fields: `step` (which step — its title or number, matching the task list), `result` (what is now true/changed), `evidence` (≥1 item, each with `kind` = verification|review|diff|files|manual and a `summary`, plus optional `command`/`paths`), and optional `notes`."
+	return "Record the completion of ONE step of an approved plan. Call it as you finish each step: it signs the step off with a claim and its evidence — the verification you ran (command + result), a review, the diff/files you changed, or a manual check. At least one evidence item is required, but each item is taken as the model's claim: the host verifies it when a matching receipt exists and counts the rest as manual/unverified rather than rejecting the step. The host advances the task list for you when you sign off — it marks this step completed and moves the next to in_progress, so you don't need a separate todo_write to mark completions. Fields: `step` (which step — its title or number, matching the task list), `result` (what is now true/changed), `evidence` (≥1 item, each with `kind` = verification|review|diff|files|manual and a `summary`, plus optional `command`/`paths`), and optional `notes`."
 }
 
 func (completeStep) Schema() json.RawMessage {
@@ -58,7 +58,7 @@ func (completeStep) Schema() json.RawMessage {
   "evidence":{
     "type":"array",
     "minItems":1,
-    "description":"Proof the step is done. At least one item is required.",
+    "description":"Claim the step is done. At least one item is required; each is taken as a claim the host verifies when a matching receipt exists.",
     "items":{
       "type":"object",
       "properties":{
@@ -173,39 +173,45 @@ func verifyStepEvidence(ctx context.Context, items []stepEvidence) (hostVerified
 		case "verification":
 			command := strings.TrimSpace(e.Command)
 			if command == "" {
-				return 0, 0, fmt.Errorf("evidence %d: verification command is required for host verification — cite the command you ran, or use kind \"manual\"", i+1)
+				return 0, 0, fmt.Errorf("evidence %d: verification command is required — cite the command you ran, or use kind \"manual\"", i+1)
 			}
-			if !ledger.HasSuccessfulCommand(command) && !verifyCommandFromSession(ctx, command) {
-				if ledger.HasFailedCommand(command) {
-					return 0, 0, fmt.Errorf("evidence %d: verification command %q ran but exited non-zero, so it can't prove the step; if the non-zero exit is itself the expected proof (e.g. a file is gone), re-run it so it succeeds (append \"|| true\") and sign off again", i+1, command)
+			if ledger.HasSuccessfulCommand(command) || verifyCommandFromSession(ctx, command) {
+				_, deliveryHasMutation := ledger.LatestSuccessfulMutationIndex()
+				if !(evidence.DeliveryProfileFromContext(ctx) && deliveryHasMutation && !evidence.IsDeliveryVerificationCommand(command)) {
+					hostVerified++
+				} else {
+					// Delivery profile: an opaque command is not host-proven
+					// verification; count it as a claim — the delivery
+					// readiness gate re-checks the cited command itself.
+					manualUnverified++
 				}
-				hint := allCommandHints(ctx, ledger)
-				return 0, 0, fmt.Errorf("evidence %d: verification command %q has no matching successful receipt — cite the command exactly as it ran in the session%s", i+1, command, hint)
+				continue
 			}
-			_, deliveryHasMutation := ledger.LatestSuccessfulMutationIndex()
-			if evidence.DeliveryProfileFromContext(ctx) && deliveryHasMutation && !evidence.IsDeliveryVerificationCommand(command) {
-				return 0, 0, fmt.Errorf("evidence %d: command %q ran successfully but is not a recognized delivery verification; do not cite an opaque command as verification. Use a project test/check/lint command, or for JavaScript syntax use node --check <file> (a read-only extraction pipeline ending in node --check also works). If this was only a visible/manual inspection, cite kind manual or files without a command, then rerun and cite a recognized verifier after any opaque mutation", i+1, command)
-			}
-			hostVerified++
+			// No matching receipt: accepted as the model's claim rather than
+			// rejected, so a mis-cited command cannot stall the step.
+			manualUnverified++
 		case "review":
 			if !ledger.HasCompletedReview() {
-				return 0, 0, fmt.Errorf("evidence %d: review evidence requires a completed review run in this turn; after a mutation, the review must be newer and cover the changed result", i+1)
+				manualUnverified++
+				continue
 			}
 			hostVerified++
 		case "diff":
 			if len(e.Paths) == 0 {
-				return 0, 0, fmt.Errorf("evidence %d: diff evidence requires paths for host verification — cite the files you changed", i+1)
+				return 0, 0, fmt.Errorf("evidence %d: diff evidence requires paths — cite the files you changed", i+1)
 			}
 			if !ledger.HasSuccessfulWrite(e.Paths) && !verifyPathsFromSession(ctx, e.Paths, true) {
-				return 0, 0, fmt.Errorf("evidence %d: diff paths have no matching successful writer receipt in this turn%s", i+1, receiptHint("files written this turn", ledger.TouchedPaths(8, true)))
+				manualUnverified++
+				continue
 			}
 			hostVerified++
 		case "files":
 			if len(e.Paths) == 0 {
-				return 0, 0, fmt.Errorf("evidence %d: files evidence requires paths for host verification — cite the files you touched", i+1)
+				return 0, 0, fmt.Errorf("evidence %d: files evidence requires paths — cite the files you touched", i+1)
 			}
 			if !ledger.HasSuccessfulReadOrWrite(e.Paths) && !ledger.HasSuccessfulBashMentioningPaths(e.Paths) && !verifyPathsFromSession(ctx, e.Paths, false) {
-				return 0, 0, fmt.Errorf("evidence %d: file paths have no matching successful read/write receipt in this turn%s", i+1, receiptHint("files touched this turn", ledger.TouchedPaths(8, false)))
+				manualUnverified++
+				continue
 			}
 			hostVerified++
 		case "manual":
@@ -402,68 +408,6 @@ func failedCallIDs(msgs []provider.Message) map[string]bool {
 		}
 	}
 	return failed
-}
-
-func receiptHint(label string, items []string) string {
-	if len(items) == 0 {
-		return ""
-	}
-	for i, item := range items {
-		if len(item) > 80 {
-			items[i] = item[:80] + "…"
-		}
-	}
-	return fmt.Sprintf("; %s: %q — cite one as it actually ran, or run the check now", label, items)
-}
-
-// allCommandHints builds a combined hint from both the per-turn ledger and the
-// full session history, so the model can self-correct a mismatched citation.
-func allCommandHints(ctx context.Context, ledger *evidence.Ledger) string {
-	seen := map[string]bool{}
-	var cmds []string
-	if ledger != nil {
-		for _, c := range ledger.SuccessfulCommands(8) {
-			if !seen[c] {
-				seen[c] = true
-				cmds = append(cmds, c)
-			}
-		}
-	}
-	if msgs, ok := evidence.SessionMessagesFromContext(ctx); ok {
-		failed := failedCallIDs(msgs)
-		for _, msg := range msgs {
-			for _, tc := range msg.ToolCalls {
-				if failed[tc.ID] {
-					continue
-				}
-				if tc.Name == "todo_write" || tc.Name == "complete_step" {
-					continue
-				}
-				c := extractCommandFromCall(tc.Name, tc.Arguments)
-				if c == "" || seen[c] {
-					continue
-				}
-				seen[c] = true
-				cmds = append(cmds, c)
-				if len(cmds) >= 12 {
-					break
-				}
-			}
-			if len(cmds) >= 12 {
-				break
-			}
-		}
-	}
-	if len(cmds) == 0 {
-		return ""
-	}
-	// Truncate long entries for readability.
-	for i, c := range cmds {
-		if len(c) > 80 {
-			cmds[i] = c[:80] + "…"
-		}
-	}
-	return fmt.Sprintf("; commands that ran: %q — pick the matching one and retry complete_step", cmds)
 }
 
 func firstWord(s string) string {

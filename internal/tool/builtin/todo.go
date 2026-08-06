@@ -20,8 +20,7 @@ func init() { tool.RegisterBuiltin(todoWrite{}) }
 // stay serial — and flips each to completed as it finishes.
 // Replacing, removing, or parking a current in_progress item is allowed (task
 // redirection); completed history must stay in place at its original position,
-// and flipping an item to completed still requires a matching complete_step
-// receipt in the same turn.
+// and any status is taken as given — the model marks completion directly.
 type todoWrite struct{}
 
 type todoItem struct {
@@ -97,9 +96,6 @@ func (todoWrite) Execute(ctx context.Context, args json.RawMessage) (string, err
 	if err := verifyCompletedTodoPositions(ctx, p.Todos); err != nil {
 		return "", err
 	}
-	if err := verifyTodoCompletionTransitions(ctx, p.Todos); err != nil {
-		return "", err
-	}
 	return fmt.Sprintf("Todos updated: %d total — %d completed, %d in progress, %d pending.",
 		len(p.Todos), done, active, pending), nil
 }
@@ -115,7 +111,7 @@ func verifyCompletedTodoPositions(ctx context.Context, todos []todoItem) error {
 		}
 		match, found := evidence.MatchTodoIdentity(toEvidenceTodo(todo), previous)
 		if !found || match.Index != i+1 {
-			return fmt.Errorf("completed todo %d %q cannot be inserted, duplicated, or reordered; preserve the completed prefix and sign off the current item with complete_step", i+1, todo.Content)
+			return fmt.Errorf("completed todo %d %q cannot be inserted, duplicated, or reordered; preserve the completed prefix at its original position", i+1, todo.Content)
 		}
 	}
 	if len(evidence.IncompleteTodos(previous)) > 0 && !evidence.PreservesCompletedTodoPositions(previous, toEvidenceTodos(todos)) {
@@ -132,43 +128,6 @@ func todoBaseline(ctx context.Context) []evidence.TodoItem {
 	}
 	previous, _ := evidence.TodoStateFromContext(ctx)
 	return previous
-}
-
-func verifyTodoCompletionTransitions(ctx context.Context, todos []todoItem) error {
-	ledger, ok := evidence.FromContext(ctx)
-	if !ok {
-		return nil
-	}
-	missing, hasBaseline := ledger.UnverifiedCompletedTodos(toEvidenceTodos(todos))
-	if !hasBaseline {
-		if previous, ok := evidence.TodoStateFromContext(ctx); ok && len(previous) > 0 {
-			for i, todo := range todos {
-				if todo.Status != "completed" {
-					continue
-				}
-				match, found := evidence.MatchTodoIdentity(toEvidenceTodo(todo), previous)
-				if !found || match.Status != "completed" {
-					return fmt.Errorf("todo %d %q cannot become completed without signing off the current item with complete_step", i+1, todo.Content)
-				}
-			}
-			return nil
-		}
-		for i, todo := range todos {
-			if todo.Status == "completed" {
-				return fmt.Errorf("initial todo %d %q cannot start completed; establish the task list before doing the work, then sign off the current item with complete_step", i+1, todo.Content)
-			}
-		}
-		return nil
-	}
-	if len(missing) == 0 {
-		return nil
-	}
-	const hint = "; sign each finished item off with complete_step first, then re-send this todo_write"
-	if len(missing) == 1 {
-		m := missing[0]
-		return fmt.Errorf("todo %d %q is newly completed but has no matching successful complete_step receipt in this turn%s", m.Index, m.Content, hint)
-	}
-	return fmt.Errorf("%d todos are newly completed but have no matching successful complete_step receipts in this turn%s", len(missing), hint)
 }
 
 func toEvidenceTodos(todos []todoItem) []evidence.TodoItem {

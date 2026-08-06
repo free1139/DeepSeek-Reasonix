@@ -2556,8 +2556,7 @@ func (a *Agent) advanceCanonicalTodo(step string) {
 // recordTodoState logs the host-advanced list as a synthetic todo_write receipt
 // so the per-turn final gate (which reads the ledger's latest todo_write) sees
 // the advance — the model no longer has to re-send a todo_write to mark the
-// completion. It bypasses the todo_write tool, so the completion-transition
-// guard never runs on it.
+// completion.
 func (a *Agent) recordTodoState(todos []evidence.TodoItem) {
 	if a.evidence == nil {
 		return

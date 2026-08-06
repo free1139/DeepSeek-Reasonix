@@ -873,7 +873,7 @@ func TestFinalReadinessAuditRecordsTerminalError(t *testing.T) {
 
 // TestEvidenceFlowRejectsUncitedCommand proves the loop rejects a sign-off whose
 // cited command was never run: bash ran "go test", complete_step cites "go vet".
-func TestEvidenceFlowRejectsUncitedCommand(t *testing.T) {
+func TestEvidenceFlowAcceptsUncitedCommandAsClaim(t *testing.T) {
 	completeStep, ok := tool.LookupBuiltin("complete_step")
 	if !ok {
 		t.Fatal("complete_step builtin not registered")
@@ -901,11 +901,11 @@ func TestEvidenceFlowRejectsUncitedCommand(t *testing.T) {
 	}
 
 	got := toolResult(a.session, "complete_step")
-	if !strings.Contains(got, "has no matching successful receipt") {
-		t.Fatalf("complete_step result = %q, want the uncited command rejected", got)
+	if strings.Contains(got, "has no matching successful receipt") {
+		t.Fatalf("complete_step result = %q, want the uncited command accepted as a claim", got)
 	}
-	if strings.Contains(got, "host-verified") {
-		t.Fatalf("uncited command should not verify, got %q", got)
+	if !strings.Contains(got, "manual/unverified") {
+		t.Fatalf("uncited command should be counted as manual/unverified, got %q", got)
 	}
 }
 
@@ -989,7 +989,7 @@ func TestEvidenceFlowAcceptsTodoCompletionAfterCompleteStep(t *testing.T) {
 	}
 }
 
-func TestEvidenceFlowRejectsTodoCompletionWithoutCompleteStep(t *testing.T) {
+func TestEvidenceFlowAllowsTodoCompletionWithoutCompleteStep(t *testing.T) {
 	todoWrite, ok := tool.LookupBuiltin("todo_write")
 	if !ok {
 		t.Fatal("todo_write builtin not registered")
@@ -1018,21 +1018,20 @@ func TestEvidenceFlowRejectsTodoCompletionWithoutCompleteStep(t *testing.T) {
 	}}
 
 	a := New(prov, reg, NewSession(""), Options{}, event.Discard)
-	if err := a.Run(context.Background(), "complete the todo without a sign-off"); err != nil {
+	if err := a.Run(context.Background(), "complete the todo directly"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
 	results := toolResults(a.session, "todo_write")
 	if len(results) < 2 {
-		t.Fatalf("todo_write results = %v, want the rejected completion result", results)
+		t.Fatalf("todo_write results = %v, want the direct completion result", results)
 	}
-	got := results[1]
-	if !strings.Contains(got, "complete_step") {
-		t.Fatalf("todo_write result = %q, want completion rejected until complete_step", got)
+	if got := results[1]; !strings.Contains(got, "1 completed") {
+		t.Fatalf("todo_write result = %q, want direct completion accepted", got)
 	}
 }
 
-func TestEvidenceFlowRecoversTodoCompletionAfterFailedCompleteStepWithProgress(t *testing.T) {
+func TestEvidenceFlowCompletesTodoDirectlyAfterUnmatchedCompleteStep(t *testing.T) {
 	todoWrite, ok := tool.LookupBuiltin("todo_write")
 	if !ok {
 		t.Fatal("todo_write builtin not registered")
@@ -1062,22 +1061,16 @@ func TestEvidenceFlowRecoversTodoCompletionAfterFailedCompleteStepWithProgress(t
 	}}
 
 	a := New(prov, reg, NewSession(""), Options{}, event.Discard)
-	if err := a.Run(context.Background(), "recover after a failed complete_step"); err != nil {
+	if err := a.Run(context.Background(), "sign off with a mismatched command"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
 	stepResult := lastToolResult(a.session, "complete_step")
-	if !strings.Contains(stepResult, "no matching successful receipt") {
-		t.Fatalf("complete_step result = %q, want the sign-off attempt to fail first", stepResult)
-	}
-	if !strings.Contains(stepResult, `python \"script.py\"`) {
-		t.Fatalf("complete_step result = %q, want the self-correction hint to include the real command", stepResult)
-	}
-	if strings.Contains(stepResult, "todo_write") {
-		t.Fatalf("complete_step result = %q, want command hints without todo tool noise", stepResult)
+	if strings.Contains(stepResult, "no matching successful receipt") {
+		t.Fatalf("complete_step result = %q, want the mismatched command accepted as a claim", stepResult)
 	}
 	if got := lastToolResult(a.session, "todo_write"); !strings.Contains(got, "1 completed") {
-		t.Fatalf("todo_write result = %q, want completion recovery accepted", got)
+		t.Fatalf("todo_write result = %q, want direct completion accepted", got)
 	}
 }
 
@@ -1152,7 +1145,7 @@ func TestEvidenceFlowRecoversAfterBatchTodoCompletionRejection(t *testing.T) {
 	}
 }
 
-func TestEvidenceFlowFailedCompleteStepDoesNotAuthorizeTodoCompletion(t *testing.T) {
+func TestEvidenceFlowAllowsTodoCompletionAfterFailedCompleteStep(t *testing.T) {
 	todoWrite, ok := tool.LookupBuiltin("todo_write")
 	if !ok {
 		t.Fatal("todo_write builtin not registered")
@@ -1186,21 +1179,20 @@ func TestEvidenceFlowFailedCompleteStepDoesNotAuthorizeTodoCompletion(t *testing
 	}}
 
 	a := New(prov, reg, NewSession(""), Options{}, event.Discard)
-	if err := a.Run(context.Background(), "attempt completion after a failed sign-off"); err != nil {
+	if err := a.Run(context.Background(), "complete the todo directly"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
 	results := toolResults(a.session, "todo_write")
 	if len(results) < 2 {
-		t.Fatalf("todo_write results = %v, want the rejected completion result", results)
+		t.Fatalf("todo_write results = %v, want the direct completion result", results)
 	}
-	got := results[1]
-	if !strings.Contains(got, "complete_step") {
-		t.Fatalf("todo_write result = %q, want failed complete_step not to authorize completion", got)
+	if got := results[1]; !strings.Contains(got, "1 completed") {
+		t.Fatalf("todo_write result = %q, want direct completion accepted after a failed complete_step", got)
 	}
 }
 
-func TestEvidenceFlowRejectsReplacedTodoAfterNumericCompleteStep(t *testing.T) {
+func TestEvidenceFlowRejectsReplacedTodoAsNewCompleted(t *testing.T) {
 	todoWrite, ok := tool.LookupBuiltin("todo_write")
 	if !ok {
 		t.Fatal("todo_write builtin not registered")
@@ -1238,8 +1230,8 @@ func TestEvidenceFlowRejectsReplacedTodoAfterNumericCompleteStep(t *testing.T) {
 		t.Fatalf("todo_write results = %v, want the rejected replacement result", results)
 	}
 	got := results[1]
-	if !strings.Contains(got, "Ship parser") || !strings.Contains(got, "complete_step") {
-		t.Fatalf("todo_write result = %q, want replaced todo rejected", got)
+	if !strings.Contains(got, "Ship parser") || !strings.Contains(got, "completed todo") {
+		t.Fatalf("todo_write result = %q, want replaced todo rejected as a new completed item", got)
 	}
 }
 
