@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"reasonix/internal/evidence"
-	"reasonix/internal/tool"
 )
 
 func TestTodoWriteAcceptsLevels(t *testing.T) {
@@ -99,7 +98,7 @@ func TestTodoWriteRejectsInitialCompletedWithoutBaseline(t *testing.T) {
 	}
 }
 
-func TestTodoWriteRejectsDroppingCurrentTodo(t *testing.T) {
+func TestTodoWriteAllowsDroppingCurrentTodo(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{
 		ToolName: "todo_write",
@@ -116,13 +115,34 @@ func TestTodoWriteRejectsDroppingCurrentTodo(t *testing.T) {
 		`{"todos":[{"content":"Write code","status":"in_progress"}]}`,
 	} {
 		_, err := (todoWrite{}).Execute(ctx, json.RawMessage(args))
-		if err == nil || !strings.Contains(err.Error(), "cannot be removed or replaced") {
-			t.Fatalf("dropping current todo with %s should be rejected: %v", args, err)
+		if err != nil {
+			t.Fatalf("dropping the current in_progress todo with %s should be allowed: %v", args, err)
 		}
 	}
 }
 
-func TestTodoWriteApprovedPlanReplacementPreservesCompletedHistory(t *testing.T) {
+func TestTodoWriteCompletingCurrentWithoutReceiptStillRejected(t *testing.T) {
+	ledger := evidence.NewLedger()
+	ledger.Record(evidence.Receipt{
+		ToolName: "todo_write",
+		Success:  true,
+		Todos: []evidence.TodoItem{
+			{Content: "Inspect environment", Status: "in_progress"},
+			{Content: "Write code", Status: "pending"},
+		},
+	})
+	ctx := evidence.WithLedger(context.Background(), ledger)
+	// The relaxation allows replacing/removing/parking the current item, but
+	// flipping it to completed still needs a complete_step receipt in turn.
+	args := json.RawMessage(`{"todos":[
+		{"content":"Inspect environment","status":"completed"},
+		{"content":"Write code","status":"in_progress"}]}`)
+	if _, err := (todoWrite{}).Execute(ctx, args); err == nil || !strings.Contains(err.Error(), "newly completed") {
+		t.Fatalf("completing the current todo without a complete_step receipt should be rejected: %v", err)
+	}
+}
+
+func TestTodoWritePlanReplacementPreservesCompletedHistory(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{
 		ToolName: "todo_write",
@@ -133,23 +153,22 @@ func TestTodoWriteApprovedPlanReplacementPreservesCompletedHistory(t *testing.T)
 		},
 	})
 	ctx := evidence.WithLedger(context.Background(), ledger)
-	ctx = tool.WithPlanReplacementAuthorization(ctx)
 
 	valid := json.RawMessage(`{"todos":[
 		{"content":"Inspect environment","status":"completed"},
 		{"content":"Replace parser architecture","status":"in_progress"}
 	]}`)
 	if _, err := (todoWrite{}).Execute(ctx, valid); err != nil {
-		t.Fatalf("approved plan replacement should succeed: %v", err)
+		t.Fatalf("replacing the in_progress todo should succeed without plan-replacement authorization: %v", err)
 	}
 
 	dropsHistory := json.RawMessage(`{"todos":[{"content":"Replace parser architecture","status":"in_progress"}]}`)
 	if _, err := (todoWrite{}).Execute(ctx, dropsHistory); err == nil || !strings.Contains(err.Error(), "completed task history") {
-		t.Fatalf("approved replacement dropped completed history: %v", err)
+		t.Fatalf("replacement dropped completed history: %v", err)
 	}
 }
 
-func TestTodoWriteDoesNotTreatNumericContentAsStepIndex(t *testing.T) {
+func TestTodoWriteAllowsReplacingNumericCurrentTodo(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{
 		ToolName: "todo_write",
@@ -165,8 +184,8 @@ func TestTodoWriteDoesNotTreatNumericContentAsStepIndex(t *testing.T) {
 		{"content":"Replacement","status":"in_progress"}
 	]}`)
 
-	if _, err := (todoWrite{}).Execute(ctx, args); err == nil || !strings.Contains(err.Error(), "cannot be removed or replaced") {
-		t.Fatalf("numeric todo content should be matched by identity, got %v", err)
+	if _, err := (todoWrite{}).Execute(ctx, args); err != nil {
+		t.Fatalf("replacing a numeric-content in_progress todo should be allowed by identity: %v", err)
 	}
 }
 
@@ -417,7 +436,7 @@ func TestTodoWriteRejectsOrphanSubStep(t *testing.T) {
 	}
 }
 
-func TestTodoWriteRejectsDroppingActiveSubStep(t *testing.T) {
+func TestTodoWriteAllowsDroppingActiveSubStep(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{
 		ToolName: "todo_write",
@@ -433,7 +452,7 @@ func TestTodoWriteRejectsDroppingActiveSubStep(t *testing.T) {
 	_, err := (todoWrite{}).Execute(ctx, json.RawMessage(`{"todos":[
 		{"content":"Port the parser","status":"pending"},
 		{"content":"rewrite everything","status":"in_progress","level":1}]}`))
-	if err == nil || !strings.Contains(err.Error(), "cannot be removed or replaced") {
-		t.Fatalf("dropping the active sub-step should be rejected: %v", err)
+	if err != nil {
+		t.Fatalf("dropping the active sub-step should be allowed: %v", err)
 	}
 }

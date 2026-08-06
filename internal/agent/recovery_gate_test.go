@@ -103,7 +103,7 @@ func TestAuthorizedRecoveryPlanTransitionCanReplaceCurrentTodo(t *testing.T) {
 	}
 }
 
-func TestPlanTransitionNeedsDedicatedReplacementAuthorization(t *testing.T) {
+func TestPlanTransitionStillConsultedWithoutReplacementAuthorization(t *testing.T) {
 	reg := tool.NewRegistry()
 	reg.Add(mustBuiltinTool(t, "todo_write"))
 	gate := &recordingRecoveryGate{decision: RecoveryDecision{Allow: true}}
@@ -115,8 +115,17 @@ func TestPlanTransitionNeedsDedicatedReplacementAuthorization(t *testing.T) {
 		Name:      "todo_write",
 		Arguments: `{"todos":[{"content":"Replace parser architecture","status":"in_progress"}]}`,
 	})
-	if out.errMsg == "" || !strings.Contains(out.output, "cannot be removed or replaced") {
-		t.Fatalf("plain allow unexpectedly replaced current todo: %+v", out)
+	if out.errMsg != "" {
+		t.Fatalf("replacing the current todo must no longer require plan-replacement authorization: %+v", out)
+	}
+	// The recovery gate still sees the structural rewrite even though the tool
+	// layer no longer blocks it: review of plan transitions stays independent.
+	if len(gate.proposals) != 1 || !gate.proposals[0].PlanTransition {
+		t.Fatalf("recovery proposals = %+v, want one plan-transition consultation", gate.proposals)
+	}
+	got := a.CanonicalTodoState()
+	if len(got) != 1 || got[0].Content != "Replace parser architecture" {
+		t.Fatalf("canonical todo state = %+v, want the replacement list", got)
 	}
 }
 

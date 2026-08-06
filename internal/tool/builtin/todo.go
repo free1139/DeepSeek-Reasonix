@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"reasonix/internal/evidence"
 	"reasonix/internal/tool"
@@ -17,6 +16,10 @@ func init() { tool.RegisterBuiltin(todoWrite{}) }
 // update), which a frontend renders as a checklist. Execute just validates the
 // shape and acks with a count, so the model gets a stable confirmation. The agent
 // keeps one item in_progress at a time and flips each to completed as it finishes.
+// Replacing, removing, or parking the current in_progress item is allowed (task
+// redirection); completed history must stay in place at its original position,
+// and flipping an item to completed still requires a matching complete_step
+// receipt in the same turn.
 type todoWrite struct{}
 
 type todoItem struct {
@@ -89,11 +92,6 @@ func (todoWrite) Execute(ctx context.Context, args json.RawMessage) (string, err
 	if err := evidence.ValidateSerialTodos(toEvidenceTodos(p.Todos)); err != nil {
 		return "", err
 	}
-	if !tool.HasPlanReplacementAuthorization(ctx) {
-		if err := verifyTodoCurrentContinuity(ctx, p.Todos); err != nil {
-			return "", err
-		}
-	}
 	if err := verifyCompletedTodoPositions(ctx, p.Todos); err != nil {
 		return "", err
 	}
@@ -102,29 +100,6 @@ func (todoWrite) Execute(ctx context.Context, args json.RawMessage) (string, err
 	}
 	return fmt.Sprintf("Todos updated: %d total — %d completed, %d in progress, %d pending.",
 		len(p.Todos), done, active, pending), nil
-}
-
-func verifyTodoCurrentContinuity(ctx context.Context, todos []todoItem) error {
-	previous := todoBaseline(ctx)
-	if len(previous) == 0 {
-		return nil
-	}
-	// The single current item must survive the rewrite. In a layered phase this
-	// is either its active sub-step or, after all children finish, the phase
-	// header waiting for final sign-off.
-	for i, todo := range previous {
-		if strings.TrimSpace(todo.Status) != "in_progress" {
-			continue
-		}
-		match, found := evidence.MatchTodoIdentity(todo, toEvidenceTodos(todos))
-		if !found {
-			return fmt.Errorf("current todo %d %q cannot be removed or replaced while it is in_progress; complete it with complete_step before changing the remaining list", i+1, todo.Content)
-		}
-		if match.Status == "pending" || match.Status == "" {
-			return fmt.Errorf("current todo %d %q cannot move back to pending; keep it in_progress or complete it with complete_step", i+1, todo.Content)
-		}
-	}
-	return nil
 }
 
 func verifyCompletedTodoPositions(ctx context.Context, todos []todoItem) error {
