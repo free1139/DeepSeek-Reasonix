@@ -631,14 +631,6 @@ func TestValidateSerialTodosRejectsInvalidOrdering(t *testing.T) {
 			want: "completed after unfinished",
 		},
 		{
-			name: "multiple current items",
-			todos: []TodoItem{
-				{Content: "first", Status: "in_progress"},
-				{Content: "second", Status: "in_progress"},
-			},
-			want: "second in_progress",
-		},
-		{
 			name:  "pending without current",
 			todos: []TodoItem{{Content: "first", Status: "pending"}},
 			want:  "no in_progress",
@@ -662,17 +654,51 @@ func TestValidateSerialTodosRejectsInvalidOrdering(t *testing.T) {
 	}
 }
 
+// Parallel flat items are each their own segment, so several may be current
+// at once under the segment-parallel state machine.
+func TestValidateSerialTodosAcceptsParallelCurrents(t *testing.T) {
+	for _, todos := range [][]TodoItem{
+		{
+			{Content: "first", Status: "in_progress"},
+			{Content: "second", Status: "in_progress"},
+			{Content: "third", Status: "pending"},
+		},
+		{
+			{Content: "Phase one", Status: "pending"},
+			{Content: "sub one", Status: "in_progress", Level: 1},
+			{Content: "Phase two", Status: "pending"},
+			{Content: "sub two", Status: "in_progress", Level: 1},
+			{Content: "Phase three", Status: "pending"},
+			{Content: "sub three", Status: "pending", Level: 1},
+		},
+		{
+			{Content: "done", Status: "completed"},
+			{Content: "A", Status: "in_progress"},
+			{Content: "B", Status: "in_progress"},
+		},
+	} {
+		if err := ValidateSerialTodos(todos); err != nil {
+			t.Fatalf("parallel current segments should be valid: %v (list %+v)", err, todos)
+		}
+	}
+}
+
 func TestNormalizeSerialTodosRepairsLegacyOutOfOrderState(t *testing.T) {
 	got := NormalizeSerialTodos([]TodoItem{
 		{Content: "first", Status: "in_progress"},
 		{Content: "second", Status: "completed"},
 		{Content: "third", Status: "in_progress"},
 	})
-	want := []string{"in_progress", "pending", "pending"}
+	// The trailing completed item is demoted (completed must prefix) and both
+	// parallel flat currents survive.
+	want := []string{"in_progress", "pending", "in_progress"}
 	for i := range want {
 		if got[i].Status != want[i] {
 			t.Fatalf("todo %d status = %q, want %q: %+v", i+1, got[i].Status, want[i], got)
 		}
+	}
+	if err := ValidateSerialTodos(got); err != nil {
+		t.Fatalf("normalized list should validate: %v", err)
 	}
 }
 
@@ -755,7 +781,7 @@ func TestValidateSerialTodosRejectsInvalidPhaseChains(t *testing.T) {
 				{Content: "Phase", Status: "in_progress"},
 				{Content: "sub one", Status: "in_progress", Level: 1},
 			},
-			want: "second in_progress item",
+			want: "cannot be in_progress while sub-step 2",
 		},
 		{
 			name: "orphan sub-step with no phase above it",
@@ -784,7 +810,7 @@ func TestValidateSerialTodosRejectsInvalidPhaseChains(t *testing.T) {
 				{Content: "Second phase", Status: "pending"},
 				{Content: "sub three", Status: "in_progress", Level: 1},
 			},
-			want: "in_progress after pending work",
+			want: "completed after unfinished",
 		},
 	}
 	for _, tc := range tests {
@@ -818,6 +844,60 @@ func TestNormalizeSerialTodosRepairsPhaseChains(t *testing.T) {
 	})
 	if signable[0].Status != "in_progress" {
 		t.Fatalf("phase with completed sub-steps should normalize to in_progress for sign-off: %+v", signable)
+	}
+}
+
+// A completed phase header with no started sub-steps is invalid; the repair
+// must demote the header so the normalized list validates again.
+func TestNormalizeSerialTodosDemotesCompletedPhaseWithUnstartedSubSteps(t *testing.T) {
+	got := NormalizeSerialTodos([]TodoItem{
+		{Content: "Phase", Status: "completed"},
+		{Content: "sub one", Status: "pending", Level: 1},
+	})
+	if got[0].Status != "pending" || got[1].Status != "in_progress" {
+		t.Fatalf("completed phase with unstarted sub-steps should normalize to pending header + current sub-step: %+v", got)
+	}
+	if err := ValidateSerialTodos(got); err != nil {
+		t.Fatalf("normalized list should validate: %v", err)
+	}
+}
+
+// Parallel flat items are independent segments: a pending item between two
+// current items is a waiting parallel task, not an ordering violation.
+func TestValidateSerialTodosAllowsPendingBetweenParallelCurrents(t *testing.T) {
+	todos := []TodoItem{
+		{Content: "A", Status: "in_progress"},
+		{Content: "B", Status: "pending"},
+		{Content: "C", Status: "in_progress"},
+	}
+	if err := ValidateSerialTodos(todos); err != nil {
+		t.Fatalf("pending between parallel currents should be valid: %v", err)
+	}
+}
+
+// AdvanceSerialTodo must not hand a finished segment's phase over to another
+// segment's pending work while that other segment still holds a current item.
+func TestAdvanceSerialTodoKeepsParallelSegmentsIndependent(t *testing.T) {
+	todos := []TodoItem{
+		{Content: "Task one", Status: "in_progress"},
+		{Content: "Task two", Status: "in_progress"},
+		{Content: "Task three", Status: "pending"},
+	}
+	if !AdvanceSerialTodo(todos, 0) {
+		t.Fatal("first parallel task did not complete")
+	}
+	got := []string{todos[0].Status, todos[1].Status, todos[2].Status}
+	want := []string{"completed", "in_progress", "pending"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("after signing off task one statuses = %v, want %v (task two keeps its current item, task three stays pending)", got, want)
+	}
+	if !AdvanceSerialTodo(todos, 1) {
+		t.Fatal("second parallel task did not complete")
+	}
+	got = []string{todos[0].Status, todos[1].Status, todos[2].Status}
+	want = []string{"completed", "completed", "in_progress"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("after signing off task two statuses = %v, want %v (task three only promoted once no segment is current)", got, want)
 	}
 }
 

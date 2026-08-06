@@ -300,19 +300,20 @@ func verifyTodoStep(ctx context.Context, step string) (evidence.TodoStepMatch, b
 	case "completed":
 		return match, true, nil
 	case "", "pending":
-		current := ""
+		// Under parallel segments several items may be current at once; list
+		// them all so the model can pick the one it actually finished.
+		var currents []string
 		for i, todo := range todos {
 			if strings.TrimSpace(todo.Status) != "in_progress" {
 				continue
 			}
-			// The deepest in_progress item is the signable end of the current
-			// chain: prefer an active sub-step over its phase header.
-			current = fmt.Sprintf("; finish todo %d %q first", i+1, todo.Content)
-			if todo.Level == 1 {
-				break
-			}
+			currents = append(currents, fmt.Sprintf("todo %d %q", i+1, todo.Content))
 		}
-		return evidence.TodoStepMatch{}, true, fmt.Errorf("step %q matches pending todo %d %q; complete_step only signs the current in_progress item%s", step, match.Index, match.Content, current)
+		hint := ""
+		if len(currents) > 0 {
+			hint = ": " + strings.Join(currents, ", ")
+		}
+		return evidence.TodoStepMatch{}, true, fmt.Errorf("step %q matches pending todo %d %q; complete_step only signs the current in_progress item%s", step, match.Index, match.Content, hint)
 	default:
 		return evidence.TodoStepMatch{}, true, fmt.Errorf("step %q matches todo %d (%q) but its status is %q; complete_step requires in_progress or completed", step, match.Index, match.Content, match.Status)
 	}

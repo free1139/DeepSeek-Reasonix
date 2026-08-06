@@ -57,9 +57,13 @@ export function TodoPanel({
   const currentRef = useRef<HTMLLIElement | null>(null);
 
   const done = todos.filter((t) => t.status === "completed").length;
-  const current = todos.find((t) => t.status === "in_progress");
+  const currents = todos.filter((t) => t.status === "in_progress");
+  const current = currents[0];
   const allDone = todos.length > 0 && done === todos.length;
-  const summary = current?.activeForm || current?.content || todos[todos.length - 1]?.content || "";
+  const summary =
+    currents.length > 1
+      ? `${currents[0].activeForm || currents[0].content} (+${currents.length - 1} parallel)`
+      : current?.activeForm || current?.content || todos[todos.length - 1]?.content || "";
   const [open, setOpen] = useState(() => loadOpenState(stateKey, shouldOpenTodoPanelByDefault()));
   const wasAllDoneRef = useRef(allDone);
 

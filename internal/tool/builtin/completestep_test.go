@@ -788,7 +788,7 @@ func TestCompleteStepPendingHintNamesActiveSubStep(t *testing.T) {
 		"step":"fix imports",
 		"result":"imports fixed",
 		"evidence":[{"kind":"manual","summary":"checked manually"}]}`))
-	if err == nil || !strings.Contains(err.Error(), `finish todo 2 "move files" first`) {
+	if err == nil || !strings.Contains(err.Error(), `todo 2 "move files"`) {
 		t.Fatalf("pending hint should point at the active sub-step, got %v", err)
 	}
 }

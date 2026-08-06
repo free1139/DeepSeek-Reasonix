@@ -15,8 +15,10 @@ func init() { tool.RegisterBuiltin(todoWrite{}) }
 // the full list lives in the call's args (the model re-sends it whole on every
 // update), which a frontend renders as a checklist. Execute just validates the
 // shape and acks with a count, so the model gets a stable confirmation. The agent
-// keeps one item in_progress at a time and flips each to completed as it finishes.
-// Replacing, removing, or parking the current in_progress item is allowed (task
+// keeps at most one item in_progress per phase segment — independent tasks and
+// different phases may run in parallel, while within one phase the sub-steps
+// stay serial — and flips each to completed as it finishes.
+// Replacing, removing, or parking a current in_progress item is allowed (task
 // redirection); completed history must stay in place at its original position,
 // and flipping an item to completed still requires a matching complete_step
 // receipt in the same turn.
@@ -32,7 +34,7 @@ type todoItem struct {
 func (todoWrite) Name() string { return "todo_write" }
 
 func (todoWrite) Description() string {
-	return "Record and update a structured task list for the current work. Send the COMPLETE list every call — it replaces the previous one. Use it to plan multi-step work and show progress: keep exactly one item in_progress at a time, and flip an item to completed the moment it's done (don't batch completions). Skip it for trivial single-step tasks. The list is two-level: a `level` 0 item is a PHASE (a milestone) and the `level` 1 items after it are its concrete sub-steps; omit `level` (0) for a flat list. Each item has `content` (imperative, e.g. \"Add the parser\"), `status` (pending|in_progress|completed), `activeForm` (present-continuous shown while in progress, e.g. \"Adding the parser\"), and optional `level` (0 phase | 1 sub-step)."
+	return "Record and update a structured task list for the current work. Send the COMPLETE list every call — it replaces the previous one. Use it to plan multi-step work and show progress: keep at most one item in_progress per phase segment — independent tasks and different phases may run in parallel, but within one phase the sub-steps stay serial — and flip an item to completed the moment it's done (don't batch completions). Skip it for trivial single-step tasks. The list is two-level: a `level` 0 item is a PHASE (a milestone) and the `level` 1 items after it are its concrete sub-steps; omit `level` (0) for a flat list. Each item has `content` (imperative, e.g. \"Add the parser\"), `status` (pending|in_progress|completed), `activeForm` (present-continuous shown while in progress, e.g. \"Adding the parser\"), and optional `level` (0 phase | 1 sub-step)."
 }
 
 func (todoWrite) Schema() json.RawMessage {
@@ -46,7 +48,7 @@ func (todoWrite) Schema() json.RawMessage {
       "type":"object",
       "properties":{
         "content":{"type":"string","description":"Imperative description of the task."},
-        "status":{"type":"string","enum":["pending","in_progress","completed"],"description":"Task state. Keep at most one in_progress."},
+        "status":{"type":"string","enum":["pending","in_progress","completed"],"description":"Task state. Parallel segments may each keep one in_progress; within a phase segment sub-steps stay serial."},
         "activeForm":{"type":"string","description":"Present-continuous form shown while the task is in progress (e.g. \"Running tests\")."},
         "level":{"type":"integer","enum":[0,1],"description":"Nesting level: 0 = phase/milestone, 1 = a sub-step of the phase above it. Omit for a flat list."}
       },

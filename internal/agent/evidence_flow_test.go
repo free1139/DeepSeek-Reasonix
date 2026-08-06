@@ -354,7 +354,7 @@ func TestDeliveryProfileRequiresActiveTodoForLateMutation(t *testing.T) {
 	if err := a.Run(context.Background(), "implement main and incorporate review fixes"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := toolResultByID(a.session, "late-write"); !strings.Contains(got, "current in_progress todo") {
+	if got := toolResultByID(a.session, "late-write"); !strings.Contains(got, "an in_progress todo") {
 		t.Fatalf("late mutation result = %q, want active-todo gate", got)
 	}
 	if got := toolResultByID(a.session, "retry-write"); strings.HasPrefix(got, "blocked:") || strings.HasPrefix(got, "error:") {

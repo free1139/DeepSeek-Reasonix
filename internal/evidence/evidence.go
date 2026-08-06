@@ -28,32 +28,28 @@ type TodoItem struct {
 }
 
 // ValidateSerialTodos enforces the task-list state machine promised by
-// todo_write: at most one item in the whole list is in_progress, completed
-// work forms a serial prefix, and pending work follows the current item. The
-// rule is segment-aware for two-level lists: a level-0 phase owns the level-1
-// sub-steps after it, sub-steps complete in order while their phase stays
-// pending, and the phase becomes the single in_progress item only after every
-// sub-step has completed — the phase signs off last. A fully completed or
+// todo_write: completed work forms a global prefix, and every other segment
+// is either fully pending or carries exactly one current (in_progress) item
+// as its first unfinished item. Parallel segments may each hold a current
+// item concurrently — a flat list (each item its own segment) or several
+// phases can run side by side — while within one phase segment sub-steps
+// still complete in order and the phase signs off last. A fully completed or
 // empty list is also valid.
 func ValidateSerialTodos(todos []TodoItem) error {
-	ipSeen := false
+	if len(todos) > 0 && todos[0].Level == 1 {
+		return fmt.Errorf("todo 1 %q is a level-1 sub-step with no phase above it; add a level-0 phase header or use level 0", todos[0].Content)
+	}
+	// Every item must carry a known status; the segment walk below assumes it.
 	for i, todo := range todos {
 		switch todoStatus(todo.Status) {
-		case "completed", "pending":
-		case "in_progress":
-			if ipSeen {
-				return fmt.Errorf("todo %d %q is a second in_progress item; serial task lists allow exactly one current item", i+1, todo.Content)
-			}
-			ipSeen = true
+		case "completed", "pending", "in_progress":
 		default:
 			return fmt.Errorf("todo %d %q has invalid status %q", i+1, todo.Content, todo.Status)
 		}
 	}
-	if len(todos) > 0 && todos[0].Level == 1 {
-		return fmt.Errorf("todo 1 %q is a level-1 sub-step with no phase above it; add a level-0 phase header or use level 0", todos[0].Content)
-	}
-	seenCurrent := false
-	seenPending := false
+	seenUnfinished := false
+	hasPending := false
+	currentSegments := 0
 	for _, seg := range serialTodoSegments(todos) {
 		state, err := validateSerialSegment(todos, seg)
 		if err != nil {
@@ -61,38 +57,28 @@ func ValidateSerialTodos(todos []TodoItem) error {
 		}
 		switch state {
 		case "completed":
-			if seenCurrent || seenPending {
+			if seenUnfinished {
 				return fmt.Errorf("todo %d %q is completed after unfinished work; serial task lists require completed items to form a prefix", seg.head+1, todos[seg.head].Content)
 			}
 		case "in_progress":
-			if seenPending {
-				ip := seg.head
-				for i := seg.head; i < seg.end; i++ {
-					if todoStatus(todos[i].Status) == "in_progress" {
-						ip = i
-						break
-					}
-				}
-				return fmt.Errorf("todo %d %q is in_progress after pending work; the current item must be the first unfinished item", ip+1, todos[ip].Content)
-			}
-			seenCurrent = true
+			seenUnfinished = true
+			currentSegments++
 		case "pending":
-			seenPending = true
+			seenUnfinished = true
+			hasPending = true
 		default: // stale: partially completed with no current item
-			if seenCurrent {
-				first := seg.head
-				for i := seg.head; i < seg.end; i++ {
-					if todoStatus(todos[i].Status) == "completed" {
-						first = i
-						break
-					}
+			seenUnfinished = true
+			first := seg.head
+			for i := seg.head; i < seg.end; i++ {
+				if todoStatus(todos[i].Status) == "completed" {
+					first = i
+					break
 				}
-				return fmt.Errorf("todo %d %q is completed after unfinished work; serial task lists require completed items to form a prefix", first+1, todos[first].Content)
 			}
-			seenPending = true
+			return fmt.Errorf("todo %d %q is completed after unfinished work; serial task lists require completed items to form a prefix", first+1, todos[first].Content)
 		}
 	}
-	if len(todos) > 0 && seenPending && !seenCurrent {
+	if hasPending && currentSegments == 0 {
 		return fmt.Errorf("serial task list has pending work but no in_progress item")
 	}
 	return nil
@@ -127,8 +113,9 @@ func serialTodoSegments(todos []TodoItem) []todoSegment {
 // validateSerialSegment checks one segment's internal shape and returns its
 // serial state: "completed" (every item completed), "in_progress" (the
 // segment holds the current item), "pending" (untouched), or "stale"
-// (partially completed with no current item). Item statuses and the global
-// single-in_progress rule are already validated by the caller.
+// (partially completed with no current item). Item statuses are validated by
+// the caller; the caller also owns the cross-segment rules (completed prefix,
+// parallel current segments).
 func validateSerialSegment(todos []TodoItem, seg todoSegment) (string, error) {
 	head := todos[seg.head]
 	headStatus := todoStatus(head.Status)
@@ -184,49 +171,131 @@ func validateSerialSegment(todos []TodoItem, seg todoSegment) (string, error) {
 	}
 }
 
-// NormalizeSerialTodos repairs legacy host state that predates
+// NormalizeSerialTodos repairs host state that does not yet obey
 // ValidateSerialTodos. It preserves the leading run of fully completed
-// segments and makes the first unfinished segment current: its completed
-// sub-step prefix is kept and its first unfinished sub-step becomes the
-// single in_progress item — or the phase itself when every sub-step is
-// already completed. Every later segment returns to pending.
+// segments and keeps every segment's existing legal in_progress item —
+// parallel segments stay parallel. Within each unfinished segment it keeps
+// the completed sub-step prefix, makes the first unfinished sub-step current
+// (or the phase itself when every sub-step is done), and returns later
+// sub-steps to pending. As a fallback it guarantees at least one current
+// segment whenever unfinished work exists, so a freshly seeded all-pending
+// plan still starts.
 func NormalizeSerialTodos(todos []TodoItem) []TodoItem {
 	out := append([]TodoItem(nil), todos...)
-	unfinished := false
-	for _, seg := range serialTodoSegments(out) {
-		if !unfinished && serialSegmentCompleted(out, seg) {
-			continue
-		}
-		if unfinished {
-			for i := seg.head; i < seg.end; i++ {
-				out[i].Status = "pending"
+	segments := serialTodoSegments(out)
+	seenUnfinished := false
+	for _, seg := range segments {
+		state, _ := validateSerialSegment(out, seg)
+		if state == "completed" {
+			if seenUnfinished {
+				// Completed segments must form the global prefix; demote a
+				// trailing completed segment so the repaired list validates.
+				for i := seg.head; i < seg.end; i++ {
+					out[i].Status = "pending"
+				}
 			}
 			continue
 		}
-		unfinished = true
-		if seg.end == seg.head+1 {
-			out[seg.head].Status = "in_progress"
-			continue
+		seenUnfinished = true
+		normalizeSerialSegment(out, seg)
+	}
+	hasCurrent, hasUnfinished := false, false
+	for _, seg := range segments {
+		state, _ := validateSerialSegment(out, seg)
+		switch state {
+		case "in_progress":
+			hasCurrent = true
+		case "completed":
+		default:
+			hasUnfinished = true
 		}
-		subUnfinished := false
-		for i := seg.head + 1; i < seg.end; i++ {
-			if !subUnfinished && todoStatus(out[i].Status) == "completed" {
-				continue
+	}
+	if hasUnfinished && !hasCurrent {
+		for _, seg := range segments {
+			state, _ := validateSerialSegment(out, seg)
+			if state != "completed" {
+				makeSegmentCurrent(out, seg)
+				break
 			}
-			if !subUnfinished {
-				out[i].Status = "in_progress"
-				subUnfinished = true
-				continue
-			}
-			out[i].Status = "pending"
-		}
-		if subUnfinished {
-			out[seg.head].Status = "pending"
-		} else {
-			out[seg.head].Status = "in_progress"
 		}
 	}
 	return out
+}
+
+// normalizeSerialSegment repairs one segment's internal shape while keeping
+// an existing current item: completed sub-step prefix preserved, first
+// unfinished sub-step current, later sub-steps pending, phase pending until
+// every sub-step is done. A segment that has not started (all pending) is
+// left untouched so parallel segments may wait; the caller's fallback
+// activates the first one when no segment holds a current item.
+func normalizeSerialSegment(todos []TodoItem, seg todoSegment) {
+	head := seg.head
+	if seg.end > seg.head+1 {
+		hasCompleted, hasCurrent := false, false
+		firstUnfinished := -1
+		for i := head + 1; i < seg.end; i++ {
+			switch todoStatus(todos[i].Status) {
+			case "completed":
+				hasCompleted = true
+			case "in_progress":
+				hasCurrent = true
+				if firstUnfinished < 0 {
+					firstUnfinished = i
+				}
+			default: // pending
+				if firstUnfinished < 0 {
+					firstUnfinished = i
+				}
+			}
+		}
+		if !hasCompleted && !hasCurrent {
+			// Not started: keep it waiting. A phase with no sub-step progress
+			// must not hold the current item, and a completed header with
+			// unfinished sub-steps is invalid — demote both to pending.
+			if todoStatus(todos[head].Status) != "pending" {
+				todos[head].Status = "pending"
+			}
+			return
+		}
+		if firstUnfinished >= 0 {
+			for i := head + 1; i < seg.end; i++ {
+				if todoStatus(todos[i].Status) == "completed" {
+					continue
+				}
+				if i == firstUnfinished {
+					todos[i].Status = "in_progress"
+				} else {
+					todos[i].Status = "pending"
+				}
+			}
+			todos[head].Status = "pending"
+			return
+		}
+		// Every sub-step completed: hand the phase over for sign-off.
+		if todoStatus(todos[head].Status) != "completed" {
+			todos[head].Status = "in_progress"
+		}
+		return
+	}
+	// A single flat item keeps its status: completed stays completed, an
+	// in_progress item stays current, and a pending item stays waiting —
+	// parallel segments may wait without being forced current.
+}
+
+// makeSegmentCurrent promotes the first unfinished item of a segment to
+// in_progress so the segment carries the current item.
+func makeSegmentCurrent(todos []TodoItem, seg todoSegment) {
+	if seg.end > seg.head+1 {
+		for i := seg.head + 1; i < seg.end; i++ {
+			if todoStatus(todos[i].Status) != "completed" {
+				todos[i].Status = "in_progress"
+				return
+			}
+		}
+		todos[seg.head].Status = "in_progress"
+		return
+	}
+	todos[seg.head].Status = "in_progress"
 }
 
 func serialSegmentCompleted(todos []TodoItem, seg todoSegment) bool {
@@ -258,14 +327,16 @@ func FirstUnfinishedSubStep(todos []TodoItem, index int) (int, bool) {
 }
 
 // AdvanceSerialTodo completes the in_progress item at index (0-based) as a
-// signed-off step and promotes the next serial item so exactly one item stays
-// current. A phase with unfinished sub-steps does not complete. Completing a
-// sub-step promotes its next pending sibling, or returns its phase to
-// in_progress for sign-off once every sibling is completed. Completing a
-// phase or plain step promotes the next pending unit — a phase's first
-// pending sub-step (the phase itself stays pending until its sub-steps
-// finish), or the plain step itself. A level-1 item with no phase above it
-// advances as a standalone step. It reports whether the item was completed.
+// signed-off step. Promotion stays within the item's own segment: completing
+// a sub-step promotes its next pending sibling, or returns its phase to
+// in_progress for sign-off once every sibling is completed; a phase with
+// unfinished sub-steps does not complete. Only when no segment still holds a
+// current item does it promote the next pending unit (a phase's first pending
+// sub-step — the phase itself stays pending until its sub-steps finish — or
+// the plain step itself), so parallel segments keep their own current items
+// and a finished serial list hands over to the next unit. A level-1 item
+// with no phase above it advances as a standalone step. It reports whether
+// the item was completed.
 func AdvanceSerialTodo(todos []TodoItem, index int) bool {
 	if index < 0 || index >= len(todos) {
 		return false

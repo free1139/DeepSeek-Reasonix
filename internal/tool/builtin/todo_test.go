@@ -38,11 +38,6 @@ func TestTodoWriteRejectsNonSerialStates(t *testing.T) {
 			want: "completed after unfinished",
 		},
 		{
-			name: "multiple current items",
-			args: `{"todos":[{"content":"first","status":"in_progress"},{"content":"second","status":"in_progress"}]}`,
-			want: "second in_progress",
-		},
-		{
 			name: "pending without current",
 			args: `{"todos":[{"content":"first","status":"pending"}]}`,
 			want: "no in_progress",
@@ -54,6 +49,16 @@ func TestTodoWriteRejectsNonSerialStates(t *testing.T) {
 				t.Fatalf("todo_write error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestTodoWriteAllowsParallelCurrentItems(t *testing.T) {
+	args := json.RawMessage(`{"todos":[
+		{"content":"Task one","status":"in_progress"},
+		{"content":"Task two","status":"in_progress"},
+		{"content":"Task three","status":"pending"}]}`)
+	if _, err := (todoWrite{}).Execute(context.Background(), args); err != nil {
+		t.Fatalf("parallel current items should be accepted: %v", err)
 	}
 }
 
