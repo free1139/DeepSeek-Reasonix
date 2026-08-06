@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"reasonix/internal/ablation"
+	"reasonix/internal/checkpoint"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/jobs"
@@ -65,6 +67,7 @@ var subagentRecursiveTools = []string{
 var subagentAlwaysHiddenTools = []string{
 	"parallel_tasks",
 	"fleet",
+	"read_subagent_result",
 	"install_skill",
 	"install_source",
 }
@@ -251,6 +254,7 @@ type TaskTool struct {
 	identityProfile     func(modelRef, effort string) (string, string)
 	maxSubagentDepth    int
 	deliveryProfile     bool
+	ablation            ablation.Set
 	workspaceLease      *workspacelease.Owner
 	// scheduler is the session-scoped concurrency + write-claim controller.
 	// nil falls back to the legacy jobs.ReserveStart cap for background tasks.
@@ -265,6 +269,8 @@ type TaskTool struct {
 	// bashSandboxEnforced reports whether OS sandbox can honour write roots
 	// for bash inside path-bound writer sub-agents.
 	bashSandboxEnforced func() bool
+	// mutationObserver is shared with spawned sub-agents for checkpoint capture.
+	mutationObserver *checkpoint.MutationObserver
 	// recoveryGate is the shared Auto Guard boundary for
 	// this session (root + sub-agents). nil disables recovery in children.
 	recoveryGate RecoveryGate
@@ -390,6 +396,13 @@ func (t *TaskTool) WithMaxSubagentDepth(depth int) *TaskTool {
 // the mutation gate remains dormant for them.
 func (t *TaskTool) WithDeliveryProfile(enabled bool) *TaskTool {
 	t.deliveryProfile = enabled
+	return t
+}
+
+// WithAblation propagates the parent's benchmark arm so a sub-agent runs with
+// the same subsystems switched off.
+func (t *TaskTool) WithAblation(set ablation.Set) *TaskTool {
+	t.ablation = set
 	return t
 }
 
@@ -561,10 +574,22 @@ func (r *ReadOnlyTaskTool) ResolveProfile(args json.RawMessage) *event.Profile {
 	return r.task.ResolveProfile(args)
 }
 
-func (r *ReadOnlyTaskTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+func (r *ReadOnlyTaskTool) Execute(ctx context.Context, args json.RawMessage) (result string, err error) {
 	if r == nil || r.task == nil {
 		return "", fmt.Errorf("read_only_task is not configured")
 	}
+	// read_only_task shares the same progress tracker as RunProfileSpec so
+	// every sub-agent entry point emits the same phase machine. It owns its
+	// merger (no parent task group) and finishes on every exit path.
+	trk := newSubagentProgressTracker(ctx, subSink(ctx))
+	trk.running()
+	defer func() {
+		if p := recover(); p != nil {
+			trk.finish(nil, fmt.Errorf("panic: %v", p))
+			panic(p)
+		}
+		trk.finish(ctx.Err(), err)
+	}()
 	var p struct {
 		Prompt      string   `json:"prompt"`
 		Description string   `json:"description"`
@@ -608,7 +633,12 @@ func (r *ReadOnlyTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if err != nil {
 		return "", fmt.Errorf("read-only sub-agent profile: %w", err)
 	}
-	answer, err := r.task.runReadOnlySubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, NewSession(DefaultReadOnlyTaskSystemPrompt), childDepth, subagentRecoveryTaskID(ctx, ""), usageModelRef)
+	recoveryTaskID := subagentRecoveryTaskID(ctx, "")
+	var mutationObserver *checkpoint.MutationObserver
+	if r.task.mutationObserver != nil {
+		mutationObserver = r.task.mutationObserver.CloneForSubagent(recoveryTaskID, r.task.mutationObserver.OwnershipTurn(), false)
+	}
+	answer, err := r.task.runReadOnlySubSession(ctx, p.Prompt, subReg, trk.wrap(), maxSteps, prov, pricing, ctxWin, NewSession(DefaultReadOnlyTaskSystemPrompt), childDepth, recoveryTaskID, usageModelRef, mutationObserver)
 	if err != nil {
 		return "", err
 	}
@@ -765,9 +795,29 @@ func (t *TaskTool) resolveWriterClaims(writePaths []string, requireClaim bool) (
 // RunProfileSpec executes a unified profile/task specification. Shared by task,
 // fleet items, and boot-wired skill runners so prompt, tools, claims, and
 // scheduling cannot drift across entry points.
-func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (string, error) {
+func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (result string, err error) {
 	if t == nil {
 		return "", fmt.Errorf("task tool is not configured")
+	}
+	// Per-child progress tracker: converts the child's reasoning/text/notice/
+	// retrying into reserved ToolProgress previews and guarantees exactly one
+	// terminal status (completed/cancelled/failed). The background job owns
+	// finish after handoff; every other exit finishes here, including
+	// validation errors and panics.
+	trk := newSubagentProgressTracker(ctx, subSink(ctx))
+	backgroundHandoff := false
+	defer func() {
+		if backgroundHandoff {
+			return
+		}
+		if p := recover(); p != nil {
+			trk.finish(nil, fmt.Errorf("panic: %v", p))
+			panic(p)
+		}
+		trk.finish(ctx.Err(), err)
+	}()
+	if !spec.RunInBackground {
+		trk.running()
 	}
 	if strings.TrimSpace(spec.Prompt) == "" {
 		return "", fmt.Errorf("prompt is required")
@@ -792,7 +842,7 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 	var subReg *tool.Registry
 	if spec.ReadOnly {
 		subReg = ReadOnlySubagentToolRegistryForDepthWithRuntime(t.parentReg, toolNames, childDepth, t.maxDepth(), t.capabilityRuntime)
-		if subReg.Len() == 0 {
+		if subReg.Len() == 0 && !spec.AllowNoTools {
 			return "", fmt.Errorf("no read-only tools available for this sub-agent")
 		}
 	} else {
@@ -813,7 +863,7 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 
 	modelRef, effortRef := spec.Model, spec.Effort
 	usageModelRef := t.usageModelRef(modelRef, effortRef)
-	parentID, parent, _, _ := CallContext(ctx)
+	parentID, _, _, _ := CallContext(ctx)
 	run, err := t.prepareTranscriptRunWithPrompt(subReg, modelRef, effortRef, ParentSession(ctx), parentID, spec.ContinueFrom, spec.ForkFrom, spec.SystemPrompt, spec.Kind, spec.Name)
 	if err != nil {
 		return "", err
@@ -843,12 +893,25 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 		spec.WritePaths = whole
 	}
 
-	runSession := func(runCtx context.Context, sink event.Sink) (string, error) {
-		recoveryTaskID := subagentRecoveryTaskID(runCtx, run.Ref)
-		if spec.ReadOnly {
-			return t.runReadOnlySubSession(runCtx, spec.Prompt, subReg, sink, maxSteps, prov, pricing, ctxWin, run.Session, childDepth, recoveryTaskID, usageModelRef)
+	recoveryTaskID := subagentRecoveryTaskID(ctx, run.Ref)
+	backgroundWriter := (spec.RunInBackground || spec.BackgroundWriter) && !spec.ReadOnly
+	var mutationObserver *checkpoint.MutationObserver
+	if t.mutationObserver != nil {
+		turn := t.mutationObserver.OwnershipTurn()
+		mutationObserver = t.mutationObserver.CloneForSubagent(recoveryTaskID, turn, backgroundWriter)
+	}
+	runSession := func(runCtx context.Context, sink event.Sink, writerAlreadyRegistered bool) (string, error) {
+		if mutationObserver != nil && backgroundWriter && !writerAlreadyRegistered {
+			turn := mutationObserver.OwnershipTurn()
+			if err := mutationObserver.RegisterWriter(recoveryTaskID, "background_subagent", turn); err != nil {
+				return "", err
+			}
+			defer mutationObserver.UnregisterWriter(recoveryTaskID)
 		}
-		return t.runSubSession(runCtx, spec.Prompt, subReg, sink, maxSteps, prov, pricing, ctxWin, run.Session, childDepth, recoveryTaskID, usageModelRef)
+		if spec.ReadOnly {
+			return t.runReadOnlySubSession(runCtx, spec.Prompt, subReg, sink, maxSteps, prov, pricing, ctxWin, run.Session, childDepth, recoveryTaskID, usageModelRef, mutationObserver)
+		}
+		return t.runSubSession(runCtx, spec.Prompt, subReg, sink, maxSteps, prov, pricing, ctxWin, run.Session, childDepth, recoveryTaskID, usageModelRef, mutationObserver)
 	}
 
 	if spec.RunInBackground {
@@ -873,7 +936,6 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 		} else {
 			releaseStart = func() {}
 		}
-		nested := subSinkFor(parentID, parent)
 		label := firstNonEmpty(spec.Description, spec.Name, "task")
 		if t.transcripts != nil && run != nil && run.Ref != "" {
 			if err := t.transcripts.MarkRunning(run); err != nil {
@@ -882,11 +944,27 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 				return "", err
 			}
 		}
+		writerRegistered := false
+		if mutationObserver != nil && backgroundWriter {
+			turn := mutationObserver.OwnershipTurn()
+			if err := mutationObserver.RegisterWriter(recoveryTaskID, "background_subagent", turn); err != nil {
+				releaseStart()
+				run.Release()
+				return "", errors.Join(err, t.transcripts.SaveFailed(run))
+			}
+			writerRegistered = true
+		}
 		parentSession := ParentSession(ctx)
 		backgroundEvidence := evidence.NewLedger()
 		// Capture acquire request by value for the job goroutine.
 		slotReq := acquireReq
+		// Emit queued before the job goroutine can start so the status slot
+		// never regresses to a stale queued after running.
+		trk.queued()
 		job := jm.StartForSession(jobs.SessionFromContext(ctx), "task", label, func(jobCtx context.Context, _ io.Writer) (result string, err error) {
+			if writerRegistered {
+				defer mutationObserver.UnregisterWriter(recoveryTaskID)
+			}
 			jobCtx = WithParentSession(jobCtx, parentSession)
 			jobCtx = evidence.WithLedger(jobCtx, backgroundEvidence)
 			defer run.Release()
@@ -897,6 +975,9 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 					result = FormatSubagentRunResult("", run, true)
 					err = errors.Join(panicErr, t.transcripts.SaveFailed(run))
 				}
+				// The job owns the terminal status: the parent tool call has
+				// already returned its job id by now.
+				trk.finish(jobCtx.Err(), err)
 			}()
 			// Queue for a concurrency/write slot here — not before Start —
 			// so the parent tool call returns a job id immediately.
@@ -905,7 +986,8 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 				return FormatSubagentRunResult("", run, true), errors.Join(slotErr, t.transcripts.SaveFailed(run))
 			}
 			defer releaseSlot()
-			answer, err := runSession(jobCtx, nested)
+			trk.running()
+			answer, err := runSession(jobCtx, trk.wrap(), writerRegistered)
 			if err != nil {
 				return FormatSubagentRunResult("", run, true), errors.Join(err, t.transcripts.SaveFailed(run))
 			}
@@ -915,6 +997,9 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 			return FormatSubagentRunResult(answer, run, false), nil
 		})
 		releaseStart()
+		// Hand the tracker to the job goroutine: the outer defer must not
+		// finish (and close) it while the job still runs.
+		backgroundHandoff = true
 		queuedNote := ""
 		if t.scheduler != nil {
 			queuedNote = " It may wait in the session queue until a concurrency/write slot is free."
@@ -933,7 +1018,7 @@ func (t *TaskTool) RunProfileSpec(ctx context.Context, spec ProfileExecSpec) (st
 	}
 	defer releaseSlot()
 	defer run.Release()
-	answer, err := runSession(ctx, subSink(ctx))
+	answer, err := runSession(ctx, trk.wrap(), false)
 	if err != nil {
 		return "", errors.Join(err, t.transcripts.SaveFailed(run))
 	}
@@ -1597,8 +1682,8 @@ func (t *TaskTool) resolveSubSessionRuntime(modelRef, effort string) (provider.P
 	return prov, pricing, ctxWin, nil
 }
 
-func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int, recoveryTaskID, modelRef string) (string, error) {
-	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID)
+func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int, recoveryTaskID, modelRef string, mutationObserver *checkpoint.MutationObserver) (string, error) {
+	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID, mutationObserver)
 	opts.ModelRef = modelRef
 	// Capture the pristine task before host framing is prepended: delivery
 	// intent classification must judge the task, not the wrapper.
@@ -1607,8 +1692,8 @@ func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *too
 	return RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, opts, sink)
 }
 
-func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int, recoveryTaskID, modelRef string) (string, error) {
-	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID)
+func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int, recoveryTaskID, modelRef string, mutationObserver *checkpoint.MutationObserver) (string, error) {
+	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth, recoveryTaskID, mutationObserver)
 	opts.ModelRef = modelRef
 	// Capture the pristine task before host framing is prepended: delivery
 	// intent classification must judge the task, not the wrapper.
@@ -1621,8 +1706,8 @@ func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, sub
 // sub-agent spawned through this tool shares (task, read_only_task, and
 // parallel_tasks children). Compaction, language preferences, and depth limits
 // must stay uniform across those paths — add new fields here, not at call sites.
-func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *provider.Pricing, ctxWin, childDepth int, recoveryTaskID string) Options {
-	return Options{
+func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *provider.Pricing, ctxWin, childDepth int, recoveryTaskID string, mutationObserver *checkpoint.MutationObserver) Options {
+	opts := Options{
 		MaxSteps:            maxSteps,
 		Temperature:         t.temperature,
 		Pricing:             pricing,
@@ -1641,11 +1726,14 @@ func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *p
 		SubagentDepth:       childDepth,
 		MaxSubagentDepth:    t.maxDepth(),
 		DeliveryProfile:     t.deliveryProfile,
+		Ablation:            t.ablation,
 		WorkspaceLease:      t.workspaceLease,
 		RecoveryGate:        t.recoveryGate,
 		RecoveryAgentID:     "subagent",
 		RecoveryTaskID:      recoveryTaskID,
+		MutationObserver:    mutationObserver,
 	}
+	return opts
 }
 
 func subagentRecoveryTaskID(ctx context.Context, ref string) string {
@@ -1664,6 +1752,17 @@ func (t *TaskTool) WithRecoveryGate(g RecoveryGate) *TaskTool {
 		return nil
 	}
 	t.recoveryGate = g
+	return t
+}
+
+// WithMutationObserver shares the host mutation observer with spawned sub-agents.
+// Foreground children inherit the parent ownership turn; background children
+// keep the turn that spawned them (set via OwnershipTurn at Begin).
+func (t *TaskTool) WithMutationObserver(obs *checkpoint.MutationObserver) *TaskTool {
+	if t == nil {
+		return nil
+	}
+	t.mutationObserver = obs
 	return t
 }
 
@@ -2040,9 +2139,11 @@ func NestedSink(ctx context.Context, fallback event.Sink) event.Sink {
 	return subSinkFor(parentID, parent)
 }
 
-// subSink forwards a sub-agent's tool dispatch/result events and billable usage
-// to the parent's event stream. Only tool activity is nested visually; the
-// sub-agent's text/reasoning stays isolated and only its final answer is returned.
+// subSink forwards a sub-agent's tool dispatch/result/progress events and
+// billable usage to the parent's event stream. Only tool activity is nested
+// visually; the sub-agent's text/reasoning stays isolated (progress previews
+// travel as reserved ToolProgress channels, not as parent Text/Reasoning) and
+// only its final answer is returned.
 //
 // The sub-agent's own turn/text/reasoning events are dropped — forwarding them
 // would make the parent transcript noisy and could imply they belong to the
@@ -2054,8 +2155,10 @@ func NestedSink(ctx context.Context, fallback event.Sink) event.Sink {
 // Tool events are tagged with the parent task call's ID so a frontend nests them
 // under it. The forwarded call IDs are namespaced with the parent ID so a
 // sub-agent call can never collide with a parent call in the frontend's
-// dispatch→result matching. Falls back to Discard when there's no parent stream
-// (the headless run loop, or a direct Execute in tests).
+// dispatch→result matching. ToolProgress covers both the sub-agent's real tool
+// output and nested sub-agent progress previews, which ride the same sink so
+// their IDs match the cards they belong to. Falls back to Discard when there's
+// no parent stream (the headless run loop, or a direct Execute in tests).
 func subSink(ctx context.Context) event.Sink {
 	parentID, parent, _, ok := CallContext(ctx)
 	if !ok || parent == nil {
@@ -2073,7 +2176,7 @@ func subSinkFor(parentID string, parent event.Sink) event.Sink {
 	}
 	return event.FuncSink(func(e event.Event) {
 		switch e.Kind {
-		case event.ToolDispatch, event.ToolResult:
+		case event.ToolDispatch, event.ToolResult, event.ToolProgress:
 			e.Tool.ParentID = parentID
 			e.Tool.ID = parentID + "/" + e.Tool.ID
 			parent.Emit(e)
