@@ -45,7 +45,7 @@ var validEvidenceKinds = map[string]bool{
 func (completeStep) Name() string { return "complete_step" }
 
 func (completeStep) Description() string {
-	return "Record the completion of ONE step of an approved plan. Call it as you finish each step: it signs the step off with a claim and its evidence — the verification you ran (command + result), a review, the diff/files you changed, or a manual check. At least one evidence item is required, but each item is taken as the model's claim: the host verifies it when a matching receipt exists and counts the rest as manual/unverified rather than rejecting the step. The host advances the task list for you when you sign off — it marks this step completed and moves the next to in_progress, so you don't need a separate todo_write to mark completions. Fields: `step` (which step — its title or number, matching the task list), `result` (what is now true/changed), `evidence` (≥1 item, each with `kind` = verification|review|diff|files|manual and a `summary`, plus optional `command`/`paths`), and optional `notes`."
+	return "Record the completion of ONE step of an approved plan. Call it as you finish each step: it signs the step off with a claim and its evidence — the verification you ran (command + result), a review, the diff/files you changed, or a manual check. At least one evidence item is required, but each item is taken as the model's claim: the host verifies it when a matching receipt exists and counts the rest as manual/unverified rather than rejecting the step. Signing off an in_progress item advances the task list; signing off any other item records the claim only — reflect the real status with todo_write. Fields: `step` (which step — its title or number, matching the task list), `result` (what is now true/changed), `evidence` (≥1 item, each with `kind` = verification|review|diff|files|manual and a `summary`, plus optional `command`/`paths`), and optional `notes`."
 }
 
 func (completeStep) Schema() json.RawMessage {
@@ -151,6 +151,8 @@ func (completeStep) Execute(ctx context.Context, args json.RawMessage) (string, 
 	advanceStatus := " The host advanced the task list; continue with the next step."
 	if hasTodo && todoMatch.Status == "completed" {
 		advanceStatus = " The matched todo was already completed; the task list is unchanged."
+	} else if hasTodo && (todoMatch.Status == "pending" || todoMatch.Status == "") {
+		advanceStatus = " The matched todo is not in_progress; the task list is unchanged — record status changes with todo_write."
 	}
 	return fmt.Sprintf("Step %q signed off with %d evidence item(s) [%s].%s%s",
 		step, len(p.Evidence), strings.Join(kinds, ", "), hostStatus+todoStatus+projectStatus, advanceStatus), nil
@@ -306,20 +308,9 @@ func verifyTodoStep(ctx context.Context, step string) (evidence.TodoStepMatch, b
 	case "completed":
 		return match, true, nil
 	case "", "pending":
-		// Under parallel segments several items may be current at once; list
-		// them all so the model can pick the one it actually finished.
-		var currents []string
-		for i, todo := range todos {
-			if strings.TrimSpace(todo.Status) != "in_progress" {
-				continue
-			}
-			currents = append(currents, fmt.Sprintf("todo %d %q", i+1, todo.Content))
-		}
-		hint := ""
-		if len(currents) > 0 {
-			hint = ": " + strings.Join(currents, ", ")
-		}
-		return evidence.TodoStepMatch{}, true, fmt.Errorf("step %q matches pending todo %d %q; complete_step only signs the current in_progress item%s", step, match.Index, match.Content, hint)
+		// No order enforcement: the model signs off whatever step it names.
+		// The claim is recorded; advancing the list is todo_write's job.
+		return match, true, nil
 	default:
 		return evidence.TodoStepMatch{}, true, fmt.Errorf("step %q matches todo %d (%q) but its status is %q; complete_step requires in_progress or completed", step, match.Index, match.Content, match.Status)
 	}

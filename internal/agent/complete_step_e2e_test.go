@@ -175,7 +175,7 @@ func TestE2ECrossTurnCanonicalGateBlocksThenClears(t *testing.T) {
 	}
 }
 
-func TestE2ECrossTurnPendingSignoffIsRejectedUntilCurrentAdvances(t *testing.T) {
+func TestE2ECrossTurnPendingSignoffAcceptedAsClaim(t *testing.T) {
 	sess := NewSession("sys")
 	sess.Add(provider.Message{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{
 		ID: "t0", Name: "todo_write",
@@ -197,8 +197,10 @@ func TestE2ECrossTurnPendingSignoffIsRejectedUntilCurrentAdvances(t *testing.T) 
 	if err := a.Run(context.Background(), "continue"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !sessionContains(a, "only signs the current in_progress item") {
-		t.Fatal("cross-turn pending signoff was not rejected")
+	// The out-of-order sign-off of beta (still pending) is accepted as a claim
+	// and does not block the later serial sign-offs.
+	if !sessionContains(a, "not in_progress") {
+		t.Fatal("cross-turn pending sign-off should be accepted with the list-unchanged note")
 	}
 	for i, td := range a.todoState {
 		if canonicalTodoStatus(td.Status) != "completed" {

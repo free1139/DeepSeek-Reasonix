@@ -416,7 +416,7 @@ func TestCompleteStepRejectsTodoMismatch(t *testing.T) {
 	}
 }
 
-func TestCompleteStepRejectsPendingTodo(t *testing.T) {
+func TestCompleteStepAcceptsPendingTodoAsClaim(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{
 		ToolName: "todo_write",
@@ -432,15 +432,15 @@ func TestCompleteStepRejectsPendingTodo(t *testing.T) {
 		"step":"Add parser",
 		"result":"parser added",
 		"evidence":[{"kind":"manual","summary":"checked manually"}]}`))
-	if err == nil || !strings.Contains(err.Error(), "only signs the current in_progress item") {
-		t.Fatalf("pending todo should be rejected, out=%q err=%v", out, err)
+	if err != nil {
+		t.Fatalf("pending todo should be signable as a claim: %v", err)
 	}
-	if !strings.Contains(err.Error(), "Inspect environment") {
-		t.Fatalf("pending rejection should name the current todo, got %v", err)
+	if !strings.Contains(out, "not in_progress") {
+		t.Fatalf("pending sign-off should report the list is unchanged, got %q", out)
 	}
 }
 
-func TestCompleteStepRejectsPendingCanonicalTodoAcrossTurns(t *testing.T) {
+func TestCompleteStepAcceptsPendingCanonicalTodoAcrossTurns(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ctx := evidence.WithLedger(context.Background(), ledger)
 	ctx = evidence.WithTodoState(ctx, []evidence.TodoItem{
@@ -448,15 +448,15 @@ func TestCompleteStepRejectsPendingCanonicalTodoAcrossTurns(t *testing.T) {
 		{Content: "Add parser", Status: "pending"},
 	})
 
-	_, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
+	out, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"Add parser",
 		"result":"parser added",
 		"evidence":[{"kind":"manual","summary":"checked manually"}]}`))
-	if err == nil || !strings.Contains(err.Error(), "only signs the current in_progress item") {
-		t.Fatalf("cross-turn pending todo should be rejected, got %v", err)
+	if err != nil {
+		t.Fatalf("cross-turn pending todo should be signable as a claim: %v", err)
 	}
-	if !strings.Contains(err.Error(), "Inspect environment") {
-		t.Fatalf("cross-turn rejection should name the current todo, got %v", err)
+	if !strings.Contains(out, "not in_progress") {
+		t.Fatalf("cross-turn pending sign-off should note the list is unchanged, got %q", out)
 	}
 }
 
@@ -770,7 +770,9 @@ func TestCompleteStepSignsPhaseAfterSubStepsComplete(t *testing.T) {
 	}
 }
 
-func TestCompleteStepPendingHintNamesActiveSubStep(t *testing.T) {
+// The pending sign-off hint (which used to list the active in_progress items)
+// is gone: signing off a pending item is now accepted as a claim.
+func TestCompleteStepPendingSignOffIsAccepted(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{
 		ToolName: "todo_write",
@@ -783,11 +785,14 @@ func TestCompleteStepPendingHintNamesActiveSubStep(t *testing.T) {
 	})
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
-	_, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
+	out, err := (completeStep{}).Execute(ctx, json.RawMessage(`{
 		"step":"fix imports",
 		"result":"imports fixed",
 		"evidence":[{"kind":"manual","summary":"checked manually"}]}`))
-	if err == nil || !strings.Contains(err.Error(), `todo 2 "move files"`) {
-		t.Fatalf("pending hint should point at the active sub-step, got %v", err)
+	if err != nil {
+		t.Fatalf("a pending sub-step sign-off should be accepted as a claim: %v", err)
+	}
+	if !strings.Contains(out, "not in_progress") {
+		t.Fatalf("pending sub-step sign-off should note the list is unchanged, got %q", out)
 	}
 }
