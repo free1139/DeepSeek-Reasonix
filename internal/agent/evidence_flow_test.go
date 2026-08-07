@@ -1192,7 +1192,7 @@ func TestEvidenceFlowAllowsTodoCompletionAfterFailedCompleteStep(t *testing.T) {
 	}
 }
 
-func TestEvidenceFlowRejectsReplacedTodoAsNewCompleted(t *testing.T) {
+func TestEvidenceFlowAllowsReplacingWithNewCompleted(t *testing.T) {
 	todoWrite, ok := tool.LookupBuiltin("todo_write")
 	if !ok {
 		t.Fatal("todo_write builtin not registered")
@@ -1227,11 +1227,10 @@ func TestEvidenceFlowRejectsReplacedTodoAsNewCompleted(t *testing.T) {
 
 	results := toolResults(a.session, "todo_write")
 	if len(results) < 2 {
-		t.Fatalf("todo_write results = %v, want the rejected replacement result", results)
+		t.Fatalf("todo_write results = %v, want the accepted replacement result", results)
 	}
-	got := results[1]
-	if !strings.Contains(got, "Ship parser") || !strings.Contains(got, "completed todo") {
-		t.Fatalf("todo_write result = %q, want replaced todo rejected as a new completed item", got)
+	if got := results[1]; !strings.Contains(got, "1 completed") {
+		t.Fatalf("todo_write result = %q, want replaced todo accepted as a new completed item", got)
 	}
 }
 

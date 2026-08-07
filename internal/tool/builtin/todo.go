@@ -18,9 +18,9 @@ func init() { tool.RegisterBuiltin(todoWrite{}) }
 // keeps at most one item in_progress per phase segment — independent tasks and
 // different phases may run in parallel, while within one phase the sub-steps
 // stay serial — and flips each to completed as it finishes.
-// Replacing, removing, or parking a current in_progress item is allowed (task
-// redirection); completed history must stay in place at its original position,
-// and any status is taken as given — the model marks completion directly.
+// Replacing, removing, or parking any item — current or completed — is allowed
+// (task redirection); any status is taken as given, and the list only has to
+// stay internally serial: completed work forms a prefix before pending work.
 type todoWrite struct{}
 
 type todoItem struct {
@@ -93,41 +93,8 @@ func (todoWrite) Execute(ctx context.Context, args json.RawMessage) (string, err
 	if err := evidence.ValidateSerialTodos(toEvidenceTodos(p.Todos)); err != nil {
 		return "", err
 	}
-	if err := verifyCompletedTodoPositions(ctx, p.Todos); err != nil {
-		return "", err
-	}
 	return fmt.Sprintf("Todos updated: %d total — %d completed, %d in progress, %d pending.",
 		len(p.Todos), done, active, pending), nil
-}
-
-func verifyCompletedTodoPositions(ctx context.Context, todos []todoItem) error {
-	previous := todoBaseline(ctx)
-	if len(previous) == 0 {
-		return nil
-	}
-	for i, todo := range todos {
-		if todo.Status != "completed" {
-			continue
-		}
-		match, found := evidence.MatchTodoIdentity(toEvidenceTodo(todo), previous)
-		if !found || match.Index != i+1 {
-			return fmt.Errorf("completed todo %d %q cannot be inserted, duplicated, or reordered; preserve the completed prefix at its original position", i+1, todo.Content)
-		}
-	}
-	if len(evidence.IncompleteTodos(previous)) > 0 && !evidence.PreservesCompletedTodoPositions(previous, toEvidenceTodos(todos)) {
-		return fmt.Errorf("completed task history cannot be removed, changed, or reordered while the plan is active; preserve every completed item at its original position")
-	}
-	return nil
-}
-
-func todoBaseline(ctx context.Context) []evidence.TodoItem {
-	if ledger, ok := evidence.FromContext(ctx); ok {
-		if previous, ok := ledger.LatestTodos(); ok && len(previous) > 0 {
-			return previous
-		}
-	}
-	previous, _ := evidence.TodoStateFromContext(ctx)
-	return previous
 }
 
 func toEvidenceTodos(todos []todoItem) []evidence.TodoItem {

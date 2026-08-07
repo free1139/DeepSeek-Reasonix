@@ -145,7 +145,7 @@ func TestTodoWriteAllowsCompletingCurrentWithoutReceipt(t *testing.T) {
 	}
 }
 
-func TestTodoWritePlanReplacementPreservesCompletedHistory(t *testing.T) {
+func TestTodoWriteAllowsReplacingListWithoutCompletedHistory(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{
 		ToolName: "todo_write",
@@ -162,12 +162,14 @@ func TestTodoWritePlanReplacementPreservesCompletedHistory(t *testing.T) {
 		{"content":"Replace parser architecture","status":"in_progress"}
 	]}`)
 	if _, err := (todoWrite{}).Execute(ctx, valid); err != nil {
-		t.Fatalf("replacing the in_progress todo should succeed without plan-replacement authorization: %v", err)
+		t.Fatalf("replacing the in_progress todo should succeed: %v", err)
 	}
 
+	// Dropping the completed history entirely is allowed: any status is taken
+	// as given and the list only has to stay internally serial.
 	dropsHistory := json.RawMessage(`{"todos":[{"content":"Replace parser architecture","status":"in_progress"}]}`)
-	if _, err := (todoWrite{}).Execute(ctx, dropsHistory); err == nil || !strings.Contains(err.Error(), "completed task history") {
-		t.Fatalf("replacement dropped completed history: %v", err)
+	if _, err := (todoWrite{}).Execute(ctx, dropsHistory); err != nil {
+		t.Fatalf("replacement without the completed history should be accepted: %v", err)
 	}
 }
 
@@ -234,7 +236,7 @@ func TestTodoWriteAllowsCompletingCanonicalCurrentAcrossTurns(t *testing.T) {
 	}
 }
 
-func TestTodoWriteRejectsDuplicatedOrReorderedCompletedPrefix(t *testing.T) {
+func TestTodoWriteAllowsDuplicatedOrReorderedCompletedPrefix(t *testing.T) {
 	ledger := evidence.NewLedger()
 	ledger.Record(evidence.Receipt{
 		ToolName: "todo_write",
@@ -247,6 +249,8 @@ func TestTodoWriteRejectsDuplicatedOrReorderedCompletedPrefix(t *testing.T) {
 	})
 	ctx := evidence.WithLedger(context.Background(), ledger)
 
+	// Completed items may be duplicated or reordered across lists: the list
+	// only has to stay internally serial (completed prefix before pending).
 	for _, args := range []string{
 		`{"todos":[
 			{"content":"Inspect environment","status":"completed"},
@@ -259,9 +263,8 @@ func TestTodoWriteRejectsDuplicatedOrReorderedCompletedPrefix(t *testing.T) {
 			{"content":"Write code","status":"in_progress"}
 		]}`,
 	} {
-		_, err := (todoWrite{}).Execute(ctx, json.RawMessage(args))
-		if err == nil || !strings.Contains(err.Error(), "cannot be inserted, duplicated, or reordered") {
-			t.Fatalf("invalid completed prefix should be rejected: %v", err)
+		if _, err := (todoWrite{}).Execute(ctx, json.RawMessage(args)); err != nil {
+			t.Fatalf("duplicated/reordered completed items should be accepted: %v", err)
 		}
 	}
 }

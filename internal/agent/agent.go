@@ -3813,9 +3813,12 @@ func (a *Agent) recoveryPlanTransition(toolName string, args json.RawMessage) (b
 		return false, "", ""
 	}
 	after := evidence.ReceiptFromToolCall("todo_write", args, true, true).Todos
-	if len(after) == 0 || evidence.ValidateSerialTodos(after) != nil || !evidence.PreservesCompletedTodoPositions(before, after) {
+	if len(after) == 0 || evidence.ValidateSerialTodos(after) != nil {
 		// Let todo_write report malformed or invalid state directly; an invalid
-		// task list is not a meaningful plan proposal for the reviewer.
+		// task list is not a meaningful plan proposal for the reviewer. Completed
+		// history may now be dropped or reordered (todo_write takes any status as
+		// given), so a structural rewrite with completed edits still reaches the
+		// reviewer via the samePlanStructure check below.
 		return false, "", ""
 	}
 	if samePlanStructure(before, after) {
