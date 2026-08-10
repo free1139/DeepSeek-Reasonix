@@ -20,7 +20,7 @@ import (
 	"reasonix/internal/control"
 )
 
-// --- workspaceStatePath ---
+// workspaceStatePath
 
 func TestWorkspaceStatePath(t *testing.T) {
 	// workspaceStatePath depends on config.MemoryUserDir() which needs a
@@ -35,7 +35,7 @@ func TestWorkspaceStatePath(t *testing.T) {
 	}
 }
 
-// --- saveWorkspace / loadWorkspace round-trip ---
+// saveWorkspace / loadWorkspace round-trip
 
 func TestSaveLoadWorkspaceRoundTrip(t *testing.T) {
 	// workspaceStatePath() resolves via os.UserConfigDir() (HOME on unix,
@@ -568,14 +568,14 @@ func BenchmarkDesktopSessionDir(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if desktopSessionDir(root) == "" {
 			b.Fatal("empty session dir")
 		}
 	}
 }
 
-// --- cwdWritable ---
+// cwdWritable
 
 func TestCwdWritable(t *testing.T) {
 	// In a normal test environment, cwd should be writable.
@@ -628,7 +628,7 @@ func TestReadFilePreviewBinaryClassification(t *testing.T) {
 	orig, _ := os.Getwd()
 	defer os.Chdir(orig)
 
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	if err := os.Chdir(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -950,7 +950,7 @@ func TestMediaTokenMaxEviction(t *testing.T) {
 
 	// Fill beyond max to trigger eviction of oldest.
 	var oldestToken string
-	for i := 0; i < mediaTokenMax+1; i++ {
+	for i := range mediaTokenMax + 1 {
 		tok := store.create(dir+"/test.png", "test.png", "image/png", "image", 4, time.Time{})
 		if i == 0 {
 			oldestToken = tok
@@ -1048,7 +1048,7 @@ func TestReadFileGB18030(t *testing.T) {
 	}
 }
 
-// --- RemoveWorkspace cleanup of active pointer ---
+// RemoveWorkspace cleanup of active pointer
 
 func TestRemoveWorkspaceClearsActivePointerWhenRemovingCurrentWorkspace(t *testing.T) {
 	isolateDesktopUserDirs(t)
@@ -1115,7 +1115,7 @@ func TestClearWorkspace(t *testing.T) {
 	}
 }
 
-// --- OpenProjectTab updates active workspace pointer ---
+// OpenProjectTab updates active workspace pointer
 
 func TestOpenProjectTabUpdatesActiveWorkspacePointer(t *testing.T) {
 	isolateDesktopUserDirs(t)
@@ -1194,25 +1194,33 @@ func TestWorkspaceChangesUsesRequestedTabCheckpoints(t *testing.T) {
 	sessionA := filepath.Join(sessionDir, "a.jsonl")
 	sessionB := filepath.Join(sessionDir, "b.jsonl")
 	content := "old"
+	afterExists := true
 	now := time.Now()
 
 	for _, tc := range []struct {
-		session string
-		path    string
-		prompt  string
+		session       string
+		path          string
+		prompt        string
+		schemaVersion int
+		afterExisted  *bool
+		afterSHA256   string
 	}{
-		{sessionA, "a.txt", "edit a"},
-		{sessionB, "b.txt", "edit b"},
+		{sessionA, "a.txt", "edit a", checkpoint.SchemaV2, &afterExists, checkpoint.Digest([]byte("new"))},
+		{sessionB, "b.txt", "edit b", 0, nil, ""},
 	} {
 		ckptDir := strings.TrimSuffix(tc.session, ".jsonl") + ".ckpt"
 		if err := os.MkdirAll(ckptDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		seedCheckpoint(t, ckptDir, checkpoint.Checkpoint{
-			Turn:   0,
-			Time:   now,
-			Prompt: tc.prompt,
-			Files:  []checkpoint.FileSnap{{Path: tc.path, Content: &content}},
+			SchemaVersion: tc.schemaVersion,
+			Turn:          0,
+			Time:          now,
+			Prompt:        tc.prompt,
+			Files: []checkpoint.FileSnap{{
+				Path: tc.path, Content: &content,
+				AfterExisted: tc.afterExisted, AfterSHA256: tc.afterSHA256,
+			}},
 		})
 	}
 
@@ -1236,6 +1244,13 @@ func TestWorkspaceChangesUsesRequestedTabCheckpoints(t *testing.T) {
 	}
 	if byPath["b.txt"].LatestPrompt != "edit b" {
 		t.Fatalf("requested tab b changes = %+v, want b.txt from tab b", got.Files)
+	}
+	if byPath["b.txt"].CanSessionRevert {
+		t.Fatalf("legacy checkpoint must not enable destructive one-click revert: %+v", byPath["b.txt"])
+	}
+	gotA := app.WorkspaceChanges("a")
+	if len(gotA.Files) != 1 || !gotA.Files[0].CanSessionRevert {
+		t.Fatalf("verified v2 checkpoint should enable session revert: %+v", gotA.Files)
 	}
 }
 
@@ -1797,7 +1812,7 @@ func gitOutput(t *testing.T, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// --- settings_app.go helpers ---
+// settings_app.go helpers
 // These are unexported but in the same package, so we can test them.
 
 func TestOrDefault(t *testing.T) {

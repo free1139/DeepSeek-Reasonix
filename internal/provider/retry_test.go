@@ -86,8 +86,24 @@ func TestBackoffDelay(t *testing.T) {
 	if d := backoffDelay(5, 3*time.Second); d != 3*time.Second {
 		t.Errorf("Retry-After should win: %v", d)
 	}
-	if d := backoffDelay(1, time.Hour); d != maxBackoff {
-		t.Errorf("Retry-After should be capped to %v, got %v", maxBackoff, d)
+	if d := backoffDelay(1, 45*time.Second); d != 45*time.Second {
+		t.Errorf("Retry-After beyond the backoff cap should still be honored: %v", d)
+	}
+	if d := backoffDelay(1, time.Hour); d != maxRetryAfter {
+		t.Errorf("Retry-After should be capped to %v, got %v", maxRetryAfter, d)
+	}
+}
+
+func TestParseRetryAfterAcceptsHTTPDate(t *testing.T) {
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("Retry-After", time.Now().Add(30*time.Second).UTC().Format(http.TimeFormat))
+	if d := parseRetryAfter(resp); d < 25*time.Second || d > 31*time.Second {
+		t.Errorf("http-date Retry-After = %v, want ~30s", d)
+	}
+
+	resp.Header.Set("Retry-After", time.Now().Add(-time.Minute).UTC().Format(http.TimeFormat))
+	if d := parseRetryAfter(resp); d != 0 {
+		t.Errorf("elapsed http-date Retry-After = %v, want 0", d)
 	}
 }
 
@@ -156,7 +172,7 @@ func TestSendWithRetryRetriesTransientAuthForKnownKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a previously-good key should recover from a transient 401: %v", err)
 	}
-	if resp.StatusCode != 200 || calls != 3 {
+	if resp.StatusCode != http.StatusOK || calls != 3 {
 		t.Fatalf("status=%d calls=%d, want 200 after 3 calls", resp.StatusCode, calls)
 	}
 }
@@ -212,7 +228,7 @@ func TestSendWithRetryUnblocksStalledErrorBody(t *testing.T) {
 	cl := &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 		calls++
 		if calls == 1 {
-			return &http.Response{StatusCode: 502, Body: newStallingBody(), Header: http.Header{}}, nil
+			return &http.Response{StatusCode: http.StatusBadGateway, Body: newStallingBody(), Header: http.Header{}}, nil
 		}
 		return statusResp(200, nil), nil
 	})}
@@ -232,7 +248,7 @@ func TestSendWithRetryUnblocksStalledErrorBody(t *testing.T) {
 		if r.err != nil {
 			t.Fatalf("should recover after the stalled 502: %v", r.err)
 		}
-		if r.resp.StatusCode != 200 || calls != 2 {
+		if r.resp.StatusCode != http.StatusOK || calls != 2 {
 			t.Fatalf("status=%d calls=%d, want 200 after 2 calls", r.resp.StatusCode, calls)
 		}
 	case <-time.After(5 * time.Second):
@@ -257,7 +273,7 @@ func TestSendWithRetryRecoversAndNotifies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("should recover after one retry: %v", err)
 	}
-	if resp.StatusCode != 200 || calls != 2 {
+	if resp.StatusCode != http.StatusOK || calls != 2 {
 		t.Fatalf("status=%d calls=%d, want 200 after 2 calls", resp.StatusCode, calls)
 	}
 	if len(infos) != 1 || infos[0].Attempt != 1 || infos[0].Max != MaxRetries {

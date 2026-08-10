@@ -4,7 +4,6 @@ import "testing"
 
 func TestCuratedProviderPresetsCoverRequestedProviders(t *testing.T) {
 	wantIDs := []string{
-		"deepseek-anthropic",
 		"longcat-openai",
 		"longcat-anthropic",
 		"token-rhythm",
@@ -84,7 +83,7 @@ func TestDeepSeekAnthropicPresetIsOptionalAndModelScoped(t *testing.T) {
 		t.Fatalf("DeepSeek Anthropic preset = %+v, want one entry", preset)
 	}
 	entry := preset.Entries[0]
-	if entry.Kind != "anthropic" || entry.BaseURL != deepSeekAnthropicBaseURL || entry.Default != "deepseek-v4-flash" || entry.Thinking != "enabled" || entry.Vision || entry.APIKeyEnv != "DEEPSEEK_API_KEY" {
+	if entry.Kind != "anthropic" || entry.BaseURL != deepSeekAnthropicBaseURL || entry.Default != "deepseek-v4-flash" || entry.Thinking != "enabled" || !EffectiveWebSearch(&entry) || entry.Vision || entry.APIKeyEnv != "DEEPSEEK_API_KEY" {
 		t.Fatalf("DeepSeek Anthropic preset entry = %+v", entry)
 	}
 	var cfg Config
@@ -125,12 +124,14 @@ func TestDeepSeekResponsesPresetMatchesOfficialSupport(t *testing.T) {
 	if entry.ModelsURL != "" {
 		t.Fatalf("deepseek responses models URL = %q, want static supported-model list", entry.ModelsURL)
 	}
+	if !EffectiveWebSearch(&entry) || entry.Vision || entry.VisionModels != nil {
+		t.Fatalf("deepseek responses capabilities = web_search:%t vision:%t vision_models:%v", EffectiveWebSearch(&entry), entry.Vision, entry.VisionModels)
+	}
 }
 
 func TestCuratedProviderPresetsDisplayOrder(t *testing.T) {
 	wantPrefix := []string{
 		"deepseek-responses",
-		"deepseek-anthropic",
 		"glm-cn",
 		"zai-global",
 		"glm-coding-plan-cn",
@@ -156,6 +157,17 @@ func TestCuratedProviderPresetsDisplayOrder(t *testing.T) {
 		if got[i].ID != want {
 			t.Fatalf("preset[%d] = %q, want %q", i, got[i].ID, want)
 		}
+	}
+}
+
+func TestCuratedProviderPresetsHideRedundantDeepSeekAnthropicPreset(t *testing.T) {
+	for _, preset := range CuratedProviderPresets() {
+		if preset.ID == "deepseek-anthropic" {
+			t.Fatal("redundant DeepSeek Anthropic preset should not be shown in the curated list")
+		}
+	}
+	if _, ok := CuratedProviderPreset("deepseek-anthropic"); !ok {
+		t.Fatal("legacy DeepSeek Anthropic preset must remain available for compatibility")
 	}
 }
 

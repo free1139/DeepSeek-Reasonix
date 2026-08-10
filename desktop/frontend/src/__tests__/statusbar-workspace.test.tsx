@@ -190,6 +190,23 @@ console.log("\nstatus bar workspace");
 }
 
 {
+  const exact = renderStatusBar({
+    items: ["turn_tps"],
+    lastTurnOutputTokens: 100,
+    lastTurnModelMs: 5_000,
+  });
+  ok(exact.includes("20 t/s"), "completed TPS uses provider-output time");
+
+  const estimated = renderStatusBar({
+    items: ["turn_tps"],
+    lastTurnOutputTokens: 100,
+    lastTurnModelMs: 5_000,
+    lastTurnOutputEstimated: true,
+  });
+  ok(estimated.includes("≈20 t/s"), "fallback TPS is visibly marked as estimated");
+}
+
+{
   const dom = new JSDOM("<!doctype html><html><body><div id=\"root\"></div></body></html>", {
     pretendToBeVisual: true,
     url: "http://localhost/",
@@ -197,6 +214,9 @@ console.log("\nstatus bar workspace");
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   globalThis.window = dom.window as unknown as Window & typeof globalThis;
   globalThis.document = dom.window.document;
+  // Node's built-in navigator reflects the machine's ICU locale; pin jsdom's
+  // en-US one so English-string assertions hold on zh-locale machines.
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: dom.window.navigator });
   globalThis.Node = dom.window.Node;
   globalThis.HTMLElement = dom.window.HTMLElement;
   globalThis.HTMLButtonElement = dom.window.HTMLButtonElement;
@@ -294,26 +314,17 @@ console.log("\nstatus bar workspace");
         <StatusBar
           context={{ used: 0, window: 0, sessionTokens: 0 }}
           running={false}
-          workbenchTarget={{ kind: "ssh", hostId: "remote-1" }}
-          jobs={[{ id: "remote-job", kind: "bash", label: "remote build", status: "running", startedAt: 1 }]}
-          backgroundRuntimes={[
-            {
-              tabId: "local-1", title: "Local delivery", detached: true,
-              running: false, pendingPrompt: false,
-              jobs: [{ id: "local-job", kind: "go", label: "local test", status: "running", startedAt: 1 }],
-            },
-          ]}
+          jobs={[{ id: "local-job", kind: "go", label: "local test", status: "running", startedAt: 1 }]}
         />
       </LocaleProvider>,
     );
   });
   const mixedJobsButton = rootEl.querySelector<HTMLButtonElement>(".statusbar__jobs-trigger");
-  ok(mixedJobsButton?.textContent?.includes("2") === true, "local and active Remote Workbench jobs share the total count");
+  ok(mixedJobsButton?.textContent?.includes("1") === true, "local jobs show in the status bar total");
   if (mixedJobsButton?.getAttribute("aria-expanded") !== "true") {
     await act(async () => { mixedJobsButton?.click(); });
   }
-  ok(document.body.textContent?.includes("local test") === true, "local background jobs remain visible in Remote Workbench");
-  ok(document.body.textContent?.includes("remote build") === true, "active Remote Workbench jobs remain visible beside local jobs");
+  ok(document.body.textContent?.includes("local test") === true, "local background jobs remain visible");
   await act(async () => { root.unmount(); });
   dom.window.close();
 }

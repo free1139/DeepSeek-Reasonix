@@ -21,6 +21,12 @@ const MaxRetries = 10
 
 const maxBackoff = 15 * time.Second
 
+// maxRetryAfter bounds a server-supplied Retry-After. Rate-limit windows are
+// routinely longer than our own backoff cap, and clamping to it just spends
+// attempts re-hitting the same closed window; the sleep is cancellable, so a
+// longer honest wait costs nothing the user can't interrupt.
+const maxRetryAfter = 60 * time.Second
+
 // errorBodyReadTimeout bounds how long draining a non-OK response body may
 // block. Proxies and gateways under load (502/524 storms) can send headers and
 // then stall the body on a half-open connection; http.Client has no Timeout
@@ -214,15 +220,12 @@ func IsConnReset(err error) bool {
 
 func backoffDelay(attempt int, retryAfter time.Duration) time.Duration {
 	if retryAfter > 0 {
-		if retryAfter > maxBackoff {
-			return maxBackoff
+		if retryAfter > maxRetryAfter {
+			return maxRetryAfter
 		}
 		return retryAfter
 	}
-	d := time.Duration(1<<(attempt-1)) * 500 * time.Millisecond
-	if d > maxBackoff {
-		d = maxBackoff
-	}
+	d := min(time.Duration(1<<(attempt-1))*500*time.Millisecond, maxBackoff)
 	return d + time.Duration(rand.Intn(250))*time.Millisecond
 }
 
@@ -233,6 +236,13 @@ func parseRetryAfter(resp *http.Response) time.Duration {
 	}
 	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
 		return time.Duration(secs) * time.Second
+	}
+	// RFC 9110 also allows an HTTP-date; gateways in front of rate-limited
+	// backends use it more often than the delta-seconds form.
+	if when, err := http.ParseTime(v); err == nil {
+		if d := time.Until(when); d > 0 {
+			return d
+		}
 	}
 	return 0
 }
