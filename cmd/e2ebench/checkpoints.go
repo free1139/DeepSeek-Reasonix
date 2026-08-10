@@ -29,6 +29,8 @@ type snapshotter struct {
 	start    time.Time
 	stop     chan struct{}
 	done     chan struct{}
+	poll     <-chan time.Time
+	pollAck  chan<- struct{}
 	taken    []checkpoint
 	lastSig  uint64
 }
@@ -36,7 +38,14 @@ type snapshotter struct {
 const snapshotPollInterval = 300 * time.Millisecond
 
 func startSnapshotter(src, dst string, start time.Time) *snapshotter {
-	s := &snapshotter{src: src, dst: dst, start: start, stop: make(chan struct{}), done: make(chan struct{})}
+	return startSnapshotterWithPoll(src, dst, start, nil, nil)
+}
+
+// startSnapshotterWithPoll injects a deterministic poll stream for tests. The
+// production path uses snapshotPollInterval; tests can acknowledge each poll
+// after the snapshotter has finished processing it without sleeping.
+func startSnapshotterWithPoll(src, dst string, start time.Time, poll <-chan time.Time, pollAck chan<- struct{}) *snapshotter {
+	s := &snapshotter{src: src, dst: dst, start: start, stop: make(chan struct{}), done: make(chan struct{}), poll: poll, pollAck: pollAck}
 	s.lastSig = dirSignature(src)
 	go s.run()
 	return s
@@ -44,14 +53,22 @@ func startSnapshotter(src, dst string, start time.Time) *snapshotter {
 
 func (s *snapshotter) run() {
 	defer close(s.done)
-	ticker := time.NewTicker(snapshotPollInterval)
-	defer ticker.Stop()
+	poll := s.poll
+	var ticker *time.Ticker
+	if poll == nil {
+		ticker = time.NewTicker(snapshotPollInterval)
+		poll = ticker.C
+		defer ticker.Stop()
+	}
 	for {
 		select {
 		case <-s.stop:
 			return
-		case <-ticker.C:
+		case <-poll:
 			s.snapshotIfChanged()
+			if s.pollAck != nil {
+				s.pollAck <- struct{}{}
+			}
 		}
 	}
 }
@@ -67,7 +84,7 @@ func (s *snapshotter) snapshotIfChanged() {
 	if err := copyDir(s.src, dir); err != nil {
 		return
 	}
-	os.Remove(filepath.Join(dir, ".run-metrics.json"))
+	dropHarnessArtifacts(dir)
 	s.taken = append(s.taken, checkpoint{Seq: len(s.taken) + 1, ElapsedMs: elapsed, dir: dir})
 }
 
@@ -96,7 +113,7 @@ func dirSignature(root string) uint64 {
 			}
 			return nil
 		}
-		if name == ".run-metrics.json" {
+		if isHarnessArtifact(name) {
 			return nil
 		}
 		info, err := d.Info()
@@ -335,7 +352,7 @@ func firstUsefulMutation(checkpoints []checkpoint, seedDir, finalDir string) int
 // solutionFiles maps relative path → final content for every file the run
 // created or changed; harness artifacts are not part of anyone's solution.
 func solutionFiles(seedDir, finalDir string) map[string]string {
-	skip := map[string]bool{".run-metrics.json": true, "verify.sh": true}
+	skip := map[string]bool{"verify.sh": true}
 	out := map[string]string{}
 	_ = filepath.WalkDir(finalDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -348,7 +365,7 @@ func solutionFiles(seedDir, finalDir string) map[string]string {
 			return nil
 		}
 		rel, _ := filepath.Rel(finalDir, path)
-		if skip[filepath.Base(rel)] {
+		if base := filepath.Base(rel); skip[base] || isHarnessArtifact(base) {
 			return nil
 		}
 		final, err := os.ReadFile(path)
@@ -363,4 +380,39 @@ func solutionFiles(seedDir, finalDir string) map[string]string {
 		return nil
 	})
 	return out
+}
+
+// attachSnapshotter starts per-change workdir snapshots when checkpoint grading
+// is on. It always returns a usable cleanup so the caller needs no branch; a
+// temp-dir failure degrades to no snapshots rather than failing the run.
+func attachSnapshotter(cfg suiteConfig, t task, work string, startedAt time.Time) (*snapshotter, func()) {
+	if !cfg.checkpoints {
+		return nil, func() {}
+	}
+	dir, err := os.MkdirTemp("", "e2ebench-cp-"+t.ID+"-")
+	if err != nil {
+		return nil, func() {}
+	}
+	return startSnapshotter(work, dir, startedAt), func() { _ = os.RemoveAll(dir) }
+}
+
+// isHarnessArtifact reports whether a work-dir entry belongs to the benchmark
+// rather than to anyone's solution. Segmented runs write one metrics file per
+// leg, so the name is a prefix match — a hard-coded ".run-metrics.json" would
+// let every later leg's file read as a change the agent made.
+func isHarnessArtifact(name string) bool {
+	return strings.HasPrefix(name, ".run-metrics") && strings.HasSuffix(name, ".json")
+}
+
+// dropHarnessArtifacts removes them from a snapshot copy.
+func dropHarnessArtifacts(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() && isHarnessArtifact(e.Name()) {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
