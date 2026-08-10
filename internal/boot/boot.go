@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -56,6 +57,7 @@ import (
 	"reasonix/internal/recovery"
 	"reasonix/internal/sandbox"
 	"reasonix/internal/secrets"
+	"reasonix/internal/sessiontemp"
 	"reasonix/internal/skill"
 	"reasonix/internal/stats"
 	"reasonix/internal/tool"
@@ -189,6 +191,12 @@ type Options struct {
 	SandboxNetworkOverride *bool
 	SandboxBashOverride    string
 	WorkspaceOnly          bool
+	// SessionTemp is the logical-session private temporary directory manager.
+	// Rebuild passes the previous Controller's Manager so hot rebuilds keep
+	// temporary files. Empty creates a fresh Manager inside control.New.
+	// Frontends that build a replacement Controller without Rebuild must pass
+	// the same Manager for the same logical session.
+	SessionTemp *sessiontemp.Manager
 }
 
 func recoveryHeadlessMode(opts Options) bool {
@@ -249,11 +257,11 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		sink = stats.NewRecorder(sink, config.StatsDir(), source)
 	}
 	// Goal token-budget accounting: the controller detects this tee and
-	// attributes billable usage events to the active goal turn's recorder, so
-	// executor/planner/subagent/compaction/classifier/router/reviewer/evaluator
-	// calls under one Goal scope count against its token budget. The tee must
-	// sit on the shared sink the agents emit into.
-	sink = control.NewGoalUsageTee(sink)
+	// attributes billable usage to the active goal turn's recorder. Both the
+	// tee and the delta coalescer must ride the shared sink agents emit into
+	// directly — wrapping only the controller's reference would leave the
+	// executor's per-chunk Text/Reasoning stream uncoalesced.
+	sink = control.NewGoalUsageTee(event.Coalesce(sink, event.DefaultStreamDeltaWindow))
 
 	// Extension preflight (stages 5b/7): start the installed, enabled v1 runtime
 	// packages ONCE, here, before model resolution, so plugin-namespaced refs
@@ -538,8 +546,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			sysPrompt = outputstyle.Apply(sysPrompt, st)
 		}
 	}
-	sysPrompt += "\n\n" + config.UserDecisionPolicy
-	sysPrompt += "\n\n" + config.LanguagePolicy
+	sysPrompt = appendCorePolicies(sysPrompt)
 	if workspaceLine := currentWorkspacePromptLine(root); workspaceLine != "" {
 		sysPrompt += "\n\n" + workspaceLine
 	}
@@ -571,6 +578,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			sysPrompt += "\n\n" + envSection
 		}
 	}
+	sysPrompt = appendOfflineEnvironmentNote(sysPrompt, cfg.Environment.Offline)
 
 	// Persistent memory (REASONIX.md / AGENTS.md hierarchy + auto-memory index)
 	// folds into the system prompt exactly here, once: it becomes part of the
@@ -653,11 +661,18 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		enabledBuiltins = tokenEconomyBuiltins(enabledBuiltins)
 	}
 	readPathResolver := builtin.NewPathResolver()
+	// Session-private temporary directory manager for Bash/grep. Rebuild
+	// reuses the previous Controller's Manager; a fresh build creates one
+	// here so tools and the Controller share the same instance from boot.
+	sessionTemp := opts.SessionTemp
+	if sessionTemp == nil {
+		sessionTemp = sessiontemp.New()
+	}
 	// An explicit Economy allowlist can contain only on-demand tools, leaving no
 	// startup built-ins. Do not pass that filtered empty slice to addBuiltins,
 	// where an empty list intentionally means "all built-ins".
 	if !tokenEconomy || len(cfg.Tools.Enabled) == 0 || len(enabledBuiltins) > 0 {
-		addBuiltins(reg, enabledBuiltins, writeRoots, bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, forbidReadRoots, readPathResolver, sessionGuard, managedConfig, opts.FileOverlay, opts.TerminalRunner)
+		addBuiltins(reg, enabledBuiltins, writeRoots, bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, forbidReadRoots, readPathResolver, sessionGuard, managedConfig, opts.FileOverlay, opts.TerminalRunner, sessionTemp)
 	}
 	// Use the caller-supplied shared host when set, so controllers for the same
 	// workspace root reuse running MCP processes (e.g. one CodeGraph daemon
@@ -884,10 +899,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		cleanup = func() { prev(); lspMgr.Close() }
 	}
 
-	maxSteps := 0
-	if opts.MaxSteps > 0 {
-		maxSteps = opts.MaxSteps
-	}
+	maxSteps := max(opts.MaxSteps, 0)
 	subagentStore, err := newSubagentStore(sessionDir, opts.SubagentParentLive)
 	if err != nil {
 		return nil, err
@@ -1395,7 +1407,6 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		var slashEntries []command.SlashEntry
 		if includeSkills {
 			for _, sk := range skillStore.SlashList() {
-				sk := sk
 				slashEntries = append(slashEntries, command.SlashEntry{
 					Name:        sk.SlashName(),
 					Description: sk.Description,
@@ -1407,7 +1418,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 			if cmd.Hidden {
 				continue
 			}
-			cmd := cmd
+
 			slashEntries = append(slashEntries, command.SlashEntry{
 				Name:        cmd.Name,
 				Description: cmd.Description,
@@ -1540,6 +1551,7 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 				ManagedConfig:   managedConfig,
 				FileOverlay:     opts.FileOverlay,
 				Terminal:        opts.TerminalRunner,
+				SessionTemp:     sessionTemp,
 			}.Tools(missing...))
 			return "enabled " + strings.Join(installed, ", ") + "."
 		}
@@ -1911,6 +1923,9 @@ func build(ctx context.Context, opts Options) (*BuildResult, error) {
 		// The merged catalog (nil without provider-declaring sidecars) lets
 		// frontends enumerate plugin/... models through ProviderCatalog.
 		ProviderResolver: extensionResolver,
+		// Share the Manager already bound into bash/grep so tools and the
+		// Controller observe the same temporary generation across rebuilds.
+		SessionTemp: sessionTemp,
 	}
 	// Guardian: when guardian_model is configured, spawn an LLM safety reviewer
 	// that can auto-allow safe Ask decisions and annotate risky ones before
@@ -2333,13 +2348,7 @@ func SubagentModelKeys(name string) []string {
 		if alias == "" {
 			continue
 		}
-		seen := false
-		for _, key := range keys {
-			if key == alias {
-				seen = true
-				break
-			}
-		}
+		seen := slices.Contains(keys, alias)
 		if !seen {
 			keys = append(keys, alias)
 		}
@@ -2616,12 +2625,12 @@ func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (p
 // and makes bash warn when a command references them. managedConfig names the
 // Reasonix-owned config files writable outside writeRoots after a fresh
 // per-write human approval.
-func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, bashTimeout time.Duration, searchSpec builtin.SearchSpec, stderr io.Writer, workDir string, proxySpec netclient.ProxySpec, forbidReadRoots []string, readPathResolver *builtin.PathResolver, sessionGuard builtin.SessionDataGuard, managedConfig builtin.ManagedConfigPaths, overlay builtin.FileOverlay, terminal builtin.TerminalRunner) {
+func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, bashTimeout time.Duration, searchSpec builtin.SearchSpec, stderr io.Writer, workDir string, proxySpec netclient.ProxySpec, forbidReadRoots []string, readPathResolver *builtin.PathResolver, sessionGuard builtin.SessionDataGuard, managedConfig builtin.ManagedConfigPaths, overlay builtin.FileOverlay, terminal builtin.TerminalRunner, sessionTemp *sessiontemp.Manager) {
 	// If a workspace directory is set, use workspace-bound tools that resolve
 	// paths relative to that directory. Otherwise fall back to the process-cwd
 	// compile-time builtins.
 	if workDir != "" {
-		ws := builtin.Workspace{Dir: workDir, WriteRoots: writeRoots, ForbidReadRoots: forbidReadRoots, Bash: bashSpec, BashTimeout: bashTimeout, Search: searchSpec, ProxySpec: proxySpec, ReadPaths: readPathResolver, SessionGuard: sessionGuard, ManagedConfig: managedConfig, FileOverlay: overlay, Terminal: terminal}
+		ws := builtin.Workspace{Dir: workDir, WriteRoots: writeRoots, ForbidReadRoots: forbidReadRoots, Bash: bashSpec, BashTimeout: bashTimeout, Search: searchSpec, ProxySpec: proxySpec, ReadPaths: readPathResolver, SessionGuard: sessionGuard, ManagedConfig: managedConfig, FileOverlay: overlay, Terminal: terminal, SessionTemp: sessionTemp}
 		for _, t := range ws.Tools(enabled...) {
 			reg.Add(t)
 		}
@@ -2645,9 +2654,17 @@ func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sand
 	// preserved on replace): file-writers bound to the workspace, read tools
 	// bound to forbid-read roots, bash to the OS sandbox, web_fetch to the proxy.
 	// Only replace tools actually enabled/present.
+	bashTool := builtin.ConfineBash(bashSpec, sessionGuard, bashTimeout)
+	if rebound, ok := builtin.BindSessionTemp(bashTool, sessionTemp); ok {
+		bashTool = rebound
+	}
+	searchTool := builtin.ConfineSearch(searchSpec, bashSpec, forbidReadRoots)
+	if rebound, ok := builtin.BindSessionTemp(searchTool, sessionTemp); ok {
+		searchTool = rebound
+	}
 	confined := append(builtin.ConfineWriters(writeRoots, sessionGuard, managedConfig),
-		builtin.ConfineBash(bashSpec, sessionGuard, bashTimeout),
-		builtin.ConfineSearch(searchSpec, bashSpec, forbidReadRoots),
+		bashTool,
+		searchTool,
 		builtin.ConfineWebFetch(proxySpec))
 	confined = append(confined, builtin.ConfineReaders(forbidReadRoots)...)
 	for _, t := range confined {
