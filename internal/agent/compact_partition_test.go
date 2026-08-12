@@ -8,17 +8,22 @@ import (
 	"reasonix/internal/provider"
 )
 
-// bigTurn is comfortably over maxPinnedFirstUserTokens, so it is never pinnable.
-func bigTurn() string { return strings.Repeat("paste ", 4000) }
-
 // partitionCoversRegion is the invariant that makes a lost user turn impossible:
 // every provider-visible message in the region lands in exactly one group.
-func partitionCoversRegion(t *testing.T, a *Agent, region []provider.Message) (early, kept, fold []provider.Message) {
+func partitionCoversRegion(t *testing.T, a *Agent, region []provider.Message) (kept, fold []provider.Message) {
 	t.Helper()
-	early, carried, kept, fold := a.partitionFoldForProjection(region)
-	kept = append(carried, kept...)
+	kept, fold, retention := a.partitionFoldForProjection(region)
+	userTurns := 0
+	for _, m := range region {
+		if m.Role == provider.RoleUser && !m.LocalOnly && !isCompactionSummary(m) {
+			userTurns++
+		}
+	}
+	if got := retention.Kept + retention.Dropped; got != userTurns {
+		t.Errorf("retention accounts for %d user turns, region has %d", got, userTurns)
+	}
 	seen := map[string]int{}
-	for _, group := range [][]provider.Message{early, kept, fold} {
+	for _, group := range [][]provider.Message{kept, fold} {
 		for _, m := range group {
 			seen[m.Content]++
 		}
@@ -38,119 +43,119 @@ func partitionCoversRegion(t *testing.T, a *Agent, region []provider.Message) (e
 			t.Errorf("message %q is in %d groups — it would be duplicated", m.Content, seen[m.Content])
 		}
 	}
-	return early, kept, fold
+	return kept, fold
 }
 
-func TestPartitionHoistsFirstSmallUserTurnsInOrder(t *testing.T) {
-	// The hoist window is position-fixed (the first N), never "the most recent
-	// N": a window that moved with each fold would rewrite the projection prefix
-	// and crater the server-side cache.
-	a := &Agent{}
-	var region []provider.Message
-	for i := range 25 {
-		region = append(region, provider.Message{Role: provider.RoleUser, Content: fmt.Sprintf("small turn %d", i)})
-	}
-	early, kept, fold := partitionCoversRegion(t, a, region)
-	if len(early) != maxEarlyUserTurns || len(kept) != 0 || len(fold) != 25-maxEarlyUserTurns {
-		t.Fatalf("early=%d kept=%d fold=%d, want %d/0/%d", len(early), len(kept), len(fold), maxEarlyUserTurns, 25-maxEarlyUserTurns)
-	}
-	for i, m := range early {
-		if want := fmt.Sprintf("small turn %d", i); UserMessageText(m) != want {
-			t.Fatalf("early[%d]=%q, want %q — the hoist window must be the leading turns", i, UserMessageText(m), want)
-		}
-	}
-	for i, m := range fold {
-		if want := fmt.Sprintf("small turn %d", maxEarlyUserTurns+i); UserMessageText(m) != want {
-			t.Fatalf("fold[%d]=%q, want %q", i, UserMessageText(m), want)
-		}
-	}
-}
-
-func TestPartitionFoldsLargeUserTurns(t *testing.T) {
+func TestPartitionKeepsSmallUserTurnsVerbatim(t *testing.T) {
+	// A constraint stated mid-session cannot be re-derived once a digest drops
+	// it, so small user turns never reach the summarizer's judgement.
 	a := &Agent{}
 	region := []provider.Message{
-		{Role: provider.RoleUser, Content: bigTurn()},
-		{Role: provider.RoleUser, Content: "small"},
+		{Role: provider.RoleUser, Content: "small turn 0"},
+		{Role: provider.RoleUser, Content: "small turn 1"},
+		{Role: provider.RoleUser, Content: "small turn 2"},
+		{Role: provider.RoleAssistant, Content: "work"},
 	}
-	early, _, fold := partitionCoversRegion(t, a, region)
-	if len(early) != 1 || UserMessageText(early[0]) != "small" {
-		t.Fatalf("early=%+v, want only the small turn hoisted", early)
+	kept, fold := partitionCoversRegion(t, a, region)
+	if len(kept) != 3 || len(fold) != 1 {
+		t.Fatalf("kept=%d fold=%d, want 3/1", len(kept), len(fold))
 	}
-	if len(fold) != 1 {
-		t.Fatalf("fold=%d, want the large turn folded", len(fold))
+	if got := renderTranscript(fold); strings.Contains(got, "small turn") {
+		t.Fatalf("no user turn should reach the summarizer: %s", got)
 	}
 }
 
-// A user turn that is not hoisted must still reach the summarizer. Two rules
-// that disagreed on which turns count as "early" used to drop the turns after an
-// oversized one from both groups, deleting stated constraints outright.
-func TestPartitionKeepsSmallTurnsAfterALargeOne(t *testing.T) {
+func TestPartitionFoldsUserTurnsPastBudget(t *testing.T) {
+	// Unbounded hoisting is what padded an earlier revision's candidates past
+	// the acceptance ceiling, so oversize and over-budget turns still fold.
+	a := &Agent{}
+	oversize := provider.Message{
+		Role:    provider.RoleUser,
+		Content: strings.Repeat("y", maxKeptUserTurnTokens*8),
+	}
+	region := []provider.Message{
+		{Role: provider.RoleUser, Content: "small and kept"},
+		oversize,
+	}
+	kept, fold := partitionCoversRegion(t, a, region)
+	if len(kept) != 1 || len(fold) != 1 {
+		t.Fatalf("kept=%d fold=%d, want the oversize turn folded", len(kept), len(fold))
+	}
+	if !strings.Contains(renderTranscript(kept), "small and kept") {
+		t.Fatal("the small turn should survive alongside a folded oversize one")
+	}
+}
+
+func TestPartitionUserTurnBudgetIsBoundedInTotal(t *testing.T) {
+	a := &Agent{}
+	// Each turn is a quarter of the per-turn ceiling, so the total budget —
+	// not the per-turn one — is what must stop retention.
+	each := strings.Repeat("z", maxKeptUserTurnTokens)
+	region := make([]provider.Message, 0, 32)
+	for i := range 32 {
+		// Distinct content: partitionCoversRegion keys its coverage check on it.
+		region = append(region, provider.Message{Role: provider.RoleUser, Content: fmt.Sprintf("%02d%s", i, each)})
+	}
+	kept, fold := partitionCoversRegion(t, a, region)
+	if len(fold) == 0 {
+		t.Fatal("total budget never engaged: every turn was kept")
+	}
+	budget := keptUserTurnsBudgetTokens
+	spent := 0
+	for _, m := range kept {
+		spent += fixedTokenEstimate(m)
+	}
+	if spent > budget {
+		t.Fatalf("kept %d tokens of user turns, over the %d budget", spent, budget)
+	}
+}
+
+func TestPartitionKeepsUserTurnsAcrossPriorDigest(t *testing.T) {
+	// The keep policy is scoped to messages after the latest digest so it cannot
+	// grow forever; user turns are bounded by budget instead, so a turn from
+	// before the digest must still survive the next fold.
 	a := &Agent{}
 	region := []provider.Message{
-		{Role: provider.RoleUser, Content: "constraint A"},
-		{Role: provider.RoleUser, Content: bigTurn()},
-		{Role: provider.RoleUser, Content: "never touch the db schema"},
-		{Role: provider.RoleUser, Content: "constraint C"},
+		{Role: provider.RoleUser, Content: "constraint from before the digest"},
+		{Role: provider.RoleUser, Content: summaryTagOpen + "\nprior digest\n" + summaryTagClose},
 		{Role: provider.RoleAssistant, Content: "work"},
 	}
-	early, _, fold := partitionCoversRegion(t, a, region)
-	if len(early) != 3 {
-		t.Fatalf("early=%d (%+v), want the three small turns hoisted across the oversized one", len(early), early)
+	kept, fold := partitionCoversRegion(t, a, region)
+	if len(kept) != 1 || !strings.Contains(renderTranscript(kept), "constraint from before") {
+		t.Fatalf("pre-digest user turn must survive; kept=%v", renderTranscript(kept))
 	}
-	if got := renderTranscript(fold); !strings.Contains(got, "paste") {
-		t.Fatalf("the oversized turn must still reach the summarizer:\n%s", got)
-	}
-}
-
-// The hoist set is drawn from the fold region only. Reading past it would hoist
-// a turn that also rides in the verbatim tail, sending it to the model twice.
-func TestPartitionHoistIsDisjointFromTail(t *testing.T) {
-	a := &Agent{}
-	msgs := []provider.Message{
-		{Role: provider.RoleSystem, Content: "sys"},
-		{Role: provider.RoleUser, Content: "task"},
-		{Role: provider.RoleUser, Content: "constraint A"},
-		{Role: provider.RoleAssistant, Content: "work"},
-		{Role: provider.RoleUser, Content: "tail turn one"},
-		{Role: provider.RoleAssistant, Content: "more"},
-		{Role: provider.RoleUser, Content: "tail turn two"},
-	}
-	head := a.pinnedPrefixLen(msgs)
-	const start = 4
-	early, _, _ := partitionCoversRegion(t, a, msgs[head:start])
-	for _, m := range early {
-		for _, tail := range msgs[start:] {
-			if m.Content == tail.Content {
-				t.Fatalf("hoisted turn %q also rides in the verbatim tail", m.Content)
-			}
-		}
+	if !strings.Contains(renderTranscript(fold), "prior digest") {
+		t.Fatal("the digest itself must still fold into the next one")
 	}
 }
 
 func TestPartitionFoldsPriorDigests(t *testing.T) {
-	// Any digest in the transcript is merged into the next one, so the model
-	// never sees a chain of them.
+	// Any digest in the region is merged into the next one, so the model
+	// never sees a chain of digests.
 	a := &Agent{}
 	region := []provider.Message{
 		{Role: provider.RoleUser, Content: summaryTagOpen + "\nolder digest\n" + summaryTagClose},
 		{Role: provider.RoleUser, Content: summaryTagOpen + "\nnewer digest\n" + summaryTagClose},
 		{Role: provider.RoleAssistant, Content: "work"},
 	}
-	early, kept, fold := partitionCoversRegion(t, a, region)
-	if len(early) != 0 || len(kept) != 0 || len(fold) != 3 {
-		t.Fatalf("early=%d kept=%d fold=%d, want every digest folded", len(early), len(kept), len(fold))
+	kept, fold := partitionCoversRegion(t, a, region)
+	if len(kept) != 0 || len(fold) != 3 {
+		t.Fatalf("kept=%d fold=%d, want every digest folded", len(kept), len(fold))
 	}
 }
 
 func TestPartitionKeepPolicyOutranksFold(t *testing.T) {
 	a := &Agent{keepPolicy: KeepErrors}
 	region := []provider.Message{
-		{Role: provider.RoleUser, Content: "small"},
+		{Role: provider.RoleAssistant, Content: "unrelated prose"},
 		{Role: provider.RoleAssistant, Content: "call", ToolCalls: []provider.ToolCall{{ID: "t1", Name: "bash"}}},
 		{Role: provider.RoleTool, ToolCallID: "t1", Name: "bash", Content: "error: boom"},
 	}
-	early, kept, fold := partitionCoversRegion(t, a, region)
-	if len(early) != 1 || len(kept) != 2 || len(fold) != 0 {
-		t.Fatalf("early=%d kept=%d fold=%d, want the error result and its caller kept", len(early), len(kept), len(fold))
+	kept, fold := partitionCoversRegion(t, a, region)
+	if len(kept) != 2 || len(fold) != 1 {
+		t.Fatalf("kept=%d fold=%d, want the error tool-call group kept and the prose folded", len(kept), len(fold))
+	}
+	if got := renderTranscript(kept); !strings.Contains(got, "error: boom") || !strings.Contains(got, "call") {
+		t.Fatalf("the failing call and its result must be kept together: %s", got)
 	}
 }

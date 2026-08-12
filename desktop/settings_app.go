@@ -46,6 +46,7 @@ type ProviderView struct {
 	Kind                        string                      `json:"kind"`
 	BaseURL                     string                      `json:"baseUrl"`
 	ChatURL                     string                      `json:"chatUrl"`
+	RequestURL                  string                      `json:"requestUrl"`
 	Models                      []string                    `json:"models"`
 	VisionModels                []string                    `json:"visionModels"`
 	VisionModelsSet             bool                        `json:"visionModelsConfigured"`
@@ -162,7 +163,6 @@ type AgentView struct {
 	MaxSubagentConcurrency int     `json:"maxSubagentConcurrency"`
 	MaxParallelWriters     int     `json:"maxParallelWriters"`
 	SystemPrompt           string  `json:"systemPrompt"`
-	ColdResumePrune        bool    `json:"coldResumePrune"`
 	ReasoningLanguage      string  `json:"reasoningLanguage"`
 	CompactRatio           float64 `json:"compactRatio,omitempty"`
 	EffectiveCompactRatio  float64 `json:"effectiveCompactRatio,omitempty"`
@@ -281,30 +281,32 @@ type BotSettingsView struct {
 
 // SettingsView is the whole Settings panel payload.
 type SettingsView struct {
-	DefaultModel            string               `json:"defaultModel"`
-	PlannerModel            string               `json:"plannerModel"`
-	SubagentModel           string               `json:"subagentModel"`
-	SubagentEffort          string               `json:"subagentEffort"`
-	AutoPlan                string               `json:"autoPlan"`
-	Providers               []ProviderView       `json:"providers"`
-	OfficialProviders       []ProviderView       `json:"officialProviders"`
-	ProviderPresets         []ProviderPresetView `json:"providerPresets"`
-	Permissions             PermissionsView      `json:"permissions"`
-	Sandbox                 SandboxView          `json:"sandbox"`
-	Network                 NetworkView          `json:"network"`
-	Agent                   AgentView            `json:"agent"`
-	Bot                     BotSettingsView      `json:"bot"`
-	DesktopLanguage         string               `json:"desktopLanguage"`
-	DesktopCurrency         string               `json:"desktopCurrency"`
-	DesktopLayoutStyle      string               `json:"desktopLayoutStyle"`
-	DesktopTheme            string               `json:"desktopTheme"`
-	DesktopThemeStyle       string               `json:"desktopThemeStyle"`
-	DesktopTerminalTheme    string               `json:"desktopTerminalTheme,omitempty"`
-	CloseBehavior           string               `json:"closeBehavior"`
-	DisplayMode             string               `json:"displayMode"`
-	StatusBarStyle          string               `json:"statusBarStyle"`
-	StatusBarItems          []string             `json:"statusBarItems"`
-	DefaultToolApprovalMode string               `json:"defaultToolApprovalMode"`
+	DefaultModel                 string               `json:"defaultModel"`
+	PlannerModel                 string               `json:"plannerModel"`
+	SubagentModel                string               `json:"subagentModel"`
+	SubagentEffort               string               `json:"subagentEffort"`
+	AutoPlan                     string               `json:"autoPlan"`
+	Providers                    []ProviderView       `json:"providers"`
+	OfficialProviders            []ProviderView       `json:"officialProviders"`
+	ProviderPresets              []ProviderPresetView `json:"providerPresets"`
+	Permissions                  PermissionsView      `json:"permissions"`
+	Sandbox                      SandboxView          `json:"sandbox"`
+	Network                      NetworkView          `json:"network"`
+	Agent                        AgentView            `json:"agent"`
+	Bot                          BotSettingsView      `json:"bot"`
+	DesktopLanguage              string               `json:"desktopLanguage"`
+	DesktopCurrency              string               `json:"desktopCurrency"`
+	DesktopLayoutStyle           string               `json:"desktopLayoutStyle"`
+	DesktopTheme                 string               `json:"desktopTheme"`
+	DesktopThemeStyle            string               `json:"desktopThemeStyle"`
+	DesktopTerminalTheme         string               `json:"desktopTerminalTheme,omitempty"`
+	CloseBehavior                string               `json:"closeBehavior"`
+	DisplayMode                  string               `json:"displayMode"`
+	ReasoningDisplayMode         string               `json:"reasoningDisplayMode"`
+	ReasoningDisplayModeExplicit bool                 `json:"reasoningDisplayModeExplicit"`
+	StatusBarStyle               string               `json:"statusBarStyle"`
+	StatusBarItems               []string             `json:"statusBarItems"`
+	DefaultToolApprovalMode      string               `json:"defaultToolApprovalMode"`
 
 	CheckUpdates      bool   `json:"checkUpdates"`
 	UpdateChannel     string `json:"updateChannel"`
@@ -333,22 +335,24 @@ type SettingsView struct {
 // frontend startup. It deliberately excludes providers and credential state so
 // slow keychain/env resolution stays off the first-render path.
 type DesktopStartupSettingsView struct {
-	Bot                  BotSettingsView `json:"bot"`
-	DesktopLanguage      string          `json:"desktopLanguage"`
-	DesktopLayoutStyle   string          `json:"desktopLayoutStyle"`
-	DesktopTheme         string          `json:"desktopTheme"`
-	DesktopThemeStyle    string          `json:"desktopThemeStyle"`
-	DesktopTerminalTheme string          `json:"desktopTerminalTheme,omitempty"`
-	DisplayMode          string          `json:"displayMode"`
-	StatusBarStyle       string          `json:"statusBarStyle"`
-	StatusBarItems       []string        `json:"statusBarItems"`
-	CheckUpdates         bool            `json:"checkUpdates"`
-	UpdateChannel        string          `json:"updateChannel"`
-	ConversationWidth    string          `json:"conversationWidth,omitempty"`
-	// ConfigWarnings are non-blocking notices when user/project config was
-	// recovered in memory (last-known-good or defaults) without rewriting files.
-	ConfigWarnings []string `json:"configWarnings,omitempty"`
-	ConfigPath     string   `json:"configPath,omitempty"`
+	Bot                          BotSettingsView `json:"bot"`
+	DesktopLanguage              string          `json:"desktopLanguage"`
+	DesktopLayoutStyle           string          `json:"desktopLayoutStyle"`
+	DesktopTheme                 string          `json:"desktopTheme"`
+	DesktopThemeStyle            string          `json:"desktopThemeStyle"`
+	DesktopTerminalTheme         string          `json:"desktopTerminalTheme,omitempty"`
+	DisplayMode                  string          `json:"displayMode"`
+	ReasoningDisplayMode         string          `json:"reasoningDisplayMode"`
+	ReasoningDisplayModeExplicit bool            `json:"reasoningDisplayModeExplicit"`
+	StatusBarStyle               string          `json:"statusBarStyle"`
+	StatusBarItems               []string        `json:"statusBarItems"`
+	CheckUpdates                 bool            `json:"checkUpdates"`
+	UpdateChannel                string          `json:"updateChannel"`
+	ConversationWidth            string          `json:"conversationWidth,omitempty"`
+	// ConfigWarnings report in-memory recovery without rewriting user/project files.
+	ConfigWarnings         []string `json:"configWarnings,omitempty"`
+	ConfigWarningsRevision uint64   `json:"configWarningsRevision"`
+	ConfigPath             string   `json:"configPath,omitempty"`
 }
 
 // shadowingConfigPath returns the config file that outranks writePath for the
@@ -636,7 +640,7 @@ func providerViewFromEntryForRootWithResolverAndCredentials(p config.ProviderEnt
 		visionCapability = "unsupported"
 	}
 	return ProviderView{
-		Name: p.Name, BuiltIn: builtIn, Added: added, Kind: p.Kind, BaseURL: p.BaseURL, ChatURL: p.ChatURL,
+		Name: p.Name, BuiltIn: builtIn, Added: added, Kind: p.Kind, BaseURL: p.BaseURL, ChatURL: p.ChatURL, RequestURL: p.RequestURL,
 		Models: nonNil(models), VisionModels: nonNil(providerVisionModels(models, visionModels)), VisionModelsSet: visionModelsSet, VisionCapability: visionCapability, ModelsURL: p.ModelsURL, Default: p.DefaultModel(),
 		APIKeyEnv:                   p.APIKeyEnv,
 		Headers:                     nonNilStringMap(p.Headers),
@@ -652,7 +656,7 @@ func providerViewFromEntryForRootWithResolverAndCredentials(p config.ProviderEnt
 		ReasoningProtocol:           p.ReasoningProtocol,
 		Thinking:                    providerThinkingForSettings(p.Thinking),
 		WebSearch:                   config.EffectiveWebSearch(&p),
-		ServerWebSearchCapability:   config.IsOfficialDeepSeekWebSearchEndpoint(&p),
+		ServerWebSearchCapability:   config.HasServerWebSearchCapability(&p),
 		SupportedEfforts:            nonNil(p.SupportedEfforts),
 		DefaultEffort:               p.DefaultEffort,
 		ModelOverrides:              providerModelOverridesForView(p.ModelOverrides, models),
@@ -837,6 +841,7 @@ func providerEntryCoreMatches(existing, preset config.ProviderEntry) bool {
 	return strings.EqualFold(strings.TrimSpace(existing.Kind), strings.TrimSpace(preset.Kind)) &&
 		normalizeProviderURL(existing.BaseURL) == normalizeProviderURL(preset.BaseURL) &&
 		strings.TrimSpace(existing.ChatURL) == strings.TrimSpace(preset.ChatURL) &&
+		strings.TrimSpace(existing.RequestURL) == strings.TrimSpace(preset.RequestURL) &&
 		strings.TrimSpace(existing.APIKeyEnv) == strings.TrimSpace(preset.APIKeyEnv) &&
 		existing.AuthHeader == preset.AuthHeader
 }
@@ -894,61 +899,27 @@ func officialProviderAddedSet(cfg *config.Config) map[string]bool {
 	return out
 }
 
-func desktopStartupSettingsFromConfig(cfg *config.Config) DesktopStartupSettingsView {
-	if cfg == nil {
-		return DesktopStartupSettingsView{
-			Bot:                  botSettingsView(config.BotConfig{}),
-			DesktopLayoutStyle:   "workbench",
-			DesktopTheme:         "auto",
-			DesktopThemeStyle:    "graphite",
-			DesktopTerminalTheme: "auto",
-			DisplayMode:          "standard",
-			StatusBarStyle:       "text",
-			StatusBarItems:       config.DefaultDesktopStatusBarItems(),
-			CheckUpdates:         true,
-			UpdateChannel:        "stable",
-			ConversationWidth:    "standard",
-		}
-	}
-	return DesktopStartupSettingsView{
-		Bot:                  botSettingsView(cfg.Bot),
-		DesktopLanguage:      cfg.DesktopLanguage(),
-		DesktopLayoutStyle:   cfg.DesktopLayoutStyle(),
-		DesktopTheme:         cfg.DesktopTheme(),
-		DesktopThemeStyle:    cfg.DesktopThemeStyle(),
-		DesktopTerminalTheme: cfg.DesktopTerminalTheme(),
-		DisplayMode:          cfg.DesktopDisplayMode(),
-		StatusBarStyle:       cfg.DesktopStatusBarStyle(),
-		StatusBarItems:       cfg.DesktopStatusBarItems(),
-		CheckUpdates:         cfg.DesktopCheckUpdates(),
-		UpdateChannel:        cfg.DesktopUpdateChannel(),
-		ConversationWidth:    cfg.DesktopConversationWidth(),
-		ConfigWarnings:       cfg.LoadWarnings(),
-		ConfigPath:           config.UserConfigPath(),
-	}
-}
-
-// DesktopStartupSettings returns only the desktop chrome preferences needed at
-// app startup. Keep provider/key status in Settings(), where the Settings panel
-// actually needs it.
-func (a *App) DesktopStartupSettings() DesktopStartupSettingsView {
+// DesktopStartupSettings returns startup chrome preferences without provider/key state.
+func (a *App) DesktopStartupSettings() (view DesktopStartupSettingsView) {
+	revision := a.nextConfigLoadWarningsRevision()
+	defer func() { view.ConfigWarningsRevision = revision }()
 	// Prefer the resilient workspace load so config warnings surface on first paint.
 	if cfg, err := config.LoadForRootReadOnly(a.activeWorkspaceRoot()); err == nil {
-		view := desktopStartupSettingsFromConfig(cfg)
+		view = desktopStartupSettingsFromConfig(cfg)
 		view.ConfigWarnings = cfg.LoadWarnings()
 		view.ConfigPath = config.UserConfigPath()
 		return view
 	}
 	cfg, path, err := a.loadDesktopUserConfigForView()
 	if err != nil {
-		view := desktopStartupSettingsFromConfig(nil)
+		view = desktopStartupSettingsFromConfig(nil)
 		view.ConfigWarnings = []string{
 			"user configuration could not be loaded; using built-in defaults. Run: reasonix doctor repair",
 		}
 		view.ConfigPath = config.UserConfigPath()
 		return view
 	}
-	view := desktopStartupSettingsFromConfig(cfg)
+	view = desktopStartupSettingsFromConfig(cfg)
 	view.ConfigPath = path
 	return view
 }
@@ -977,46 +948,7 @@ func (a *App) ReloadUserConfig() (DesktopStartupSettingsView, error) {
 func (a *App) Settings() SettingsView {
 	cfg, cfgPath, err := a.loadDesktopUserConfigForView()
 	if err != nil {
-		return SettingsView{
-			Providers:         []ProviderView{},
-			OfficialProviders: officialProviderViews(map[string]bool{}, ""),
-			ProviderPresets:   providerPresetViewsForRootWithResolver(nil, a.activeWorkspaceRoot(), nil),
-			ProviderKinds:     nonNil(provider.Kinds()),
-			Permissions: PermissionsView{
-				Mode:  "ask",
-				Allow: []string{},
-				Ask:   []string{},
-				Deny:  []string{},
-			},
-			Sandbox: SandboxView{Bash: config.Default().BashMode(), AllowWrite: []string{}, EffectiveWriteRoots: []string{}, Shell: "auto", EffectiveShell: sandboxEffectiveShellView(sandbox.ResolveShell("", "", nil))},
-			Agent: AgentView{
-				PlannerMaxSteps:        0,
-				MaxSubagentDepth:       agent.DefaultMaxSubagentDepth,
-				MaxSubagentConcurrency: agent.DefaultMaxSubagentConcurrency,
-				MaxParallelWriters:     agent.DefaultMaxParallelWriters,
-				ColdResumePrune:        true,
-				ReasoningLanguage:      "auto",
-				CompactRatio:           config.Default().Agent.CompactRatio,
-				EffectiveCompactRatio:  config.Default().Agent.CompactRatio,
-			},
-			Bot:                     botSettingsView(config.BotConfig{}),
-			AutoPlan:                "off",
-			DesktopLayoutStyle:      "workbench",
-			DesktopTheme:            "auto",
-			DesktopThemeStyle:       "graphite",
-			DesktopTerminalTheme:    "auto",
-			CloseBehavior:           "background",
-			DisplayMode:             "standard",
-			StatusBarStyle:          "text",
-			StatusBarItems:          config.DefaultDesktopStatusBarItems(),
-			DefaultToolApprovalMode: "auto",
-			CheckUpdates:            true,
-			UpdateChannel:           "stable",
-			Telemetry:               true,
-			Metrics:                 true,
-			ExpandThinking:          false,
-			ConversationWidth:       "standard",
-		}
+		return a.defaultSettingsView()
 	}
 	ctrl := a.activeCtrl()
 	bash := cfg.BashMode()
@@ -1072,34 +1004,35 @@ func (a *App) Settings() SettingsView {
 			MaxSubagentConcurrency: desktopSubagentConcurrency(cfg.Agent.MaxSubagentConcurrency),
 			MaxParallelWriters:     desktopParallelWriters(cfg.Agent.MaxParallelWriters, cfg.Agent.MaxSubagentConcurrency),
 			SystemPrompt:           cfg.Agent.SystemPrompt,
-			ColdResumePrune:        cfg.ColdResumePruneEnabled(),
 			ReasoningLanguage:      cfg.ReasoningLanguage(),
 			CompactRatio:           cfg.Agent.CompactRatio,
 			EffectiveCompactRatio:  cfg.Agent.CompactRatio,
 		},
-		Bot:                     botSettingsView(cfg.Bot),
-		DesktopLanguage:         cfg.DesktopLanguage(),
-		DesktopCurrency:         cfg.DesktopCurrency(),
-		DesktopLayoutStyle:      cfg.DesktopLayoutStyle(),
-		DesktopTheme:            cfg.DesktopTheme(),
-		DesktopThemeStyle:       cfg.DesktopThemeStyle(),
-		DesktopTerminalTheme:    cfg.DesktopTerminalTheme(),
-		CloseBehavior:           cfg.DesktopCloseBehavior(),
-		DisplayMode:             cfg.DesktopDisplayMode(),
-		StatusBarStyle:          cfg.DesktopStatusBarStyle(),
-		StatusBarItems:          cfg.DesktopStatusBarItems(),
-		DefaultToolApprovalMode: cfg.DesktopDefaultToolApprovalMode(),
-		CheckUpdates:            cfg.DesktopCheckUpdates(),
-		UpdateChannel:           cfg.DesktopUpdateChannel(),
-		Telemetry:               cfg.DesktopTelemetry(),
-		Metrics:                 cfg.DesktopMetrics(),
-		ExpandThinking:          cfg.Desktop.ExpandThinking,
-		ConversationWidth:       cfg.DesktopConversationWidth(),
-		ConfigPath:              cfgPath,
-		ShadowedByPath:          shadowingConfigPath(cfgPath, root),
-		ProviderKinds:           nonNil(provider.Kinds()),
-		AutoApproveTools:        ctrl != nil && ctrl.AutoApproveTools(),
-		Bypass:                  ctrl != nil && ctrl.AutoApproveTools(),
+		Bot:                          botSettingsView(cfg.Bot),
+		DesktopLanguage:              cfg.DesktopLanguage(),
+		DesktopCurrency:              cfg.DesktopCurrency(),
+		DesktopLayoutStyle:           cfg.DesktopLayoutStyle(),
+		DesktopTheme:                 cfg.DesktopTheme(),
+		DesktopThemeStyle:            cfg.DesktopThemeStyle(),
+		DesktopTerminalTheme:         cfg.DesktopTerminalTheme(),
+		CloseBehavior:                cfg.DesktopCloseBehavior(),
+		DisplayMode:                  cfg.DesktopDisplayMode(),
+		ReasoningDisplayMode:         cfg.DesktopReasoningDisplayMode(),
+		ReasoningDisplayModeExplicit: cfg.DesktopReasoningDisplayModeExplicit(),
+		StatusBarStyle:               cfg.DesktopStatusBarStyle(),
+		StatusBarItems:               cfg.DesktopStatusBarItems(),
+		DefaultToolApprovalMode:      cfg.DesktopDefaultToolApprovalMode(),
+		CheckUpdates:                 cfg.DesktopCheckUpdates(),
+		UpdateChannel:                cfg.DesktopUpdateChannel(),
+		Telemetry:                    cfg.DesktopTelemetry(),
+		Metrics:                      cfg.DesktopMetrics(),
+		ExpandThinking:               cfg.Desktop.ExpandThinking,
+		ConversationWidth:            cfg.DesktopConversationWidth(),
+		ConfigPath:                   cfgPath,
+		ShadowedByPath:               shadowingConfigPath(cfgPath, root),
+		ProviderKinds:                nonNil(provider.Kinds()),
+		AutoApproveTools:             ctrl != nil && ctrl.AutoApproveTools(),
+		Bypass:                       ctrl != nil && ctrl.AutoApproveTools(),
 	}
 	if ctrl != nil {
 		if effective := ctrl.CompactRatio(); effective > 0 {
@@ -1904,12 +1837,10 @@ func (a *App) rebuildSettingTurnLockedWithModel(setting string, tab *WorkspaceTa
 	if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), setting); err != nil {
 		return err
 	}
-	ensureWorkspace := a.ensureTabControllerWorkspace
-	if admissionHeld {
-		ensureWorkspace = a.ensureTabControllerWorkspaceAdmissionHeld
-	}
-	if err := ensureWorkspace(tab); err != nil {
-		return err
+	if !admissionHeld {
+		if err := a.ensureTabControllerWorkspace(tab); err != nil {
+			return err
+		}
 	}
 	prevPath := a.reconciledSessionPathForTab(tab)
 	if prevPath == "" {
@@ -1922,9 +1853,6 @@ func (a *App) rebuildSettingTurnLockedWithModel(setting string, tab *WorkspaceTa
 		}
 	}
 	if err := rebuildControllerActiveWorkErrorFor(a.controllerForTab(tab), setting); err != nil {
-		return err
-	}
-	if err := ensureWorkspace(tab); err != nil {
 		return err
 	}
 
@@ -2000,9 +1928,6 @@ func (a *App) rebuildSettingTurnLockedWithModel(setting string, tab *WorkspaceTa
 		oldCtrl.Close()
 	}
 	a.persistTabSessionPath(tab, path)
-	if setting == "currency" {
-		a.repriceTabUsageForCurrentCurrency(tab)
-	}
 	a.clearDeferredRebuild(tab.ID)
 	a.notifyTabRuntimeRebuilt(tab)
 	a.emitReady(a.ctx)
@@ -2022,12 +1947,14 @@ func (a *App) buildSettingReplacementController(tab *WorkspaceTab, snap tabRunti
 	opts := boot.Options{
 		Model: model, RequireKey: false,
 		RuntimeReload:            boot.RuntimeReload{ForceFullRebuild: reload},
-		AutoPricingCurrency:      a.desktopAutoPricingCurrency(),
 		StatsSource:              "desktop",
+		TaskStore:                a.taskStore(),
+		OnConfigLoadWarnings:     a.configLoadWarningsHandler(),
 		Sink:                     snap.sink,
 		WorkspaceRoot:            snap.workspaceRoot,
 		SessionDir:               sessionDirForSnapshot(snap),
 		EffortOverride:           cloneStringPtr(snap.effort),
+		AgentPreset:              boot.NormalizeAgentPreset(runtime.tokenMode),
 		TokenMode:                runtime.tokenMode,
 		SharedHost:               a.lookupSharedHost(snap.sharedHostKey),
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
@@ -2391,21 +2318,25 @@ func (a *App) SetDefaultToolApprovalMode(mode string) error {
 func (a *App) SetDefaultAutoRecoveryCheckpoint(_ bool) error { return nil }
 
 func officialProviderTemplate(kind, pricingLanguage string) ([]config.ProviderEntry, string, error) {
+	_ = pricingLanguage // display language no longer selects list-price tables
 	webSearchEnabled := true
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "deepseek", "deepseek-official":
+		// Freeze the official USD regional table; display currency is independent.
 		return []config.ProviderEntry{{
-			Name:          "deepseek",
-			Kind:          "anthropic",
-			BaseURL:       "https://api.deepseek.com/anthropic",
-			Models:        []string{"deepseek-v4-flash", "deepseek-v4-pro"},
-			Default:       "deepseek-v4-flash",
-			APIKeyEnv:     "DEEPSEEK_API_KEY",
-			BalanceURL:    "https://api.deepseek.com/user/balance",
-			Thinking:      "enabled",
-			WebSearch:     &webSearchEnabled,
-			ContextWindow: 1_000_000,
-			Prices:        config.DeepSeekV4PricesForLanguage(pricingLanguage),
+			Name:            "deepseek",
+			Kind:            "anthropic",
+			BaseURL:         "https://api.deepseek.com/anthropic",
+			Models:          []string{"deepseek-v4-flash", "deepseek-v4-pro"},
+			Default:         "deepseek-v4-flash",
+			APIKeyEnv:       "DEEPSEEK_API_KEY",
+			BalanceURL:      "https://api.deepseek.com/user/balance",
+			Thinking:        "enabled",
+			WebSearch:       &webSearchEnabled,
+			ContextWindow:   1_000_000,
+			BillingCurrency: "USD",
+			BillingMode:     "payg",
+			Prices:          config.DeepSeekV4PricesForCurrency("USD"),
 			ModelOverrides: map[string]config.ProviderModelOverride{
 				"deepseek-v4-flash": {SupportedEfforts: []string{"disabled", "low", "high", "max"}, DefaultEffort: "high"},
 				"deepseek-v4-pro":   {SupportedEfforts: []string{"disabled", "high", "max"}, DefaultEffort: "high"},
@@ -2475,6 +2406,10 @@ func saveProviderConfig(c *config.Config, p ProviderView) error {
 	e.Kind = p.Kind
 	e.BaseURL = p.BaseURL
 	e.ChatURL = strings.TrimSpace(p.ChatURL)
+	e.RequestURL = strings.TrimSpace(p.RequestURL)
+	if strings.EqualFold(strings.TrimSpace(e.Kind), "openai") && e.RequestURL != "" {
+		e.ChatURL = e.RequestURL
+	}
 	e.ModelsURL = strings.TrimSpace(p.ModelsURL)
 	e.APIKeyEnv = p.APIKeyEnv
 	e.Headers = p.Headers
@@ -3332,17 +3267,6 @@ func (a *App) SetStatusBarItems(items []string) error {
 // language preference used by model-facing desktop sessions.
 func (a *App) SetDesktopLanguage(lang string) error {
 	responseLanguage := ""
-	pricingChanged := false
-	if cfg, _, err := a.loadDesktopUserConfigForView(); err == nil && cfg.DesktopCurrency() == "" {
-		targetCurrency := a.desktopAutoPricingCurrency()
-		switch strings.ToLower(strings.TrimSpace(lang)) {
-		case "zh":
-			targetCurrency = "CNY"
-		case "en":
-			targetCurrency = "USD"
-		}
-		pricingChanged = a.desktopEffectivePricingCurrency(cfg) != targetCurrency
-	}
 	mutate := func(c *config.Config) error {
 		if err := c.SetDesktopLanguage(lang); err != nil {
 			return err
@@ -3353,17 +3277,9 @@ func (a *App) SetDesktopLanguage(lang string) error {
 		responseLanguage = c.ResponseLanguage()
 		return nil
 	}
-	var err error
-	if pricingChanged {
-		_, err = a.applyConfigChangeWithWarning("currency", mutate)
-	} else {
-		err = a.applyConfigOnly(mutate)
-	}
+	err := a.applyConfigOnly(mutate)
 	if err != nil {
 		return err
-	}
-	if pricingChanged {
-		a.scheduleCurrencyRefreshForOtherTabs()
 	}
 	if strings.TrimSpace(lang) != "" && !strings.EqualFold(strings.TrimSpace(lang), "auto") {
 		a.setDesktopLocale(lang)
@@ -3373,70 +3289,41 @@ func (a *App) SetDesktopLanguage(lang string) error {
 	return nil
 }
 
-// SetDesktopCurrency updates the official pricing region independently from UI
-// language. Rebuild the active controller so subsequent usage carries the new
-// currency and regional rates through the existing structured cost fields.
+// SetDesktopCurrency persists a display-only preference and re-selects the
+// occurrence-time valuations already stored in each tab. Provider price tables
+// and live controllers are intentionally untouched.
 func (a *App) SetDesktopCurrency(currency string) error {
-	_, err := a.applyConfigChangeWithWarning("currency", func(c *config.Config) error {
+	err := a.applyConfigOnly(func(c *config.Config) error {
 		return c.SetDesktopCurrency(currency)
 	})
-	if err == nil {
-		a.scheduleCurrencyRefreshForOtherTabs()
+	if err != nil {
+		return err
 	}
-	return err
-}
 
-func (a *App) scheduleCurrencyRefreshForOtherTabs() {
-	if a == nil || a.ctx == nil {
-		return
-	}
+	a.sessionRemovalMu.Lock()
+	defer a.sessionRemovalMu.Unlock()
 	a.mu.RLock()
-	activeID := a.activeTabID
-	tabIDs := make([]string, 0, len(a.tabs))
-	for id, tab := range a.tabs {
-		if id != activeID && tab != nil && tab.Ctrl != nil && !tab.removed {
-			tabIDs = append(tabIDs, id)
-		}
-	}
+	tabs := append([]*WorkspaceTab(nil), a.runtimeTabsLocked()...)
 	a.mu.RUnlock()
-	for _, id := range tabIDs {
-		a.scheduleDeferredRebuild(id, "currency")
+	for _, tab := range tabs {
+		a.repriceTabUsageForCurrentCurrency(tab)
 	}
-}
-
-func (a *App) scheduleCurrencyRefreshForAllTabs() {
-	if a == nil {
-		return
-	}
-	a.mu.RLock()
-	tabIDs := make([]string, 0, len(a.tabs))
-	for id, tab := range a.tabs {
-		if tab != nil && tab.Ctrl != nil && !tab.removed {
-			tabIDs = append(tabIDs, id)
-		}
-	}
-	a.mu.RUnlock()
-	for _, id := range tabIDs {
-		a.scheduleDeferredRebuild(id, "currency")
-	}
-}
-
-func (a *App) desktopPricingFollowsDetectedLocale() bool {
-	cfg, _, err := a.loadDesktopUserConfigForView()
-	return err == nil && cfg.DesktopPricingFollowsDetectedLocale()
+	return nil
 }
 
 func (a *App) desktopEffectivePricingCurrency(cfg *config.Config) string {
+	// Display currency only — never the provider list-price region.
 	if cfg == nil {
-		return a.desktopAutoPricingCurrency()
+		return ""
 	}
-	if cfg.DesktopPricingFollowsDetectedLocale() {
-		return a.desktopAutoPricingCurrency()
+	if pref := cfg.DisplayCurrencyPref(); pref != "" {
+		return pref
 	}
-	return cfg.DeepSeekOfficialPricingCurrency()
+	return cfg.ExplicitDisplayCurrency()
 }
 
 func (a *App) desktopOfficialPricingLanguage(cfg *config.Config) string {
+	// Used only for display-language adjacent UI; list prices use billing_currency.
 	if a.desktopEffectivePricingCurrency(cfg) == "CNY" {
 		return "zh"
 	}
@@ -3446,18 +3333,12 @@ func (a *App) desktopOfficialPricingLanguage(cfg *config.Config) string {
 // SetTrayLocale mirrors the resolved desktop UI language into the native tray
 // menu. It is runtime-only; the persisted preference remains [desktop].language.
 func (a *App) SetTrayLocale(locale string) error {
-	previousCurrency := a.desktopAutoPricingCurrency()
 	a.setDesktopLocale(locale)
-	pricingCurrencyChanged := previousCurrency != a.desktopAutoPricingCurrency()
 	trayLocale := "en"
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(locale)), "zh") {
 		trayLocale = "zh"
 	}
 	a.updateTrayLocale(trayLocale)
-	if pricingCurrencyChanged && a.desktopPricingFollowsDetectedLocale() {
-		a.scheduleCurrencyRefreshForAllTabs()
-		a.kickDeferredRebuildRetry()
-	}
 	a.emitProjectTreeChanged()
 	return nil
 }
@@ -3570,10 +3451,6 @@ func (a *App) SetAgentParams(temperature float64, maxSteps int, plannerMaxSteps 
 		c.Agent.SystemPrompt = systemPrompt
 		return nil
 	})
-}
-
-func (a *App) SetColdResumePrune(enabled bool) error {
-	return a.applyConfigChange(func(c *config.Config) error { return c.SetColdResumePrune(enabled) })
 }
 
 func (a *App) SetCompactRatio(ratio float64) error {

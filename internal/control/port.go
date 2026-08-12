@@ -111,6 +111,11 @@ type Goals interface {
 	ResetPlannerSession()
 	PlanMode() bool
 	SetPlanMode(v bool)
+	// AgentPreset is the session role setting (light|balanced|delivery).
+	AgentPreset() string
+	// SetAgentPreset updates the role setting for subsequent turns without
+	// rebuilding the controller.
+	SetAgentPreset(preset string)
 }
 
 // SessionHistory covers checkpoint/rewind, branch/fork, and the log-restructuring
@@ -135,6 +140,7 @@ type SessionHistory interface {
 	SwitchBranch(ref string) (agent.BranchInfo, error)
 	Compact(ctx context.Context, instructions string) error
 	CompactRatio() float64
+	ContextReport() (summary, detail string)
 	SummarizeFrom(ctx context.Context, turn int) error
 	SummarizeUpTo(ctx context.Context, turn int) error
 }
@@ -197,6 +203,7 @@ type Capabilities interface {
 // Status covers read-only run/usage/billing telemetry and task list state.
 type Status interface {
 	ContextSnapshot() (int, int)
+	ContextMaintenanceSnapshot() agent.ContextMaintenanceSnapshot
 	LastUsage() *provider.Usage
 	Balance(ctx context.Context) (*billing.Balance, error)
 	Jobs() []jobs.View
@@ -253,6 +260,7 @@ type SessionAPI interface {
 	SessionPersistence
 	Input
 	Settings
+	Inbox
 }
 
 // Compile-time proof that the concrete controller satisfies each sub-port and
@@ -270,5 +278,6 @@ var (
 	_ SessionPersistence = (*Controller)(nil)
 	_ Input              = (*Controller)(nil)
 	_ Settings           = (*Controller)(nil)
+	_ Inbox              = (*Controller)(nil)
 	_ SessionAPI         = (*Controller)(nil)
 )

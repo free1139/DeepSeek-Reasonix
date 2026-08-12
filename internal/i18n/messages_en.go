@@ -45,6 +45,12 @@ var English = Messages{
 	ChatThinking:                           "thinking…",
 	ChatThoughtForFmt:                      "thought for %ds",
 	ChatStatusThinkingFmt:                  "%s thinking… (%ds · Esc cancels)",
+	TurnPhaseWorking:                       "working",
+	TurnPhaseChecking:                      "checking",
+	TurnPhaseVerifying:                     "verifying",
+	TurnPhaseReviewing:                     "reviewing",
+	CompletionSummaryBlocked:               "This turn is blocked; review the changes for details.",
+	CompletionSummaryNeedsAttention:        "This turn still has verification or review gaps.",
 	ChatToolWorkingFmt:                     "%s working · %ds",
 	ChatSubagentPhaseQueued:                "queued",
 	ChatSubagentPhaseRunning:               "running",
@@ -149,9 +155,9 @@ var English = Messages{
 	LanguageHeader:            "languages:",
 	LanguageHint:              "switch with /language <auto|en|zh>",
 	LanguageChangedFmt:        "language set to %s (resolved: %s)",
-	CurrencyHeader:            "pricing currency:",
+	CurrencyHeader:            "fee display currency:",
 	CurrencyHint:              "switch with /currency <auto|CNY|USD>",
-	CurrencyChangedFmt:        "pricing currency set to %s (resolved: %s)",
+	CurrencyChangedFmt:        "fee display currency set to %s (resolved: %s)",
 	RuntimeRefreshBusy:        "finish or cancel active work and stop background jobs before changing this setting",
 	RuntimeRefreshUnavailable: "runtime refresh is unavailable in this session",
 
@@ -241,6 +247,7 @@ var English = Messages{
 	CmdClear:            "discard current context",
 	CmdCls:              "clear screen only (keep LLM context)",
 	CmdCompact:          "compact context",
+	CmdContext:          "show context window, thresholds, and last maintenance",
 	CmdRewind:           "rewind to an earlier turn",
 	CmdTree:             "show conversation branches",
 	CmdBranch:           "create a conversation branch",
@@ -249,7 +256,7 @@ var English = Messages{
 	CmdRename:           "rename a session",
 	CmdModel:            "switch model",
 	CmdStatus:           "show session status",
-	CmdWorkMode:         "switch work mode",
+	CmdWorkMode:         "switch execution setting",
 	CmdDocs:             "search version-matched embedded documentation",
 	CmdMemory:           "inspect instructions, memory, and recovery",
 	CmdMigrate:          "retry legacy data migration",
@@ -264,7 +271,7 @@ var English = Messages{
 	CmdOutputStyle:      "list output styles",
 	CmdTheme:            "switch CLI theme",
 	CmdLanguage:         "switch CLI language",
-	CmdCurrency:         "switch pricing currency",
+	CmdCurrency:         "switch fee display currency",
 	CmdSkill:            "manage skills",
 	CmdVerbose:          "toggle thinking text",
 	CmdReloadCmd:        "reload custom commands",
@@ -275,6 +282,7 @@ var English = Messages{
 	CmdMouse:            "toggle in-app mouse capture (off = native terminal selection/right-click)",
 	CmdReasonLang:       "set visible reasoning language",
 	CmdHelp:             "list commands",
+	CmdWeb:              "continue this session in the Web UI",
 	CmdTodo:             "dismiss the task list",
 	CmdQuit:             "exit the session",
 	CmdCopy:             "pick a response to copy to clipboard",
@@ -329,8 +337,7 @@ var English = Messages{
 	GoalPaused:                   "goal paused — /goal resume continues it",
 	GoalPausedReason:             "paused by the user",
 	GoalPausedFmt:                "goal is paused (%s) — use /goal resume to continue",
-	GoalBudgetExtended:           "goal resumed — one additional turn slice added",
-	GoalRuntimeFmt:               "runtime: turns %d/%d, tokens %d, no-progress %d/%d, extensions %d",
+	GoalRuntimeFmt:               "runtime: turns %d · requests %d · tokens %d · work time %s",
 	GoalRuntimeLastReason:        "last reason",
 	ModelSwitchUnavailable:       "model switching is unavailable in this session",
 	ModelSwitchBusy:              "finish or cancel active work and stop background jobs before switching models",
@@ -342,21 +349,22 @@ var English = Messages{
 	RuntimeReloadQueued:          "reload queued — will run when the current work finishes",
 	RuntimeReloaded:              "runtime reloaded",
 	RuntimeReloadedGenerationFmt: "runtime reloaded (generation %d)",
-	WorkModeStatusFmt:            "work %s",
-	WorkModeListHeaderFmt:        "work modes (current: %s)",
-	WorkModeListHint:             "switch with /work-mode economy|balanced|delivery (/profile is an alias)",
-	WorkModeEconomyLabel:         "economy",
+	WorkModeStatusFmt:            "execution %s",
+	WorkModeListHeaderFmt:        "execution settings (current: %s)",
+	WorkModeListHint:             "switch with /preset light|balanced|delivery (/work-mode and /profile are aliases)",
+	WorkModeEconomyLabel:         "light",
 	WorkModeBalancedLabel:        "balanced",
 	WorkModeDeliveryLabel:        "delivery",
-	WorkModeEconomyDesc:          "lower token use; optional tool sources connect on demand",
-	WorkModeBalancedDesc:         "full tool surface; model decides how much work is needed",
-	WorkModeDeliveryDesc:         "complete, verified delivery; stronger skill and plugin use",
-	WorkModeUsage:                "usage: /work-mode economy|balanced|delivery",
-	WorkModeSwitchUnavailable:    "work-mode switching is unavailable in this session",
-	WorkModeSwitchBusy:           "finish or cancel active work before switching work modes",
-	WorkModeAlreadyOnFmt:         "work mode is already %s",
-	WorkModeSwitchingFmt:         "switching work mode to %s…",
-	WorkModeSwitchedFmt:          "work mode switched to %s (conversation carried over; prompt cache resets)",
+	WorkModeEconomyDesc:          "Light · fast and reliable: on-demand capabilities · targeted verification",
+	WorkModeBalancedDesc:         "Balanced · adaptive: auto planning · risk-tiered verification",
+	WorkModeDeliveryDesc:         "Delivery · evidence closed-loop: full acceptance · verification and independent review",
+	WorkModeUsage:                "usage: /preset light|balanced|delivery",
+	WorkModeSwitchUnavailable:    "execution setting switching is unavailable in this session",
+	WorkModeSwitchBusy:           "finish or cancel active work before switching execution settings",
+	WorkModeAlreadyOnFmt:         "execution setting is already %s",
+	WorkModeSwitchingFmt:         "switching execution setting to %s…",
+	WorkModeSwitchedFmt:          "execution setting switched to %s (applies to subsequent turns; no session rebuild)",
+	WorkModeDeprecatedNotice:     "note: /work-mode and /profile are deprecated; use /preset light|balanced|delivery",
 	RewindNone:                   "nothing to rewind yet",
 	RewindCodeConversation:       "Code + conversation",
 	RewindConversationOnly:       "Conversation only",
@@ -438,6 +446,7 @@ var English = Messages{
 	CustomPromptBaseURL:  "Enter Base URL",
 	CustomPromptKeyEnv:   "API Key variable name (press Enter to use the default; not the model name)",
 	CustomPromptAPIKey:   "Enter API Key",
+	CustomPromptWindow:   "Context window in tokens (a value below the model's real window makes compaction fire early)",
 	CustomAddedFmt:       "Added custom model: %s",
 
 	// Anthropic compatible provider
@@ -552,6 +561,7 @@ Usage:
   reasonix run [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] [--output-format FORMAT] <task>
   reasonix run --events-jsonl [--model NAME] <task>      emit redacted structured events as JSONL
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI-powered code review on local diffs
+  reasonix web [--model NAME] [--addr HOST:PORT] [--no-open]  start the local Web UI and open it in the default browser
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  serve over HTTP+SSE (with optional auth)
   reasonix acp [--model NAME]                           serve Agent Client Protocol over stdio (also: reasonix --acp)
   reasonix setup [path]                                 interactive config wizard; writes reasonix.toml (+ .env)
@@ -581,6 +591,7 @@ Examples:
   reasonix
   reasonix --continue
   reasonix --resume provider-config
+  reasonix web
   reasonix run "implement the TODOs in main.go"
   reasonix run --model mimo-pro "add unit tests for this function"
   reasonix -p "summarize this repository" --output-format json
