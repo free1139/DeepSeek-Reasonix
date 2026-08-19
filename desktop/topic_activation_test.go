@@ -308,12 +308,16 @@ func TestStartTopicActivationSyncBuildAndReuseFastPath(t *testing.T) {
 // activationStubController is the minimal SessionAPI surface exercised by
 // prune/detach/attach flows around a tab with active runtime work.
 type activationStubController struct {
-	control.SessionAPI
+	stubSessionAPI
 	sessionPath string
 	closed      atomic.Bool
+	status      *control.RuntimeStatus
 }
 
 func (c *activationStubController) RuntimeStatus() control.RuntimeStatus {
+	if c.status != nil {
+		return *c.status
+	}
 	return control.RuntimeStatus{Running: true}
 }
 func (c *activationStubController) SessionPath() string      { return c.sessionPath }

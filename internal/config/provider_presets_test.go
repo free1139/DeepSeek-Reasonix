@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"reasonix/internal/provider"
 )
 
 func TestCurrentBuiltInAnthropicCompatibleProvidersRemainLocalByCapability(t *testing.T) {
@@ -62,6 +64,9 @@ func TestCuratedProviderPresetsCoverRequestedProviders(t *testing.T) {
 		"qwen-coding-plan-global-anthropic",
 		"stepfun",
 		"stepfun-anthropic",
+		"stepfun-responses",
+		"stepfun-api",
+		"stepfun-api-anthropic",
 		"novita",
 		"gmi",
 		"vercel-ai-gateway",
@@ -69,6 +74,8 @@ func TestCuratedProviderPresetsCoverRequestedProviders(t *testing.T) {
 		"nvidia",
 		"kilocode",
 		"ollama-cloud",
+		"scnet",
+		"scnet-anthropic",
 	}
 	got := map[string]ProviderPreset{}
 	for _, preset := range CuratedProviderPresets() {
@@ -96,6 +103,39 @@ func TestCuratedProviderPresetsCoverRequestedProviders(t *testing.T) {
 		if _, ok := got[id]; !ok {
 			t.Fatalf("missing preset %q", id)
 		}
+	}
+}
+
+func TestOpenCodeGoContextWindowPresetsMatchModelsDev(t *testing.T) {
+	preset, ok := CuratedProviderPreset("opencode-go")
+	if !ok || len(preset.Entries) != 1 {
+		t.Fatal("missing opencode-go preset")
+	}
+	entry := preset.Entries[0]
+	if entry.ContextWindow != 128000 {
+		t.Fatalf("provider fallback window = %d, want 128000", entry.ContextWindow)
+	}
+	for id, lim := range provider.OpenCodeGoChatModels() {
+		if got := entry.ModelOverrides[id].ContextWindow; got != lim.Context {
+			t.Fatalf("%s context = %d, want %d", id, got, lim.Context)
+		}
+	}
+	anth, ok := CuratedProviderPreset("opencode-go-anthropic")
+	if !ok {
+		t.Fatal("missing opencode-go-anthropic")
+	}
+	for id, lim := range provider.OpenCodeGoAnthropicModels() {
+		if got := anth.Entries[0].ModelOverrides[id].ContextWindow; got != lim.Context {
+			t.Fatalf("anthropic %s context = %d, want %d", id, got, lim.Context)
+		}
+	}
+	dsAnth, _ := CuratedProviderPreset("opencode-go-deepseek-anthropic")
+	if dsAnth.Entries[0].ContextWindow != 1_000_000 {
+		t.Fatalf("deepseek anthropic window = %d", dsAnth.Entries[0].ContextWindow)
+	}
+	dsResp, _ := CuratedProviderPreset("opencode-go-deepseek-responses")
+	if dsResp.Entries[0].ContextWindow != 1_000_000 {
+		t.Fatalf("deepseek responses window = %d", dsResp.Entries[0].ContextWindow)
 	}
 }
 
@@ -165,7 +205,7 @@ func TestDeepSeekAnthropicPresetIsOptionalAndModelScoped(t *testing.T) {
 	if got, err := NormalizeEffort(flash, "low"); err != nil || got != "low" {
 		t.Fatalf("Flash low effort = %q/%v, want low/nil", got, err)
 	}
-	if cap := EffortCapabilityForEntry(pro); cap.Default != "high" || containsString(cap.Levels, "low") || !containsString(cap.Levels, "max") {
+	if cap := EffortCapabilityForEntry(pro); cap.Default != "high" || !containsString(cap.Levels, "low") || !containsString(cap.Levels, "max") {
 		t.Fatalf("Pro effort capability = %+v", cap)
 	}
 }
@@ -179,7 +219,7 @@ func TestDeepSeekResponsesPresetMatchesOfficialSupport(t *testing.T) {
 	if entry.Kind != "responses" || entry.BaseURL != "https://api.deepseek.com" || entry.ResponsesMode != "stateless" {
 		t.Fatalf("deepseek responses endpoint = %+v", entry)
 	}
-	if len(entry.Models) != 1 || entry.Models[0] != "deepseek-v4-flash" || entry.Default != "deepseek-v4-flash" {
+	if !entry.HasModel("deepseek-v4-flash") || !entry.HasModel("deepseek-v4-pro") || entry.Default != "deepseek-v4-flash" {
 		t.Fatalf("deepseek responses models = %v default=%q", entry.Models, entry.Default)
 	}
 	if entry.ModelsURL != "" {
@@ -187,6 +227,24 @@ func TestDeepSeekResponsesPresetMatchesOfficialSupport(t *testing.T) {
 	}
 	if !EffectiveWebSearch(&entry) || entry.Vision || entry.VisionModels != nil {
 		t.Fatalf("deepseek responses capabilities = web_search:%t vision:%t vision_models:%v", EffectiveWebSearch(&entry), entry.Vision, entry.VisionModels)
+	}
+	var cfg Config
+	if err := cfg.UpsertProvider(entry); err != nil {
+		t.Fatalf("UpsertProvider: %v", err)
+	}
+	flash, ok := cfg.ResolveModel("deepseek-responses/deepseek-v4-flash")
+	if !ok {
+		t.Fatal("Flash model did not resolve")
+	}
+	pro, ok := cfg.ResolveModel("deepseek-responses/deepseek-v4-pro")
+	if !ok {
+		t.Fatal("Pro model did not resolve")
+	}
+	if cap := EffortCapabilityForEntry(flash); cap.Default != "high" || !containsString(cap.Levels, "disabled") || !containsString(cap.Levels, "low") || !containsString(cap.Levels, "max") {
+		t.Fatalf("Flash effort capability = %+v", cap)
+	}
+	if cap := EffortCapabilityForEntry(pro); cap.Default != "high" || !containsString(cap.Levels, "low") || !containsString(cap.Levels, "max") {
+		t.Fatalf("Pro effort capability = %+v", cap)
 	}
 }
 
@@ -294,6 +352,21 @@ func TestCuratedProviderPresetsStepFunUsesOfficialBaseURLs(t *testing.T) {
 			kind:    "anthropic",
 			baseURL: "https://api.stepfun.com/step_plan",
 		},
+		{
+			id:      "stepfun-responses",
+			kind:    "responses",
+			baseURL: "https://api.stepfun.com/v1",
+		},
+		{
+			id:      "stepfun-api",
+			kind:    "openai",
+			baseURL: "https://api.stepfun.com/v1",
+		},
+		{
+			id:      "stepfun-api-anthropic",
+			kind:    "anthropic",
+			baseURL: "https://api.stepfun.com",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.id, func(t *testing.T) {
@@ -312,6 +385,44 @@ func TestCuratedProviderPresetsStepFunUsesOfficialBaseURLs(t *testing.T) {
 				t.Fatalf("preset %q base_url = %q, want %q", tt.id, entry.BaseURL, tt.baseURL)
 			}
 		})
+	}
+}
+
+// StepFun's Responses API enables only step-3.7-flash server-side and ignores
+// previous_response_id, so the preset must ship the single-model catalog and
+// the stateless mode.
+func TestCuratedProviderPresetsStepFunResponsesContract(t *testing.T) {
+	preset, ok := CuratedProviderPreset("stepfun-responses")
+	if !ok || len(preset.Entries) != 1 {
+		t.Fatal("missing stepfun-responses preset")
+	}
+	entry := preset.Entries[0]
+	if got := entry.ModelList(); len(got) != 1 || got[0] != "step-3.7-flash" {
+		t.Fatalf("stepfun-responses models = %v, want [step-3.7-flash]", got)
+	}
+	if entry.ResponsesMode != "stateless" {
+		t.Fatalf("stepfun-responses responses_mode = %q, want stateless", entry.ResponsesMode)
+	}
+}
+
+// The pay-as-you-go presets must stay on the standard /v1 surface and expose
+// vision only on step-3.7-flash, matching the channel's live behavior (the
+// step_plan channel rejects images; 3.5 SKUs are not Responses-enabled).
+func TestCuratedProviderPresetsStepFunPayAsYouGoContract(t *testing.T) {
+	api, ok := CuratedProviderPreset("stepfun-api")
+	if !ok || len(api.Entries) != 1 {
+		t.Fatal("missing stepfun-api preset")
+	}
+	entry := api.Entries[0]
+	if !stringSlicesEqual(entry.VisionModels, []string{"step-3.7-flash"}) {
+		t.Fatalf("stepfun-api vision_models = %v, want [step-3.7-flash]", entry.VisionModels)
+	}
+	anthropic, ok := CuratedProviderPreset("stepfun-api-anthropic")
+	if !ok || len(anthropic.Entries) != 1 {
+		t.Fatal("missing stepfun-api-anthropic preset")
+	}
+	if got := anthropic.Entries[0].BaseURL; got != "https://api.stepfun.com" {
+		t.Fatalf("stepfun-api-anthropic base_url = %q, want origin (SDK appends /v1/messages)", got)
 	}
 }
 

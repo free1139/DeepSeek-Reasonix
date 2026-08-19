@@ -10,6 +10,7 @@ import (
 // Receipt is the host-runtime record of one tool call. It stays in memory for
 // the current agent turn and is not serialized into prompts or session state.
 type Receipt struct {
+	Sequence  uint64          `json:"-"`
 	ToolName  string          `json:"tool_name"`
 	Args      json.RawMessage `json:"args,omitempty"`
 	Profile   string          `json:"profile,omitempty"`
@@ -38,6 +39,10 @@ type Receipt struct {
 	// Verification is the host's classification of a shell call: one of the
 	// Verification* values. Empty means the host never classified this receipt.
 	Verification string `json:"verification,omitempty"`
+	// PolicyFloor is the session quality floor in force when this write was
+	// committed ("delivery" or empty). Host-only replay fact: the contract
+	// rebuild reads it back so a floor change never rewrites history.
+	PolicyFloor string `json:"policy_floor,omitempty"`
 }
 
 // ObserveOutput records the trimmed output size and a compact digest without

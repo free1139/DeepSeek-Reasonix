@@ -1,8 +1,11 @@
 // Package workspacelease serializes Delivery writers that target the same
 // workspace. Readers never acquire a lease. A writer keeps its lease from the
-// first mutation until every participating agent run and background job has
-// finished, so review and verification cannot be invalidated by another
-// Delivery session changing the workspace mid-turn.
+// first mutation until every participating agent run has finished; a retained
+// background job then extends it only for a bounded grace period, so a resident
+// service cannot pin the workspace against other sessions forever.
+//
+// Owner is participation accounting only. Cross-process and in-process
+// serialization is delegated to internal/filelock.
 package workspacelease
 
 import (
@@ -17,11 +20,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"reasonix/internal/filelock"
 )
 
-const retryInterval = 75 * time.Millisecond
-
-var errHeld = errors.New("workspace write lease is held")
+// backgroundGrace bounds how long a retained background job may keep the write
+// lease after the last agent run ends. run_in_background is used for long-lived
+// services (dev servers, watchers) whose job channel may never close, so an
+// unbounded retention would hand one session the workspace permanently. The
+// window still covers a job's initial burst of workspace writes.
+const backgroundGrace = 30 * time.Second
 
 // WaitNotice is called once when an acquisition cannot complete immediately.
 // It must return quickly and must not call back into Owner.
@@ -31,9 +39,9 @@ type WaitNotice func()
 // shared by the root agent and all of its subagents. Different sessions must
 // use different Owners, even when they share a workspace.
 type Owner struct {
-	lockPath string
-	onWait   WaitNotice
-	local    *localLock
+	lockPath   string
+	onWait     WaitNotice
+	graceAfter time.Duration
 
 	mu            sync.Mutex
 	activeRuns    int
@@ -43,6 +51,10 @@ type Owner struct {
 	waiting       bool
 	acquireDone   chan struct{}
 	releaseSystem func()
+	// leaseEpoch changes on every acquisition so a pending grace release can
+	// prove it still targets the lease it was armed for.
+	leaseEpoch uint64
+	graceTimer *time.Timer
 }
 
 // State is a sanitized process-local snapshot used by Desktop to explain a
@@ -62,15 +74,6 @@ func (o *Owner) State() State {
 	return State{Acquired: o.acquired, Waiting: o.waiting}
 }
 
-type localLock struct {
-	token chan struct{}
-}
-
-var localRegistry = struct {
-	sync.Mutex
-	locks map[string]*localLock
-}{locks: map[string]*localLock{}}
-
 // New returns a Delivery-session lease owner for workspaceRoot. lockDir must be
 // shared by Reasonix processes for cross-process protection; it is kept outside
 // the workspace so acquiring a lease never dirties user files.
@@ -89,19 +92,10 @@ func New(workspaceRoot, lockDir string, onWait WaitNotice) (*Owner, error) {
 	sum := sha256.Sum256([]byte(canonical))
 	key := hex.EncodeToString(sum[:])
 
-	localRegistry.Lock()
-	local := localRegistry.locks[key]
-	if local == nil {
-		local = &localLock{token: make(chan struct{}, 1)}
-		local.token <- struct{}{}
-		localRegistry.locks[key] = local
-	}
-	localRegistry.Unlock()
-
 	return &Owner{
-		lockPath: filepath.Join(lockDir, key+".lock"),
-		onWait:   onWait,
-		local:    local,
+		lockPath:   filepath.Join(lockDir, key+".lock"),
+		onWait:     onWait,
+		graceAfter: backgroundGrace,
 	}, nil
 }
 
@@ -160,6 +154,9 @@ func (o *Owner) BeginRun() {
 	}
 	o.mu.Lock()
 	o.activeRuns++
+	// A new run may write immediately, so revoke any grace release still pending
+	// from the previous run's background jobs.
+	o.cancelGraceLocked()
 	o.mu.Unlock()
 }
 
@@ -217,6 +214,7 @@ func (o *Owner) AcquireWrite(ctx context.Context) error {
 		if err == nil {
 			o.acquired = true
 			o.releaseSystem = release
+			o.leaseEpoch++
 		}
 		close(done)
 		releaseIfIdle := o.releaseIfIdleLocked()
@@ -257,66 +255,76 @@ func (o *Owner) RetainUntil(done <-chan struct{}) {
 }
 
 func (o *Owner) releaseIfIdleLocked() func() {
-	if !o.acquired || o.acquiring || o.activeRuns != 0 || o.background != 0 {
+	if !o.acquired || o.acquiring || o.activeRuns != 0 {
 		return nil
 	}
+	if o.background != 0 {
+		o.armGraceLocked()
+		return nil
+	}
+	return o.takeLeaseLocked()
+}
+
+// takeLeaseLocked detaches the system release from this Owner exactly once, so
+// no two paths can release the same acquisition.
+func (o *Owner) takeLeaseLocked() func() {
+	o.cancelGraceLocked()
 	release := o.releaseSystem
 	o.acquired = false
 	o.releaseSystem = nil
 	return release
 }
 
-func (o *Owner) acquire(ctx context.Context) (func(), error) {
-	waited := false
-	notifyWait := func() {
-		if waited {
+// armGraceLocked schedules the bounded release that keeps a resident background
+// job from owning the workspace indefinitely. The callback re-checks the epoch
+// and participation because Timer.Stop loses the race with an already-running
+// callback, and because a run may start or the lease may be reacquired first.
+func (o *Owner) armGraceLocked() {
+	if o.graceAfter <= 0 || o.graceTimer != nil {
+		return
+	}
+	epoch := o.leaseEpoch
+	o.graceTimer = time.AfterFunc(o.graceAfter, func() {
+		o.mu.Lock()
+		if o.graceTimer == nil || o.leaseEpoch != epoch || !o.acquired || o.acquiring || o.activeRuns != 0 {
+			o.mu.Unlock()
 			return
 		}
-		waited = true
-		o.mu.Lock()
-		o.waiting = true
+		release := o.takeLeaseLocked()
 		o.mu.Unlock()
-		if o.onWait != nil {
-			o.onWait()
+		if release != nil {
+			release()
 		}
+	})
+}
+
+func (o *Owner) cancelGraceLocked() {
+	if o.graceTimer != nil {
+		o.graceTimer.Stop()
+		o.graceTimer = nil
+	}
+}
+
+// acquire tries filelock.TryAcquire, then waits via filelock.Acquire.
+// Contention flips waiting=true and fires the wait notice once.
+func (o *Owner) acquire(ctx context.Context) (func(), error) {
+	release, err := filelock.TryAcquire(o.lockPath)
+	if err == nil {
+		return release, nil
+	}
+	if !errors.Is(err, filelock.ErrHeld) {
+		return nil, fmt.Errorf("acquire workspace write lease: %w", err)
 	}
 
-	select {
-	case <-o.local.token:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-		notifyWait()
-		select {
-		case <-o.local.token:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	o.mu.Lock()
+	o.waiting = true
+	o.mu.Unlock()
+	if o.onWait != nil {
+		o.onWait()
 	}
-
-	releaseLocal := func() { o.local.token <- struct{}{} }
-	for {
-		releaseFile, err := tryLockFile(o.lockPath)
-		if err == nil {
-			return func() {
-				releaseFile()
-				releaseLocal()
-			}, nil
-		}
-		if !errors.Is(err, errHeld) {
-			releaseLocal()
-			return nil, fmt.Errorf("acquire workspace write lease: %w", err)
-		}
-		notifyWait()
-		timer := time.NewTimer(retryInterval)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			releaseLocal()
-			return nil, ctx.Err()
-		}
+	release, err = filelock.Acquire(ctx, o.lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("acquire workspace write lease: %w", err)
 	}
+	return release, nil
 }

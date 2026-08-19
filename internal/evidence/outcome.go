@@ -46,6 +46,12 @@ type OutcomeSample struct {
 	// eligibility is stamped on every arm so baselines carry the shadow.
 	GovernorEligible bool
 	GovernorEngaged  bool
+	// Runway fields are a telemetry-only counterfactual stamped by the outcome
+	// shadow. No runtime guard or provider-visible message reads them.
+	Runway      int
+	RunwayDry   int
+	RunwayIdle  int
+	RunwaySpent bool
 }
 
 // OutcomeTracker is the shadow counterpart of ProgressTracker: same per-round
@@ -65,6 +71,7 @@ type OutcomeTracker struct {
 	debtAge      int
 	blind        int
 	localExec    bool
+	runway       runwayShadow
 }
 
 // OutcomeSeed is the fork-portable slice of tracker state: what a
@@ -74,12 +81,20 @@ type OutcomeSeed struct {
 	DebtAge        int      `json:"debt_age"`
 	BlindMutations int      `json:"blind_mutations"`
 	LocalExecSeen  bool     `json:"local_exec_seen"`
+	RunwayBalance  int      `json:"runway_balance,omitempty"`
+	RunwayDry      int      `json:"runway_dry,omitempty"`
+	RunwayIdle     int      `json:"runway_idle,omitempty"`
+	RunwayObserved bool     `json:"runway_observed,omitempty"`
 }
 
 // ForkSeed exports the state a counterfactual fork must carry so post-fork
 // discriminating detection stays continuous with the original run.
 func (t *OutcomeTracker) ForkSeed() OutcomeSeed {
-	seed := OutcomeSeed{DebtAge: t.debtAge, BlindMutations: t.blind, LocalExecSeen: t.localExec}
+	seed := OutcomeSeed{
+		DebtAge: t.debtAge, BlindMutations: t.blind, LocalExecSeen: t.localExec,
+		RunwayBalance: t.runway.balance, RunwayDry: t.runway.dry,
+		RunwayIdle: t.runway.idle, RunwayObserved: t.runway.observed,
+	}
 	for base := range t.mutatedBases {
 		seed.MutatedBases = append(seed.MutatedBases, base)
 	}
@@ -99,6 +114,10 @@ func RestoreOutcomeTracker(seed OutcomeSeed) *OutcomeTracker {
 	t.blind = seed.BlindMutations
 	t.debt = seed.DebtAge > 0 || seed.BlindMutations > 0
 	t.localExec = seed.LocalExecSeen
+	t.runway = runwayShadow{
+		balance: seed.RunwayBalance, dry: seed.RunwayDry,
+		idle: seed.RunwayIdle, observed: seed.RunwayObserved,
+	}
 	return t
 }
 
@@ -143,6 +162,9 @@ func (t *OutcomeTracker) ScoreRound(receipts []Receipt) OutcomeSample {
 	s.DebtAge = t.debtAge
 	s.BlindMutations = t.blind
 	s.LocalExecSeen = t.localExec
+	runway := t.runway.observe(s)
+	s.Runway, s.RunwayDry, s.RunwayIdle, s.RunwaySpent =
+		runway.balance, runway.dry, runway.idle, runway.spent
 	return s
 }
 
@@ -173,7 +195,7 @@ func (t *OutcomeTracker) noteMutatedPaths(paths []string) {
 func (t *OutcomeTracker) commandExercisesMutation(command string) bool {
 	// Inspecting a mutated file (cat/grep/head) cannot falsify anything; only
 	// a command that can execute it discriminates.
-	if _, _, readOnly := shellsafe.CommandIsReadOnly(command); readOnly {
+	if !shellsafe.ClassifyBash(command).AnyMutation() {
 		return false
 	}
 	for base := range t.mutatedBases {
@@ -202,20 +224,34 @@ func (t *OutcomeTracker) scoreReceipt(r Receipt, s *OutcomeSample) {
 	case r.Success && (r.StepProof || r.TodoStep != nil || len(r.Todos) > 0):
 		// Bookkeeping moves no outcome dimension.
 	case r.Success && r.Read && r.OutputBytes > 0 && len(r.Paths) > 0:
+		fresh := 0
 		for _, path := range r.Paths {
 			if path == "" || t.readPaths[path] {
 				continue
 			}
 			t.readPaths[path] = true
-			s.Exploration++
+			fresh++
 		}
+		// A path already read can still answer a question never asked: a new
+		// grep pattern over the same package, the next window of a long file.
+		if newQuestion := t.noteQuestion(r); fresh == 0 && newQuestion {
+			fresh = 1
+		}
+		s.Exploration += fresh
 	case r.Success:
-		sig := r.ToolName + "\x00" + string(r.Args)
-		if !t.actions[sig] {
-			t.actions[sig] = true
+		if t.noteQuestion(r) {
 			s.Exploration++
 		}
 	}
+}
+
+func (t *OutcomeTracker) noteQuestion(r Receipt) bool {
+	sig := r.ToolName + "\x00" + string(r.Args)
+	if t.actions[sig] {
+		return false
+	}
+	t.actions[sig] = true
+	return true
 }
 
 func (t *OutcomeTracker) scoreCommand(command string, r Receipt, s *OutcomeSample) {
@@ -223,7 +259,7 @@ func (t *OutcomeTracker) scoreCommand(command string, r Receipt, s *OutcomeSampl
 		s.Churn++
 		t.noteMutatedPaths(r.Paths)
 	}
-	verify := IsDeliveryVerificationCommand(command)
+	verify := IsVerificationCommand(command)
 	if verify || t.commandExercisesMutation(command) {
 		s.Discriminating++
 	}

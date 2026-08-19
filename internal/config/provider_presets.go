@@ -97,7 +97,6 @@ var (
 
 	minimaxMSeriesModels       = []string{"MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"}
 	minimaxMSeriesVisionModels = []string{"MiniMax-M3"}
-	deepSeekResponsesModels    = []string{"deepseek-v4-flash"}
 
 	glmAPIModels       = []string{"glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"}
 	glmAPIVisionModels = []string{"glm-5v-turbo"}
@@ -110,6 +109,16 @@ var (
 	qwenPlanVisionModels = []string{"qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus", "kimi-k2.5"}
 
 	stepfunPlanModels = []string{"step-3.7-flash", "step-3.5-flash", "step-3.5-flash-2603"}
+
+	// Only step-3.7-flash is enabled server-side on the Responses API
+	// ("this model is not enabled for the Responses API" for 3.5 SKUs).
+	stepfunResponsesModels = []string{"step-3.7-flash"}
+
+	// The pay-as-you-go channel serves the same reasoning SKUs; 3.7-flash
+	// additionally accepts image input there (verified live), while the
+	// step_plan channel rejects images outright.
+	stepfunAPIModels       = []string{"step-3.7-flash", "step-3.5-flash", "step-3.5-flash-2603"}
+	stepfunAPIVisionModels = []string{"step-3.7-flash"}
 
 	legacyOpenCodeGoModels           = []string{"glm-5.2", "glm-5.1", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-pro", "deepseek-v4-flash", "mimo-v2.5-pro", "mimo-v2.5"}
 	opencodeGoModels                 = []string{"glm-5.2", "glm-5.1", "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "deepseek-v4-pro", "deepseek-v4-flash", "mimo-v2.5-pro", "mimo-v2.5"}
@@ -194,21 +203,18 @@ var curatedProviderPresets = []ProviderPreset{
 		Description: "Separate official DeepSeek Anthropic-compatible entry for Flash and Pro.",
 		KeyEnv:      "DEEPSEEK_API_KEY",
 		Entries: []ProviderEntry{{
-			Name:          "deepseek-anthropic",
-			Kind:          "anthropic",
-			BaseURL:       deepSeekAnthropicBaseURL,
-			Models:        deepSeekV4Models,
-			Default:       "deepseek-v4-flash",
-			APIKeyEnv:     "DEEPSEEK_API_KEY",
-			BalanceURL:    "https://api.deepseek.com/user/balance",
-			Thinking:      "enabled",
-			WebSearch:     boolPointer(true),
-			ContextWindow: 1_000_000,
-			Prices:        deepSeekV4PricesUSD(),
-			ModelOverrides: map[string]ProviderModelOverride{
-				"deepseek-v4-flash": {SupportedEfforts: []string{"disabled", "low", "high", "max"}, DefaultEffort: "high"},
-				"deepseek-v4-pro":   {SupportedEfforts: []string{"disabled", "high", "max"}, DefaultEffort: "high"},
-			},
+			Name:           "deepseek-anthropic",
+			Kind:           "anthropic",
+			BaseURL:        deepSeekAnthropicBaseURL,
+			Models:         deepSeekV4Models,
+			Default:        "deepseek-v4-flash",
+			APIKeyEnv:      "DEEPSEEK_API_KEY",
+			BalanceURL:     "https://api.deepseek.com/user/balance",
+			Thinking:       "enabled",
+			WebSearch:      boolPointer(true),
+			ContextWindow:  1_000_000,
+			Prices:         deepSeekV4PricesUSD(),
+			ModelOverrides: deepSeekV4EffortOverrides(),
 		}},
 	},
 	{
@@ -545,22 +551,21 @@ var curatedProviderPresets = []ProviderPreset{
 	{
 		ID:          "deepseek-responses",
 		Label:       "DeepSeek Official Responses API",
-		Description: "Official stateless DeepSeek Responses API for Flash with server-side web search.",
+		Description: "Official stateless DeepSeek Responses API for Flash and Pro with server-side web search.",
 		KeyEnv:      "DEEPSEEK_API_KEY",
 		Entries: []ProviderEntry{{
-			Name:             "deepseek-responses",
-			Kind:             "responses",
-			BaseURL:          "https://api.deepseek.com",
-			Models:           deepSeekResponsesModels,
-			Default:          "deepseek-v4-flash",
-			APIKeyEnv:        "DEEPSEEK_API_KEY",
-			BalanceURL:       "https://api.deepseek.com/user/balance",
-			ContextWindow:    1_000_000,
-			Price:            deepSeekV4FlashPriceUSD(),
-			ResponsesMode:    "stateless",
-			WebSearch:        boolPointer(true),
-			SupportedEfforts: []string{"low", "high", "max"},
-			DefaultEffort:    "high",
+			Name:           "deepseek-responses",
+			Kind:           "responses",
+			BaseURL:        "https://api.deepseek.com",
+			Models:         deepSeekV4Models,
+			Default:        "deepseek-v4-flash",
+			APIKeyEnv:      "DEEPSEEK_API_KEY",
+			BalanceURL:     "https://api.deepseek.com/user/balance",
+			ContextWindow:  1_000_000,
+			Prices:         deepSeekV4PricesUSD(),
+			ResponsesMode:  "stateless",
+			WebSearch:      boolPointer(true),
+			ModelOverrides: deepSeekV4EffortOverrides(),
 		}},
 	},
 	{
@@ -675,7 +680,7 @@ var curatedProviderPresets = []ProviderPreset{
 			Default:       "glm-5.2",
 			APIKeyEnv:     "OPENCODE_GO_API_KEY",
 			ContextWindow: 128000,
-			ModelOverrides: map[string]ProviderModelOverride{
+			ModelOverrides: withOpenCodeGoChatContextOverrides(map[string]ProviderModelOverride{
 				"deepseek-v4-flash": {
 					ReasoningProtocol: ReasoningProtocolDeepSeek,
 					SupportedEfforts:  []string{"disabled", "high", "max"},
@@ -700,9 +705,8 @@ var curatedProviderPresets = []ProviderPreset{
 					ReasoningProtocol: ReasoningProtocolOpenAI,
 					SupportedEfforts:  []string{"high", "max"},
 					DefaultEffort:     "max",
-					ContextWindow:     1_048_576,
 				},
-			},
+			}),
 		}},
 	},
 	opencodeGoAnthropicPreset,
@@ -848,6 +852,23 @@ var curatedProviderPresets = []ProviderPreset{
 		}},
 	},
 	{
+		ID:          "stepfun-responses",
+		Label:       "StepFun Responses API",
+		Description: "StepFun Responses API endpoint with reasoning effort and tool calls (step-3.7-flash).",
+		KeyEnv:      "STEPFUN_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:             "stepfun-responses",
+			Kind:             "responses",
+			BaseURL:          "https://api.stepfun.com/v1",
+			Models:           stepfunResponsesModels,
+			Default:          "step-3.7-flash",
+			APIKeyEnv:        "STEPFUN_API_KEY",
+			ResponsesMode:    "stateless",
+			SupportedEfforts: []string{"low", "medium", "high"},
+			DefaultEffort:    "medium",
+		}},
+	},
+	{
 		ID:          "stepfun-anthropic",
 		Label:       "StepFun Anthropic",
 		Description: "StepFun coding-plan Anthropic-compatible endpoint.",
@@ -857,6 +878,40 @@ var curatedProviderPresets = []ProviderPreset{
 			Kind:             "anthropic",
 			BaseURL:          "https://api.stepfun.com/step_plan",
 			Models:           stepfunPlanModels,
+			Default:          "step-3.7-flash",
+			APIKeyEnv:        "STEPFUN_API_KEY",
+			Thinking:         "adaptive",
+			SupportedEfforts: []string{"low", "medium", "high"},
+			DefaultEffort:    "medium",
+		}},
+	},
+	{
+		ID:          "stepfun-api",
+		Label:       "StepFun API Pay-as-you-go",
+		Description: "StepFun pay-as-you-go OpenAI-compatible API with vision on step-3.7-flash.",
+		KeyEnv:      "STEPFUN_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:             "stepfun-api",
+			Kind:             "openai",
+			BaseURL:          "https://api.stepfun.com/v1",
+			Models:           stepfunAPIModels,
+			VisionModels:     stepfunAPIVisionModels,
+			Default:          "step-3.7-flash",
+			APIKeyEnv:        "STEPFUN_API_KEY",
+			SupportedEfforts: []string{"low", "medium", "high"},
+			DefaultEffort:    "medium",
+		}},
+	},
+	{
+		ID:          "stepfun-api-anthropic",
+		Label:       "StepFun API Anthropic Pay-as-you-go",
+		Description: "StepFun pay-as-you-go Anthropic-compatible Messages API with automatic prefix caching.",
+		KeyEnv:      "STEPFUN_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:             "stepfun-api-anthropic",
+			Kind:             "anthropic",
+			BaseURL:          "https://api.stepfun.com",
+			Models:           stepfunAPIModels,
 			Default:          "step-3.7-flash",
 			APIKeyEnv:        "STEPFUN_API_KEY",
 			Thinking:         "adaptive",
