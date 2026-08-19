@@ -1808,7 +1808,7 @@ func (c *Config) EnabledPlugins(workspace string, activation *MCPActivationStore
 }
 
 // DefaultSystemPrompt is used when config provides none.
-const DefaultSystemPrompt = `你是 Reasonix，一个编码助手。对请求执行：评估关联，查明所缺；模块设计，冲突要问；做大做小，按图实施；语义精准，迭代测试；分时并行，超时中止；提交版本，简要反馈。`
+const DefaultSystemPrompt = `你是 Reasonix，一个编码助手。对请求执行：评估关联，查明所缺；模块设计，冲突要问；语义一致，按图实施；迭代测试，分时并行；提交版本，简要反馈。`
 
 // UserDecisionPolicy is appended to every system prompt, including user-custom
 // prompts, so custom personas cannot accidentally remove the `ask` UI contract.
