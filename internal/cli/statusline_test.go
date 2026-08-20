@@ -149,8 +149,11 @@ func TestYoloStatuslineUsesDangerPill(t *testing.T) {
 
 	content := renderStatuslineView(t, true)
 	plain := bottomStatusPlain(content)
-	if !strings.Contains(plain, "YOLO") || !strings.Contains(plain, "approvals skipped") || !strings.Contains(plain, "Shift+Tab ask/auto/plan · Ctrl+Y YOLO") {
-		t.Fatalf("YOLO status line missing warning text:\n%s", plain)
+	if !strings.Contains(plain, "YOLO") || !strings.Contains(plain, "Shift+Tab ask/auto/plan · Ctrl+Y YOLO") {
+		t.Fatalf("YOLO status line missing mode or hint text:\n%s", plain)
+	}
+	if strings.Contains(plain, "approvals skipped") {
+		t.Fatalf("YOLO status line should no longer render 'tool approvals skipped':\n%s", plain)
 	}
 	if strings.Contains(plain, "[YOLO]") {
 		t.Fatalf("YOLO status line should use a pill label, not bracketed tag:\n%s", plain)
