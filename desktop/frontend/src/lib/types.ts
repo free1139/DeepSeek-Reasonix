@@ -374,6 +374,10 @@ export interface WireCompletionSummary {
   review: string;
   gap_kinds?: string[];
   constraint_degraded: boolean;
+  /** Turn-time policy floor. Missing on historical events. */
+  floor?: "standard" | "delivery" | string;
+  /** Backend decision; authoritative when floor is present. */
+  attention?: boolean;
 }
 
 export type WorkspaceWatchState = "active" | "degraded" | "unavailable";
@@ -1953,8 +1957,8 @@ export interface BackgroundRuntimeView {
 
 export interface WorkspaceConflictView {
   state: "none" | "local" | "external";
-  ownerTabId?: string;
-  ownerTitle?: string;
+  ownerTabId?: string; ownerTitle?: string;
+  ownerScope?: string; ownerLabel?: string;
   ownerWork: ActiveWorkView;
   canReveal: boolean;
   canCreateWorktree: boolean;
@@ -2022,6 +2026,10 @@ export interface BotAllowlistView {
   qqGroups: string[];
   feishuGroups: string[];
   weixinGroups: string[];
+  dingtalkUsers: string[];
+  dingtalkApprovers: string[];
+  dingtalkAdmins: string[];
+  dingtalkGroups: string[];
 }
 
 export interface BotAccessView {
@@ -2038,6 +2046,7 @@ export interface BotSelfUserIDsView {
   qq: string[];
   feishu: string[];
   weixin: string[];
+  dingtalk: string[];
 }
 
 export interface BotPairingView {
@@ -2096,6 +2105,19 @@ export interface WeixinBotView {
   apiBase: string;
 }
 
+export interface DingtalkBotView {
+  enabled: boolean;
+  clientId: string;
+  clientSecretEnv: string;
+  secretSet: boolean;
+  botName: string;
+  requireMention: boolean;
+  model: string;
+  toolApprovalMode: string;
+  workspaceRoot: string;
+  access: BotAccessView;
+}
+
 export interface BotConnectionCredentialView {
   appId: string;
   appSecretEnv: string;
@@ -2152,6 +2174,7 @@ export interface BotSettingsView {
   qq: QQBotView;
   feishu: FeishuBotView;
   weixin: WeixinBotView;
+  dingtalk: DingtalkBotView;
   connections: BotConnectionView[];
 }
 
@@ -2161,6 +2184,7 @@ export interface BotRuntimeStatusView {
   message: string;
   connections: number;
   startedAt: string;
+  platforms: Record<string, string>;
 }
 
 export interface BotInstallStartResult {

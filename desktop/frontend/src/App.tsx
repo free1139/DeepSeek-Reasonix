@@ -109,8 +109,10 @@ import {
   type QualityFloor,
   type TabMeta,
   type ToolApprovalMode,
+  type WireCompletionSummary,
   type WorkspaceConflictView,
 } from "./lib/types";
+import type { WorkspaceVerificationRevealRequest } from "./components/WorkspacePanel";
 import type { InvocationMetadataMap, StructuredInvocationSubmit } from "./lib/invocationDisplay";
 import type { RewindUndoState } from "./lib/rewindTypes";
 import { formatSelectionReference, type SelectedTextInsertRequest } from "./lib/selectedTextContext";
@@ -2933,6 +2935,22 @@ export default function App() {
     [openWorkspacePanel],
   );
 
+  const verificationRevealSequenceRef = useRef(0);
+  const [verificationRevealRequest, setVerificationRevealRequest] = useState<WorkspaceVerificationRevealRequest | null>(null);
+  const openTurnVerification = useCallback((summary: WireCompletionSummary) => {
+    openRightDockMode("changed");
+    verificationRevealSequenceRef.current += 1;
+    setVerificationRevealRequest({
+      id: verificationRevealSequenceRef.current,
+      summary,
+      tabId: activeTabId ?? "",
+      turnStartAt: state.turnStartAt,
+      currentSummary: state.completionSummary,
+    });
+  }, [activeTabId, openRightDockMode, state.completionSummary, state.turnStartAt]);
+
+  useEffect(() => { setVerificationRevealRequest(null); }, [activeTabId, state.completionSummary, state.turnStartAt]);
+
   const toggleTerminalPanel = useCallback(() => {
     setTerminalPanelOpen((prev) => {
       const next = !prev;
@@ -3399,6 +3417,9 @@ export default function App() {
     !transcriptHydrating &&
     !hydratePlaceholderActive;
   const transcriptItems = hydratePlaceholderActive ? state.hydratePlaceholderItems! : state.items;
+  const handleLoadOlderHistory = useCallback((targetTurn?: number) => (
+    activeTabId ? loadOlderHistory(activeTabId, targetTurn) : Promise.resolve(false)
+  ), [activeTabId, loadOlderHistory]);
 
   // Display items: backend history is authoritative after immediate commit.
   // rewindState only drives the undo banner, not optimistic truncation.
@@ -4853,6 +4874,7 @@ export default function App() {
                   onDeliveryContinue={() => void handleDeliveryContinue()}
                   onAcceptDelivery={() => void app.AcceptDeliveryToTab(activeTabIdRef.current ?? "")}
                   onOpenChanges={() => openRightDockMode("changed")}
+                  onOpenVerification={openTurnVerification}
                   onEditPrompt={handleEditPrompt}
                   onRewind={handleMessageAction}
                   checkpoints={state.checkpoints}
@@ -4860,6 +4882,7 @@ export default function App() {
                   rewindDisabled={Boolean(activeTab?.readOnly) || !controllerReady || hydratePlaceholderActive || rewindState != null || rewindCommitting || state.running || state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
                   running={state.running || rewindCommitting}
                   turnStartAt={state.turnStartAt}
+                  contentRevision={state.historyLayoutRevision}
                   welcomeVariant={sidebarCreation ? "creation" : "default"}
                   creationMode={sidebarCreation}
                   actionHoverMenus={sidebarCreation && !hydratePlaceholderActive && !runtimeTransitioning}
@@ -4867,9 +4890,11 @@ export default function App() {
                   revealSignal={transcriptRevealSignal}
                   hydrating={runtimeTransitioning || transcriptHydrating}
                   hasOlderHistory={!runtimeTransitioning && state.historyHasOlder && !rewindState}
-                  olderHistoryCount={state.historyStartTurn}
+                  historyStartTurn={state.historyStartTurn}
+                  historyTotalTurns={state.historyTotalTurns}
                   loadingOlderHistory={state.historyOlderLoading}
-                  onLoadOlderHistory={() => activeTabId && loadOlderHistory(activeTabId)}
+                  olderHistoryError={state.historyOlderError}
+                  onLoadOlderHistory={handleLoadOlderHistory}
                   invocationMetadata={activeTabId ? invocationMetadataByTab[activeTabId] : undefined}
                 />
                 {!runtimeTransitioning && state.hydrateError ? <div className="history-load-error" role="alert"><span>{state.hydrateError}</span><button type="button" className="btn btn--small" onClick={() => void retrySessionHistory(activeTabId)}>{t("common.retry")}</button></div> : null}
@@ -4986,7 +5011,7 @@ export default function App() {
                 title={t("runtime.workspaceConflictTitle")}
                 badge={t("runtime.workspaceConflictBadge")}
                 meta={workspaceConflict.state === "local"
-                  ? t("runtime.workspaceConflictLocal", { title: workspaceConflict.ownerTitle || t("runtime.unknownTask") })
+                  ? t("runtime.workspaceConflictLocal", { title: workspaceConflict.ownerTitle || t("runtime.unknownTask"), label: workspaceConflict.ownerLabel || t("workspace.title") })
                   : t("runtime.workspaceConflictExternal")}
                 note={t("runtime.workspaceConflictNote")}
                 onCancel={() => {
@@ -5253,6 +5278,9 @@ export default function App() {
                     onOpenInTerminal={openTerminalForPath}
                     initialViewMode={rightDockMode === "changed" ? "changed" : "files"}
                     completionSummary={state.completionSummary}
+                    turnStartAt={state.turnStartAt}
+                    verificationRevealRequest={verificationRevealRequest}
+                    qualityFloor={composerProfile.qualityFloor}
                     showViewTabs={false}
                     creationMode={sidebarCreation}
                   />

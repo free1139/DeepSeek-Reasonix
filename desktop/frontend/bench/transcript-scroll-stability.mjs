@@ -488,16 +488,13 @@ try {
   assert(beforeGrowth.anchorKey && beforeGrowth.grownKey, "bench exposes a visible anchor and mounted dynamic row above it");
 
   const gestureStart = beforeGrowth.top;
-  await transcript.evaluate((element) => {
-    const viewport = element.getBoundingClientRect();
-    const rows = [...element.querySelectorAll(".transcript__row")];
-    const visible = rows
-      .filter((row) => row.getBoundingClientRect().bottom > viewport.top && row.getBoundingClientRect().top < viewport.bottom)
-      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
-    const above = rows
-      .filter((row) => row.getBoundingClientRect().bottom <= viewport.top)
-      .sort((left, right) => right.getBoundingClientRect().bottom - left.getBoundingClientRect().bottom)[0];
-    if (above instanceof HTMLElement) above.style.paddingBottom = `${Number.parseFloat(above.style.paddingBottom || "0") + 1200}px`;
+  await transcript.evaluate((element, grownKey) => {
+    const above = [...element.querySelectorAll(".transcript__row")]
+      .find((row) => row.dataset.rowKey === grownKey);
+    if (above instanceof HTMLElement) {
+      above.dataset.growthReplayBasePadding = above.style.paddingBottom;
+      above.style.paddingBottom = `${Number.parseFloat(above.style.paddingBottom || "0") + 1200}px`;
+    }
     window.__reasonixScrollSamples = [];
     const sample = () => {
       const currentRows = [...element.querySelectorAll(".transcript__row")];
@@ -510,7 +507,7 @@ try {
     };
     element.addEventListener("scroll", sample, { passive: true });
     sample();
-  });
+  }, beforeGrowth.grownKey);
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   const afterGrowth = await transcript.evaluate((element) => ({
     top: element.scrollTop,
@@ -518,6 +515,120 @@ try {
   }));
   assert(afterGrowth.top >= gestureStart - 2, `dynamic measurement never reverses an upward gesture into a multi-screen jump (${gestureStart} → ${afterGrowth.top})`);
   assert(afterGrowth.samples.every((sample) => sample.occupied), "dynamic measurement never exposes a blank transcript viewport");
+  await transcript.evaluate((element, grownKey) => {
+    const grown = [...element.querySelectorAll(".transcript__row")]
+      .find((row) => row.dataset.rowKey === grownKey);
+    if (!(grown instanceof HTMLElement)) return;
+    grown.style.paddingBottom = grown.dataset.growthReplayBasePadding || "";
+    delete grown.dataset.growthReplayBasePadding;
+  }, beforeGrowth.grownKey);
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+  // Replay the returned 146-row Windows failure with real DOM geometry. A
+  // downward wheel lands while the tail extent briefly loses 2,500px and regains
+  // it 50ms later. Native clamping may move for the collapsed frame, but the
+  // rebound must restore the user's logical direction without blank recovery.
+  await transcript.evaluate((element) => {
+    element.dataset.extentReplayOverflowAnchor = element.style.overflowAnchor;
+    element.style.overflowAnchor = "none";
+    element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight - 500);
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await page.waitForTimeout(100);
+  await transcript.evaluate((element) => new Promise((resolve) => {
+    const style = document.createElement("style");
+    style.id = "reader-extent-replay-style";
+    style.textContent = '.transcript[data-extent-replay-expanded="true"] > [data-viewport-type="element"]::after { content: ""; display: block; height: 2500px; }';
+    document.head.append(style);
+    element.dataset.extentReplayExpanded = "true";
+    let stableFrames = 0;
+    let previousHeight = element.scrollHeight;
+    const settle = () => {
+      const currentHeight = element.scrollHeight;
+      stableFrames = Math.abs(currentHeight - previousHeight) <= 0.5 ? stableFrames + 1 : 0;
+      previousHeight = currentHeight;
+      if (stableFrames >= 4) {
+        resolve();
+        return;
+      }
+      requestAnimationFrame(settle);
+    };
+    requestAnimationFrame(settle);
+  }));
+  await page.waitForTimeout(100);
+  await moveToOuterReaderGutter(page, transcript);
+  const beforeExtentReplay = await transcript.evaluate((element) => {
+    const viewport = element.getBoundingClientRect();
+    const rows = [...element.querySelectorAll(".transcript__row")];
+    const visible = rows
+      .filter((row) => row.getBoundingClientRect().bottom > viewport.top && row.getBoundingClientRect().top < viewport.bottom)
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
+    const anchor = visible.find((row) => row.getBoundingClientRect().top >= viewport.top) ?? visible[0];
+    window.__readerExtentProbe = { writes: [], samples: [], done: false };
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = (write) => window.__readerExtentProbe.writes.push(write);
+    const sample = () => {
+      const current = document.querySelector(".transcript");
+      if (!(current instanceof HTMLElement)) return;
+      const rect = current.getBoundingClientRect();
+      const occupied = [...current.querySelectorAll(".transcript__row")].some((row) => {
+        const rowRect = row.getBoundingClientRect();
+        return rowRect.bottom > rect.top && rowRect.top < rect.bottom;
+      });
+      window.__readerExtentProbe.samples.push({ top: current.scrollTop, height: current.scrollHeight, occupied });
+      if (!window.__readerExtentProbe.done) requestAnimationFrame(sample);
+    };
+    element.addEventListener("wheel", () => requestAnimationFrame(() => {
+      delete element.dataset.extentReplayExpanded;
+      const collapsedTop = Math.max(0, element.scrollTop - 2_000);
+      element.scrollTop = collapsedTop;
+      setTimeout(() => {
+        element.dataset.extentReplayExpanded = "true";
+        // Chromium restores its own scroll anchor on macOS. Keep the returned
+        // WebView2 trace's clamped landing so this replay exercises our guard.
+        element.scrollTop = collapsedTop;
+      }, 50);
+    }), { capture: true, once: true });
+    requestAnimationFrame(sample);
+    return {
+      top: element.scrollTop,
+      anchorKey: anchor?.dataset.rowKey ?? null,
+      anchorOffset: anchor ? anchor.getBoundingClientRect().top - viewport.top : null,
+    };
+  });
+  assert(beforeExtentReplay.anchorKey, "extent replay starts from a visible logical anchor");
+  await page.mouse.wheel(0, 133);
+  await page.waitForTimeout(260);
+  const afterExtentReplay = await transcript.evaluate((element, before) => {
+    window.__readerExtentProbe.done = true;
+    window.__REASONIX_TRANSCRIPT_SCROLL_WRITE__ = undefined;
+    element.style.overflowAnchor = element.dataset.extentReplayOverflowAnchor || "";
+    delete element.dataset.extentReplayOverflowAnchor;
+    const anchor = [...element.querySelectorAll(".transcript__row")]
+      .find((row) => row.dataset.rowKey === before.anchorKey);
+    return {
+      top: element.scrollTop,
+      anchorOffset: anchor ? anchor.getBoundingClientRect().top - element.getBoundingClientRect().top : null,
+      writes: window.__readerExtentProbe.writes,
+      samples: window.__readerExtentProbe.samples,
+      mode: element.dataset.scrollMode,
+    };
+  }, beforeExtentReplay);
+  const readerStabilityWrites = afterExtentReplay.writes.filter((write) => write.owner === "reader-stability");
+  const preservedDirection = afterExtentReplay.top >= beforeExtentReplay.top - 2;
+  assert(preservedDirection, preservedDirection
+    ? `transient extent rebound cannot reverse a downward wheel (${beforeExtentReplay.top} → ${afterExtentReplay.top})`
+    : `transient extent rebound cannot reverse a downward wheel (${beforeExtentReplay.top} → ${afterExtentReplay.top}; anchor=${beforeExtentReplay.anchorOffset}→${afterExtentReplay.anchorOffset}; mode=${afterExtentReplay.mode}; writes=${JSON.stringify(afterExtentReplay.writes)}; samples=${JSON.stringify(afterExtentReplay.samples)})`);
+  assert(readerStabilityWrites.length === 1, readerStabilityWrites.length === 1
+    ? "transient extent rebound uses one bounded reader-stability write"
+    : `transient extent rebound uses one bounded reader-stability write (${readerStabilityWrites.length}; ${JSON.stringify(afterExtentReplay.samples)})`);
+  assert(afterExtentReplay.writes.every((write) => write.owner !== "recovery"),
+    "nonblank extent rebound never enters blank recovery");
+  assert(afterExtentReplay.samples.every((sample) => sample.occupied),
+    "transient extent rebound keeps mounted coverage in every sampled frame");
+  await transcript.evaluate((element) => {
+    delete element.dataset.extentReplayExpanded;
+    document.getElementById("reader-extent-replay-style")?.remove();
+  });
 
   // Rapid direction changes are the exact user report. Sample every frame and
   // require that Virtuoso always maintains mounted coverage. Keep a real
@@ -587,8 +698,8 @@ try {
   // A native scrollbar thumb drag owns the browser's scroll range. Keep
   // Virtuoso's estimated size tree fixed until pointer release so newly
   // visited variable-height rows cannot resize the thumb under the pointer.
-  // This is deliberately pointer-gutter-specific; the wheel assertions above
-  // continue to exercise ordinary chat-content scrolling and live measuring.
+  // Browser themes clamp the held thumb only after the pointer crosses the
+  // track end, so the target below deliberately overshoots the visible gutter.
   await transcript.evaluate((element) => {
     element.scrollTop = 0;
     element.dispatchEvent(new Event("scroll"));
@@ -604,7 +715,7 @@ try {
     return {
       x: Math.min(rect.right - 1, contentRight + Math.max(1, (rect.right - contentRight) / 2)),
       y: rect.top + 5,
-      bottomY: rect.bottom - 5,
+      bottomY: Math.min(window.innerHeight - 1, rect.bottom + Math.max(24, rect.height * 0.1)),
       knownSize: Number.parseFloat(row.dataset.knownSize || "0"),
       gutter: rect.right - contentRight,
       scrollHeight: element.scrollHeight,
@@ -971,7 +1082,7 @@ try {
   // frames before watching the idle tail. A single bottom sample can race a
   // late markdown/row remeasurement on loaded CI runners and contaminate the
   // idle probe with legitimate convergence motion.
-  await waitForStableTranscriptGeometry(reducedPage, { requireTail: true });
+  await waitForStableTranscriptGeometry(reducedPage, { timeout: 30_000, requireTail: true });
   const reducedIdle = await reducedPage.evaluate(() => new Promise((resolve) => {
     const element = document.querySelector(".transcript");
     const writes = [];
@@ -1020,16 +1131,26 @@ try {
     `reduced-motion tail rests on the physical bottom (${reducedIdle.finalDistance}px)`,
   );
   // The #9089 gesture: wheel up, wheel back to the bottom, release, idle.
-  await moveToOuterReaderGutter(reducedPage, reducedPage.locator(".transcript"));
+  const reducedTranscript = reducedPage.locator(".transcript");
+  const reducedBottomTop = await reducedTranscript.evaluate((element) => element.scrollTop);
+  await moveToOuterReaderGutter(reducedPage, reducedTranscript);
   await reducedPage.mouse.wheel(0, -900);
-  await reducedPage.waitForTimeout(120);
-  await reducedPage.mouse.wheel(0, 100_000);
-  await reducedPage.waitForFunction(() => {
+  await reducedPage.waitForFunction((bottomTop) => {
     const element = document.querySelector(".transcript");
     return element instanceof HTMLElement
-      && element.dataset.scrollMode === "tail-follow"
-      && element.scrollHeight - element.scrollTop - element.clientHeight <= 4;
-  }, undefined, { timeout: 10_000 });
+      && element.dataset.scrollMode === "manual"
+      && element.scrollTop < bottomTop - 1
+      && element.scrollHeight - element.scrollTop - element.clientHeight > 4;
+  }, reducedBottomTop, { timeout: 5_000 });
+  let reducedReachedBottom = false;
+  for (let attempt = 0; attempt < 20 && !reducedReachedBottom; attempt += 1) {
+    await reducedPage.mouse.wheel(0, 640);
+    await reducedPage.waitForTimeout(50);
+    reducedReachedBottom = await reducedTranscript.evaluate((element) =>
+      element.dataset.scrollMode === "tail-follow"
+      && element.scrollHeight - element.scrollTop - element.clientHeight <= 4);
+  }
+  assert(reducedReachedBottom, "reduced-motion repeated downward wheels return to the physical bottom (#9089)");
   const reducedReturn = await reducedPage.evaluate(() => new Promise((resolve) => {
     const element = document.querySelector(".transcript");
     const tops = [];

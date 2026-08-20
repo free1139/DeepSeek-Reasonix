@@ -30,6 +30,7 @@ import (
 	"reasonix/internal/provider"
 	"reasonix/internal/runtimepolicy"
 	"reasonix/internal/sandbox"
+	"reasonix/internal/sessiontemp"
 	"reasonix/internal/shellparse"
 	"reasonix/internal/taskcontract"
 	"reasonix/internal/tool"
@@ -953,6 +954,8 @@ type Options struct {
 	WriteScheduler *SubagentScheduler
 	// WriteWorkspaceRoot normalizes parent write reservations.
 	WriteWorkspaceRoot string
+	// SessionTemp owns the exact private scratch root for delivery accounting.
+	SessionTemp *sessiontemp.Manager
 	// WriteRoots is the session-scoped writable directory manager.
 	WriteRoots *sandbox.WritableRootSet
 	// WriteAccessGate authorizes extra writable directories. nil is fail-closed
@@ -1237,8 +1240,8 @@ func (a *Agent) Run(ctx context.Context, input string) (runErr error) {
 	runMaxSteps := a.maxSteps
 	runMaxStepsKey := a.maxStepsKey
 	a.recovery.runSeq.Add(1)
-	// All role settings participate in the workspace lease for the run; the
-	// exclusive write lock is still acquired lazily on the first real writer.
+	// All role settings participate in the workspace lease for the run; write
+	// locks are acquired per mutating tool and released when that tool ends.
 	if a.svc.workspaceLease != nil {
 		a.svc.workspaceLease.BeginRun()
 		defer a.svc.workspaceLease.EndRun()

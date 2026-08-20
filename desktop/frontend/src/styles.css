@@ -3477,6 +3477,22 @@ a[href] {
   margin-left: auto;
   margin-right: auto;
 }
+.transcript__older-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 36px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+.transcript__older-status .btn {
+  flex-shrink: 0;
+}
+.transcript__older-spinner {
+  flex-shrink: 0;
+  animation: spin 0.8s linear infinite;
+}
 .transcript-selection-overlay {
   position: absolute;
   inset: 0;
@@ -3881,40 +3897,26 @@ a[href] {
   animation: jump-bar-in 0.18s ease-out 0.08s forwards;
 }
 .jump-scroll {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  max-height: 100%;
-  padding: 8px 0;
-  overflow-y: auto;
+  position: relative;
+  width: 32px;
+  height: 100%;
   cursor: pointer;
   pointer-events: auto;
-  scrollbar-width: none;
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 16%, #000 84%, transparent 100%);
-  mask-image: linear-gradient(to bottom, transparent 0%, #000 16%, #000 84%, transparent 100%);
-}
-.jump-scroll::-webkit-scrollbar {
-  display: none;
+  outline: none;
 }
 .jump-item {
-  position: relative;
+  position: absolute;
+  left: 0;
   display: flex;
-  flex-shrink: 0;
   align-items: center;
   justify-content: flex-end;
   width: 32px;
-  min-height: 14px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  cursor: pointer;
+  height: 3px;
+  transform: translateY(-50%);
   pointer-events: none;
 }
-.jump-item:focus {
-  outline: none;
-}
-.jump-item:focus-visible .jump-dot {
+.jump-scroll:focus-visible {
+  border-radius: 4px;
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .jump-dot {
@@ -3926,6 +3928,15 @@ a[href] {
     background 200ms,
     width 400ms cubic-bezier(0.34, 1.56, 0.64, 1),
     box-shadow 150ms;
+}
+.jump-scroll[data-density="compact"] .jump-dot {
+  height: 2px;
+}
+.jump-scroll[data-density="packed"] .jump-dot {
+  height: 1px;
+}
+.jump-item[data-loaded="false"] .jump-dot {
+  background: color-mix(in srgb, var(--border) 55%, transparent);
 }
 .jump-dot[data-d="0"] {
   background: var(--accent);
@@ -10245,6 +10256,7 @@ body > .mermaid-diagram--fullscreen {
   min-width: 0;
   min-height: 0;
   max-width: none;
+  max-height: none;
   margin: 0;
   border: 0;
   border-radius: 0;
@@ -10333,6 +10345,9 @@ body > .mermaid-diagram--fullscreen {
 .workspace-completion-summary--attention {
   border-color: color-mix(in srgb, var(--warn) 35%, var(--border-soft));
 }
+.workspace-completion-summary {
+  cursor: default;
+}
 .workspace-completion-summary__head,
 .workspace-completion-summary__metrics,
 .workspace-completion-summary__details {
@@ -10340,9 +10355,11 @@ body > .mermaid-diagram--fullscreen {
   flex-wrap: wrap;
   gap: 4px 8px;
 }
-.workspace-completion-summary__head strong {
-  margin-right: auto;
+.workspace-completion-summary__title {
+  margin: 0 auto 0 0;
   color: var(--fg);
+  font: inherit;
+  font-weight: 650;
 }
 .workspace-completion-summary__metrics {
   margin-top: 6px;
@@ -11887,6 +11904,13 @@ body > .mermaid-diagram--fullscreen {
   border-color: var(--accent);
   outline: none;
   box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.provider-name-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.mem-hint.provider-name-readonly-hint {
+  color: var(--fg-dim);
 }
 .mem-input {
   flex: 1;
@@ -18340,8 +18364,7 @@ body > .mermaid-diagram--fullscreen {
   min-width: 0;
 }
 .bot-channel-entry__icon,
-.bot-channel-entry-card__icon,
-.bot-channel-tab__icon {
+.bot-channel-entry-card__icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -18531,8 +18554,20 @@ body > .mermaid-diagram--fullscreen {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 .bot-channel-tab__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
   width: 44px;
   height: 44px;
+  color: var(--fg-muted);
+}
+.bot-channel-tab__icon .bot-channel-tab__brand {
+  width: 24px;
+  height: 24px;
+}
+.bot-channel-tab--active .bot-channel-tab__icon {
+  color: var(--accent);
 }
 .bot-channel-tab__text {
   display: grid;
@@ -18563,7 +18598,7 @@ body > .mermaid-diagram--fullscreen {
   background: var(--fg-muted);
 }
 .bot-channel-tab__dot--configured {
-  background: var(--warn);
+  background: var(--ok);
 }
 .bot-channel-tab__dot--online {
   background: var(--ok);
@@ -18964,6 +18999,7 @@ body > .mermaid-diagram--fullscreen {
   line-height: 1.45;
 }
 .bot-pairing-row .set-seg {
+  display: inline-flex;
   flex: 0 0 auto;
 }
 .bot-simple-roles {
@@ -20020,15 +20056,15 @@ body > .mermaid-diagram--fullscreen {
 .bot-detail-card .bot-secret-row .btn {
   justify-self: flex-end;
 }
-.bot-detail-section--danger {
+/* 凭据操作按钮（保存/清除）横向排列在同一行。 */
+.bot-secret-row__actions {
+  display: flex;
   align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.bot-detail-section--danger {
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
-  border: 1px solid color-mix(in srgb, var(--danger) 20%, var(--border-soft));
-  border-left: 3px solid color-mix(in srgb, var(--danger) 70%, var(--border));
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--danger) 3%, var(--bg-elev-2));
-  padding: 11px 12px 11px 10px;
 }
 .bot-detail-section--danger .bot-detail-section__head {
   color: var(--fg);
@@ -20038,6 +20074,15 @@ body > .mermaid-diagram--fullscreen {
   color: var(--fg-dim);
   font-size: var(--text-2xs);
   line-height: 1.45;
+}
+/* 危险操作按钮文字始终红色（含未 armed 的「删除」按钮）。 */
+.bot-detail-section--danger .inline-confirm .btn {
+  color: var(--button-danger-fg);
+}
+.bot-detail-section--danger .inline-confirm .btn--danger {
+  background: var(--button-danger-bg);
+  border-color: var(--button-danger-border);
+  color: var(--button-danger-fg);
 }
 .bot-legacy-grid {
   display: grid;
@@ -20507,6 +20552,16 @@ body > .mermaid-diagram--fullscreen {
     align-items: start;
   }
 
+  /* 危险操作区块在中等宽度下改为纵向堆叠，避免两列 grid 压缩导致
+     右侧按钮被 .settings-center__content 的 overflow-x: hidden 裁切。 */
+  .bot-detail-section--danger {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+  .bot-detail-section--danger .inline-confirm {
+    justify-content: flex-start;
+  }
+
   .settings-field__control,
   .settings-inline-controls {
     justify-content: flex-start;
@@ -20576,7 +20631,6 @@ body > .mermaid-diagram--fullscreen {
 
   .bot-pairing-row {
     align-items: flex-start;
-    flex-direction: column;
   }
 
   .bot-simple-advanced__summary {
@@ -30397,13 +30451,12 @@ body > .mermaid-diagram--fullscreen {
   align-items: center;
   gap: 6px;
   width: 100%;
-  padding: 3px 6px;
+  padding: 5px 6px;
   border-radius: 6px;
   color: var(--color-text-muted, inherit);
-  font-size: 11px;
+  font-size: var(--text-md);
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   cursor: pointer;
   background: transparent;
   border: 1px dashed transparent;
@@ -30436,7 +30489,7 @@ body > .mermaid-diagram--fullscreen {
 .project-tree__group-input {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 11px;
+  font-size: inherit;
   font-weight: 600;
   padding: 1px 4px;
   border-radius: 4px;
@@ -38203,3 +38256,27 @@ body > .mermaid-diagram--fullscreen {
     gap: 4px;
   }
 }
+
+/* DingTalk bot channel: the credential row and manual setup form need
+   their own multi-column layout; the shared .bot-secret-row is forced to a
+   single column inside .bot-detail-card, which stacks five elements. */
+.bot-connect-panel--dingtalk {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  padding: 14px;
+}
+.bot-connect-panel--dingtalk .bot-connect-panel__body {
+  gap: 12px;
+}
+.bot-manual-form.bot-manual-form--dingtalk {
+  gap: 10px;
+  max-width: none;
+}
+.bot-manual-form.bot-manual-form--dingtalk .bot-card-field {
+  grid-template-columns: minmax(92px, 128px) minmax(0, 1fr);
+}
+.bot-manual-form.bot-manual-form--dingtalk .bot-card-field > div {
+  justify-content: flex-start;
+}
+/* 钉钉凭据区与飞书一致：单列竖排（通用 .bot-detail-card .bot-secret-row
+   已强制为 1fr；这里不再覆盖为多列横排，避免 5 个元素挤一行放不下）。 */
