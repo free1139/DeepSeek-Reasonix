@@ -10,7 +10,6 @@ import (
 
 	"reasonix/internal/bot"
 	"reasonix/internal/bot/dingtalk"
-	"reasonix/internal/bot/feishu"
 	"reasonix/internal/bot/qq"
 	"reasonix/internal/bot/weixin"
 	"reasonix/internal/config"
