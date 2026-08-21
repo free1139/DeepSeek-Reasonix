@@ -31,7 +31,7 @@ function assertBudget(label, actual, budget) {
 const initialJS = initialAssetPaths(".js");
 const initialCSS = initialAssetPaths(".css");
 if (!initialJS.length) throw new Error("no initial JavaScript assets found in dist/index.html");
-if (!initialCSS.length) throw new Error("no initial CSS assets found in dist/index.html");
+// initial CSS 允许为空：styles.css 走 ?url 延迟加载，feature 样式走 lazy chunk。
 
 // main.tsx intentionally loads styles.css before mounting React so the inline
 // boot shell can paint without waiting for the full application stylesheet.
@@ -86,7 +86,14 @@ console.log("\nbundle budgets");
 const initialJSBudgetKiB = process.env.REASONIX_CHANNEL === "test" ? 429.2 : 427.8;
 assertBudget("initial JavaScript gzip", initialJSGzip, initialJSBudgetKiB * 1024);
 assertBudget("largest initial JavaScript chunk gzip", largestInitialJS, 280 * 1024);
-assertBudget("render-blocking CSS gzip", initialCSSGzip, 4 * 1024);
+// Render-blocking CSS is intentionally absent: styles.css loads deferred via
+// ?url, and feature styles (heartbeat) live in lazy chunks loaded on demand.
+// An empty initial CSS list is the desired state, not a build error.
+if (initialCSS.length > 0) {
+  assertBudget("render-blocking CSS gzip", initialCSSGzip, 4 * 1024);
+} else {
+  process.stdout.write("  PASS  render-blocking CSS: none (all styles deferred)\n");
+}
 // Extension surfaces, Task Monitor, and compact decision receipts share the
 // application stylesheet loaded before React mounts. Keep their combined
 // allowance bounded even though the file is no longer render-blocking.
@@ -119,9 +126,13 @@ const rawInitialBytes = [...initialJS, ...initialCSS, ...appShellCSS]
 // The maintained Virtuoso engine adds 49.1 KiB raw (2.2%) over the previous
 // 2268.7 KiB gate. Navigation remains inside the 2341 KiB production ceiling;
 // its combined diagnostic wiring adds 2.2 KiB (0.094%) to the test channel.
-// DingTalk startup wiring moves current-base production from 2341.0 to
-// 2343.6 KiB and test from 2346.2 to 2348.8 KiB. Retain about 0.1 KiB build-SHA
-// headroom with a 2.7 KiB (about 0.115%) ratchet per channel.
-const rawInitialBudgetKiB = process.env.REASONIX_CHANNEL === "test" ? 2_348.9 : 2_343.7;
+// DingTalk startup wiring moves current-base production from 2341.0 to 2343.6
+// KiB and test from 2346.2 to 2348.8 KiB; the pinned heading adds 0.5 KiB raw
+// (0.021%). The workspace panel rework (change-row hover/revert, status badges,
+// More menu, completion summary) makes the latest-base merge 2353.1 KiB in
+// production and 2358.3 KiB in test: about 9.0 KiB (0.38%) over main-v2's
+// channel gates. Retain that attributable UI capacity with 0.1 KiB of build-SHA
+// headroom without widening the gzip or largest-chunk exceptions.
+const rawInitialBudgetKiB = process.env.REASONIX_CHANNEL === "test" ? 2_358.4 : 2_353.2;
 assertBudget("initial raw JavaScript and CSS", rawInitialBytes, rawInitialBudgetKiB * 1024);
 assertBudget("largest initial JavaScript chunk raw", largestInitialJSRaw, 1_000 * 1024);
