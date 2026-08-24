@@ -9,6 +9,7 @@ import { enqueueInboxGuidance } from "../lib/inboxSubmit";
 import { formatInboxError, isInboxItemMissing } from "../lib/inboxError";
 import { inboxScopeKey } from "../lib/composerInboxQueue";
 import { useComposerInboxRefresh } from "../lib/useComposerInboxRefresh";
+import { useComposerImeGuard } from "../lib/useComposerImeGuard";
 import { guidanceIsInFlight, guidanceNeedsRetry, guidanceTextMatches, kickIdleGuidance, markGuidanceQueued } from "../lib/composerGuidance";
 import { canUsePromptHistory, composerEnterAction, composerEscapeAction, composerMenuKeyAction, insertComposerNewline, isFnKeyEvent, isImeKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
 import { cacheGeneration, loadOlder } from "../lib/composerHistory";
@@ -383,6 +384,14 @@ function composerMaxHeight(): number {
   return Math.max(COMPOSER_MIN_HEIGHT, Math.min(COMPOSER_MAX_HEIGHT, Math.floor(window.innerHeight * COMPOSER_MAX_VIEWPORT_RATIO)));
 }
 
+// Hero (creation) input cap: the old 96px hard cap clipped longer drafts
+// before the card autosize took over; give the hero min(30vh, 160px) so a
+// visible scrollbar takes over instead (#8494/#8742/#9019).
+function composerHeroInputMaxHeight(): number {
+  if (typeof window === "undefined") return 160;
+  return Math.min(Math.floor(window.innerHeight * 0.3), 160);
+}
+
 // The rendered card includes the run strip while a turn runs; subtract it to
 // recover the user's logical height when measuring from the DOM.
 function composerLogicalHeight(card: HTMLElement): number {
@@ -540,6 +549,7 @@ export function Composer({
   cwd,
   modelLabel,
   imageInputEnabled = true,
+  imageUnderstandingEnabled = false,
   tabId,
   effort,
   onSend,
@@ -610,6 +620,8 @@ export function Composer({
   cwd?: string;
   modelLabel: string;
   imageInputEnabled?: boolean;
+  /** True when text-only image turns are preprocessed by a configured vision model. */
+  imageUnderstandingEnabled?: boolean;
   tabId?: string;
   effort?: EffortInfo;
   onSend: (displayText: string, submitText?: string, tabId?: string, structured?: StructuredInvocationSubmit) => void | Promise<void>;
@@ -788,8 +800,6 @@ export function Composer({
   const intentHoverTimerRef = useRef<number | null>(null);
   const creationChrome = showContextWindowRing;
   const wasRunningByDraftRef = useRef<Record<string, boolean>>({ [draftKey]: running });
-  const composingRef = useRef(false);
-  const lastCompositionEndAt = useRef(0);
   const pastChatSearchComposingRef = useRef(false);
   const pastChatSearchLastCompositionEndAt = useRef(0);
   const lastSelectionRef = useRef({ start: 0, end: 0 });
@@ -821,6 +831,18 @@ export function Composer({
   const openPastedLabelsRef = useRef(openPastedLabels);
   const sessionRefsRef = useRef(sessionRefs);
   const selectedTextRefsRef = useRef(selectedTextRefs);
+  // Plain-textarea IME freeze: while a composition is active the textarea
+  // renders uncontrolled so no re-render can cancel it (#8593/#8409); the
+  // hook owns the composition lifecycle, resync, and force-sync semantics.
+  const { composingRef, lastCompositionEndAt, trackImeInputChange } = useComposerImeGuard({
+    taRef,
+    text,
+    invocationCount: invocations.length,
+    textRef,
+    lastSelectionRef,
+    setText,
+    setPlainSelection,
+  });
   textRef.current = text;
   invocationsRef.current = invocations;
   attachmentsRef.current = attachments;
@@ -2004,8 +2026,9 @@ export function Composer({
   const planModeOn = collaborationMode === "plan";
   const activeGoal = (goal ?? "").trim();
   const goalModeOn = collaborationMode === "goal";
-  const warnImageInputFallback = useCallback((message = t("composer.imageInputUnsupported")) => {
-    showToast(message, "warn");
+  const warnImageInputFallback = useCallback((message?: string) => {
+    const text = message ?? t("composer.imageInputUnsupported");
+    showToast(text, "warn");
   }, [showToast, t]);
 
   const submit = async () => {
@@ -2021,7 +2044,7 @@ export function Composer({
     const trimmedDraft = typedGoalDraft ?? rawDraft;
     const trimmedText = trimmedDraft.text;
     if (draftHasPendingPaste(submitDraftKey)) return;
-    if (!imageInputEnabled && hasImageAttachments(attachmentsRef.current)) {
+    if (!imageInputEnabled && !imageUnderstandingEnabled && hasImageAttachments(attachmentsRef.current)) {
       warnImageInputFallback();
     }
     const currentAttachments = attachmentsRef.current;
@@ -2938,7 +2961,7 @@ export function Composer({
       const previousHeight = node.style.height;
       node.style.height = "auto";
       const scrollHeight = node.scrollHeight || 20;
-      const maxHeight = 96;
+      const maxHeight = composerHeroInputMaxHeight();
       const nextHeight = Math.min(Math.max(scrollHeight, 20), maxHeight);
       const nextOverflow = scrollHeight > maxHeight + 1;
       node.style.height = previousHeight;
@@ -3618,6 +3641,10 @@ export function Composer({
     ? ({ height: `${textareaAutoHeight}px`, overflowY: textareaAutoOverflow ? "auto" : "hidden" } as CSSProperties)
     : undefined;
   const composerAutoExpanded = composerHeight === null && textareaAutoHeight !== null && textareaAutoHeight > 40;
+  // Autosize mode flips overflow-y to auto once content exceeds the max
+  // height; the card modifier restores a thin scrollbar for exactly that
+  // state so long drafts expose their scrollability (#8494/#8742/#9019).
+  const composerAutoOverflow = composerHeight === null && textareaAutoOverflow;
   const composerResizeValue = effectiveComposerHeight ?? clampComposerHeight((textareaAutoHeight ?? 0) + COMPOSER_AUTO_RESERVED_HEIGHT);
   void onSetMode;
   const chooseApprovalMode = (nextMode: ToolApprovalMode) => {
@@ -4406,7 +4433,7 @@ export function Composer({
         </div>
       )}
       <div
-        className={`composer-card${composerHeight !== null || composerResizing ? " composer-card--resized" : ""}${composerAutoExpanded ? " composer-card--autosized" : ""}${composerResizing ? " composer-card--resizing" : ""}${running ? (waitingPrompt ? " composer-card--waiting" : " composer-card--running") : ""}`}
+        className={`composer-card${composerHeight !== null || composerResizing ? " composer-card--resized" : ""}${composerAutoExpanded ? " composer-card--autosized" : ""}${composerAutoOverflow ? " composer-card--auto-overflow" : ""}${composerResizing ? " composer-card--resizing" : ""}${running ? (waitingPrompt ? " composer-card--waiting" : " composer-card--running") : ""}`}
         ref={composerCardRef}
         style={composerCardStyle}
       >
@@ -4518,7 +4545,7 @@ export function Composer({
                   ref={taRef}
                   className="composer__input"
                   aria-label={t("composer.placeholder")} spellCheck={false} autoCorrect="off" autoCapitalize="off"
-                  value={text}
+                  value={composingRef.current ? undefined : text}
                   onInputCapture={(e) => {
                     pendingNativeInputTypeRef.current = (e.nativeEvent as InputEvent).inputType;
                   }}
@@ -4527,6 +4554,7 @@ export function Composer({
                     const inputType = (e.nativeEvent as InputEvent).inputType
                       || pendingNativeInputTypeRef.current;
                     pendingNativeInputTypeRef.current = undefined;
+                    trackImeInputChange(e.nativeEvent as InputEvent, inputType, e.target.value);
                     resetPromptHistoryNavigation();
                     textRef.current = e.target.value;
                     setText(e.target.value);
@@ -4546,13 +4574,6 @@ export function Composer({
                   onContextMenu={openInputMenu}
                   onPaste={onPaste}
                   onKeyDown={onKeyDown}
-                  onCompositionStart={() => {
-                    composingRef.current = true;
-                  }}
-                  onCompositionEnd={() => {
-                    composingRef.current = false;
-                    lastCompositionEndAt.current = Date.now();
-                  }}
                   style={textareaStyle}
                   placeholder={composerPlaceholder}
                   rows={1}
