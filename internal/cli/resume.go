@@ -2,12 +2,16 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"reasonix/internal/agent"
 	"reasonix/internal/i18n"
+	"reasonix/internal/store"
 )
 
 const resumeListCap = 10
@@ -41,6 +45,68 @@ func mostRecentSession(dir string) (agent.SessionInfo, bool) {
 		return agent.SessionInfo{}, false
 	}
 	return sessions[0], true
+}
+
+// mostRecentSessionByMTime picks the session whose transcript or event log was
+// most recently touched on disk, using only os.ReadDir plus per-entry stat. It
+// is the --continue fast path: agent.ListSessions decodes every sidecar
+// (LoadBranchMeta per file) to recover UpdatedAt, which is O(N) work for the
+// picker, but --continue only needs the top entry. The transcript filename
+// timestamp and the .events.jsonl mtime already encode "most recently active"
+// for the single-session case this function serves; ties (mtime identical to
+// the second) fall back to filename lexical order, the same tiebreaker used by
+// agent.ListSessionOrder.
+//
+// It returns the full session path and ok=true when a candidate exists; an
+// empty directory or unreadable dir yields ("", false). Sidecars are not read
+// and agent.SessionInfo is not populated — callers only need the path for
+// --continue's LoadSession round-trip.
+func mostRecentSessionByMTime(dir string) (string, bool) {
+	if dir == "" {
+		return "", false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) == 0 {
+		return "", false
+	}
+	var bestPath string
+	var bestMTime time.Time
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !store.IsSessionTranscriptName(name) || strings.HasSuffix(name, ".cleanup-pending") {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		// skip pending-cleanup transcripts early so a half-removed session
+		// does not steal the top slot from a healthy one.
+		if agent.IsCleanupPending(full) {
+			continue
+		}
+		mtime := mtimeForSession(full, e)
+		if bestPath == "" || mtime.After(bestMTime) || (mtime.Equal(bestMTime) && full > bestPath) {
+			bestPath = full
+			bestMTime = mtime
+		}
+	}
+	return bestPath, bestPath != ""
+}
+
+// mtimeForSession returns the newer of (transcript mtime, event-log mtime),
+// matching agent.SessionContentModTime's contract so the picker agrees with
+// the legacy ListSessionOrder ordering whenever a sidecar is absent.
+func mtimeForSession(transcript string, info os.DirEntry) time.Time {
+	var mod time.Time
+	if info != nil {
+		if inf, err := info.Info(); err == nil && !inf.IsDir() {
+			mod = inf.ModTime()
+		}
+	}
+	if logPath := store.SessionEventLog(transcript); logPath != "" {
+		if linfo, err := os.Stat(logPath); err == nil && !linfo.IsDir() && linfo.ModTime().After(mod) {
+			mod = linfo.ModTime()
+		}
+	}
+	return mod
 }
 
 func capResumeSessionGroups(sessions []agent.SessionInfo, limit int) []agent.SessionInfo {

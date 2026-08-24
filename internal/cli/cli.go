@@ -1068,13 +1068,20 @@ func chatREPL(args []string, version string) int {
 		resumePath = path
 	case *cont:
 		sessionDir := resolveCLISessionDir()
+		diagnostics.Milestone("resume_list_begin")
 		reclaimCLIRecoveryBranches(sessionDir)
-		session, ok := mostRecentSession(sessionDir)
+		diagnostics.Milestone("resume_reclaim_done")
+		// mtime fast path: skip agent.ListSessions's O(N) sidecar decode and
+		// rank by os.ReadDir + per-entry stat. The single top entry feeds
+		// resumePath below; recovery-group ordering still goes through
+		// mostRecentSession when the user picks a session via /resume.
+		path, ok := mostRecentSessionByMTime(sessionDir)
+		diagnostics.Milestone("resume_list_done")
 		if !ok {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 			return 1
 		}
-		resumePath = session.Path
+		resumePath = path
 	}
 	if *copySession && resumePath == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "--copy requires --resume or --continue")
