@@ -1919,6 +1919,11 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.ctrl != nil {
 			_ = m.ctrl.Snapshot()
 			m.followSessionLease()
+			// TODO(human): write the last-session pointer here so a Ctrl+D
+			// exit survives alongside the normal chatREPL return path. Decide
+			// whether to mirror chatREPL's writeLastSession call or to skip
+			// it for hard interrupts, and whether to treat a write failure
+			// as advisory.
 		}
 		return m, tea.Quit
 
@@ -4701,6 +4706,9 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 			return nil
 		}
 		m.followSessionLease()
+		if path := m.ctrl.SessionPath(); path != "" {
+			_ = writeLastSession(m.ctrl.SessionDir(), path)
+		}
 		// Native scrollback keeps the old transcript; mark the fork with a fresh banner.
 		m.resetFreshContextView(false)
 		m.notice(i18n.M.SlashNewDone)

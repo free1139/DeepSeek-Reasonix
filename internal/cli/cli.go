@@ -1071,17 +1071,32 @@ func chatREPL(args []string, version string) int {
 		diagnostics.Milestone("resume_list_begin")
 		reclaimCLIRecoveryBranches(sessionDir)
 		diagnostics.Milestone("resume_reclaim_done")
-		// mtime fast path: skip agent.ListSessions's O(N) sidecar decode and
-		// rank by os.ReadDir + per-entry stat. The single top entry feeds
-		// resumePath below; recovery-group ordering still goes through
-		// mostRecentSession when the user picks a session via /resume.
-		path, ok := mostRecentSessionByMTime(sessionDir)
+		// last-session fast path: a pointer file written by the previous
+		// --continue (or an in-chat /resume /switch /new) names the most
+		// recent session. Reading it skips both agent.ListSessions's
+		// per-sidecar decode and the mtime scan; a missing or empty pointer
+		// falls through to the mtime fast path below.
+		path, ok := readLastSession(sessionDir)
+		if ok {
+			diagnostics.Milestone("resume_last_session_hit")
+		} else {
+			diagnostics.Milestone("resume_last_session_miss")
+			// mtime fast path: skip agent.ListSessions's O(N) sidecar decode
+			// and rank by os.ReadDir + per-entry stat. The single top entry
+			// feeds resumePath below; recovery-group ordering still goes
+			// through mostRecentSession when the user picks a session via
+			// /resume.
+			path, ok = mostRecentSessionByMTime(sessionDir)
+		}
 		diagnostics.Milestone("resume_list_done")
 		if !ok {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
 			return 1
 		}
 		resumePath = path
+		if writeErr := writeLastSession(sessionDir, path); writeErr != nil {
+			diagnostics.Milestone("resume_last_session_write_failed")
+		}
 	}
 	if *copySession && resumePath == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "--copy requires --resume or --continue")
@@ -1355,6 +1370,9 @@ func chatREPL(args []string, version string) int {
 		// final guard for every other return path.
 		leases.Release()
 		return runWebCommand(webHandoffArgs(launchWebPath, launchWebSessionID, launchWebModelRef))
+	}
+	if path := ctrl.SessionPath(); path != "" {
+		_ = writeLastSession(resolveCLISessionDir(), path)
 	}
 	return 0
 }

@@ -118,6 +118,9 @@ func (m *chatTUI) runSwitchCommand(input string) {
 		return
 	}
 	m.replayActiveBranch("switched branch")
+	if path := m.ctrl.SessionPath(); path != "" {
+		_ = writeLastSession(m.ctrl.SessionDir(), path)
+	}
 }
 
 func (m *chatTUI) replayActiveBranch(title string) {

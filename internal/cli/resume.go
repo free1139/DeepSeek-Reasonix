@@ -277,6 +277,7 @@ func (m *chatTUI) runResumeCommand(input string) {
 	}
 	m.ctrl.Resume(loaded, target.Path)
 	m.replayActiveBranch(i18n.M.ResumedTitle)
+	_ = writeLastSession(m.ctrl.SessionDir(), target.Path)
 }
 
 // resumeArgItems completes the index argument of "/resume <n>": once past the
