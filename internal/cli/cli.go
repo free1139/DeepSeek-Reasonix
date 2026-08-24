@@ -1036,6 +1036,11 @@ func chatREPL(args []string, version string) int {
 		cliCursorShape = cfg.UICursorShape()
 	}
 	diagnostics.Milestone("config_load_done")
+	if cfg.StartupOnline() {
+		diagnostics.Milestone("startup_online_true")
+	} else {
+		diagnostics.Milestone("startup_online_false")
+	}
 
 	// Decide whether we're starting fresh or resuming. --resume opens an
 	// interactive picker; --continue / -c jumps straight into the newest.
@@ -1085,10 +1090,10 @@ func chatREPL(args []string, version string) int {
 		resumePath = copied
 	}
 	sessionMode := cliTelemetrySessionMode(*cont, resumeValue != "", *copySession)
-	reporter := startCLITelemetry(cfg, telemetry.Options{
+	reporter := startCLITelemetryWithIO(cfg, telemetry.Options{
 		Version: version, Interactive: isInteractive(), CLIMode: "tui",
 		PermissionMode: *permissionMode, SessionMode: sessionMode,
-	})
+	}, os.Stdin, os.Stdout, os.Stderr, !cfg.StartupOnline())
 
 	// Own the active session file for the TUI's lifetime; in-TUI switches
 	// (/resume, /switch, /new, ...) move the lease with the active path.
@@ -2664,10 +2669,14 @@ func configCompactRatioUsage() {
 }
 
 func startCLITelemetry(cfg *config.Config, opts telemetry.Options) *telemetry.Reporter {
-	return startCLITelemetryWithIO(cfg, opts, os.Stdin, os.Stdout, os.Stderr)
+	return startCLITelemetryWithIO(cfg, opts, os.Stdin, os.Stdout, os.Stderr, false)
 }
 
-func startCLITelemetryWithIO(cfg *config.Config, opts telemetry.Options, in io.Reader, out, errOut io.Writer) *telemetry.Reporter {
+// startCLITelemetryWithIO is the testable seam behind startCLITelemetry.
+// forceOffline, when true, skips the stdin consent prompt and reports as off —
+// chatREPL sets this from [startup].online to keep TUI startup reachable on
+// machines without a console or behind a blocking stdin (e.g. /dev/null).
+func startCLITelemetryWithIO(cfg *config.Config, opts telemetry.Options, in io.Reader, out, errOut io.Writer, forceOffline bool) *telemetry.Reporter {
 	if cfg == nil {
 		cfg = config.Default()
 	}
@@ -2675,6 +2684,12 @@ func startCLITelemetryWithIO(cfg *config.Config, opts telemetry.Options, in io.R
 	opts.HomeDir = config.ReasonixHomeDir()
 	opts.Proxy = cfg.NetworkProxySpec()
 	opts.Language = cfg.Language
+
+	if forceOffline && !cfg.CLITelemetryConfigured() {
+		// Caller asked for offline startup: treat the unanswered consent as off
+		// so we never block reading from a non-interactive stdin.
+		opts.Mode = "off"
+	}
 
 	if cfg.CLITelemetryConfigured() || !telemetry.Enabled(opts.Mode, opts.Version, opts.Interactive) {
 		return startCLITelemetryReporter(opts)

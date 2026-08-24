@@ -34,6 +34,13 @@ turn_done = true   # notify when a turn finishes
 approval_request = true   # notify when a tool approval is waiting
 ask_request = true   # notify when a question is waiting
 
+[startup]
+# online = false   # when false (default), the TUI chat skips optional startup network calls
+# (e.g. the telemetry consent prompt) so reasonix can boot on machines without
+# a console or behind a non-interactive stdin. Flip to true to opt back in to
+# the original behaviour; runtime LLM/tool calls are unaffected by this flag.
+online = false
+
 [agent]
 # system_prompt = "You are ..."   # custom persona/prompt; unset or empty = built-in default
 # system_prompt_file = "prompts/system.md"   # project paths stay in <workspace>; user paths may fall back to <reasonix home>

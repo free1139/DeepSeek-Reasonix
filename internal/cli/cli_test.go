@@ -1148,7 +1148,7 @@ func TestCLITelemetryConsentDefaultsYesAndPromptsOnlyOnce(t *testing.T) {
 	var out, errOut bytes.Buffer
 	got := startCLITelemetryWithIO(cfg, telemetry.Options{
 		Version: "v1.20.0", Interactive: true, CLIMode: "tui",
-	}, strings.NewReader("\n"), &out, &errOut)
+	}, strings.NewReader("\n"), &out, &errOut, false)
 	if got != want || starts != 1 {
 		t.Fatalf("first start = %p, calls=%d; want %p, 1", got, starts, want)
 	}
@@ -1165,7 +1165,7 @@ func TestCLITelemetryConsentDefaultsYesAndPromptsOnlyOnce(t *testing.T) {
 	var secondOut bytes.Buffer
 	if got := startCLITelemetryWithIO(cfg, telemetry.Options{
 		Version: "v1.20.0", Interactive: true, CLIMode: "tui",
-	}, strings.NewReader("n\n"), &secondOut, &errOut); got != want {
+	}, strings.NewReader("n\n"), &secondOut, &errOut, false); got != want {
 		t.Fatalf("second start = %p, want %p", got, want)
 	}
 	if secondOut.Len() != 0 || starts != 2 {
@@ -1197,7 +1197,7 @@ func TestCLITelemetryConsentNoDisablesAndCleansPending(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if got := startCLITelemetryWithIO(cfg, telemetry.Options{
 		Version: "v1.20.0", Interactive: true, CLIMode: "tui",
-	}, strings.NewReader("n\n"), &out, &errOut); got != nil {
+	}, strings.NewReader("n\n"), &out, &errOut, false); got != nil {
 		t.Fatalf("declined telemetry returned reporter %p", got)
 	}
 	if starts != 0 {
@@ -1236,7 +1236,7 @@ func TestCLITelemetryConsentSaveFailureDoesNotUpload(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if got := startCLITelemetryWithIO(cfg, telemetry.Options{
 		Version: "v1.20.0", Interactive: true, CLIMode: "tui",
-	}, strings.NewReader("\n"), &out, &errOut); got != nil {
+	}, strings.NewReader("\n"), &out, &errOut, false); got != nil {
 		t.Fatalf("save failure returned reporter %p", got)
 	}
 	if starts != 0 || cfg.CLITelemetryConfigured() {
@@ -1279,7 +1279,7 @@ func TestConfiguredCLITelemetryDoesNotPromptAgain(t *testing.T) {
 		var out bytes.Buffer
 		got := startCLITelemetryWithIO(cfg, telemetry.Options{
 			Version: "v1.20.0", Interactive: true, CLIMode: "tui",
-		}, strings.NewReader("n\n"), &out, io.Discard)
+		}, strings.NewReader("n\n"), &out, io.Discard, false)
 		if out.Len() != 0 {
 			t.Fatalf("configured mode %q prompted again: %q", mode, out.String())
 		}
@@ -1322,7 +1322,7 @@ func TestUndecidedCLITelemetryDoesNotPromptOrUploadWhenIneligible(t *testing.T) 
 			var out, errOut bytes.Buffer
 			if got := startCLITelemetryWithIO(cfg, telemetry.Options{
 				Version: tc.version, Interactive: tc.interactive, CLIMode: "tui",
-			}, strings.NewReader("\n"), &out, &errOut); got != nil {
+			}, strings.NewReader("\n"), &out, &errOut, false); got != nil {
 				t.Fatalf("ineligible telemetry returned reporter %p", got)
 			}
 			if out.Len() != 0 || errOut.Len() != 0 {
@@ -1349,7 +1349,7 @@ func TestLegacySafeModeEnvDoesNotAlterConfiguredCLITelemetry(t *testing.T) {
 	startCLITelemetryReporter = func(telemetry.Options) *telemetry.Reporter { return want }
 	if got := startCLITelemetryWithIO(cfg, telemetry.Options{
 		Version: "v1.20.0", Interactive: true, CLIMode: "tui",
-	}, strings.NewReader(""), io.Discard, io.Discard); got != want {
+	}, strings.NewReader(""), io.Discard, io.Discard, false); got != want {
 		t.Fatalf("telemetry reporter = %p, want %p", got, want)
 	}
 }
@@ -1372,7 +1372,7 @@ func TestCLITelemetryConsentPromptIsLocalized(t *testing.T) {
 		var out bytes.Buffer
 		startCLITelemetryWithIO(config.Default(), telemetry.Options{
 			Version: "v1.20.0", Interactive: true, CLIMode: "tui",
-		}, strings.NewReader("\n"), &out, io.Discard)
+		}, strings.NewReader("\n"), &out, io.Discard, false)
 		for _, required := range []string{"crash.reasonix.io", "reasonix config telemetry off", "[Y/n]:"} {
 			if !strings.Contains(out.String(), required) {
 				t.Fatalf("%s consent prompt missing %q: %q", lang, required, out.String())

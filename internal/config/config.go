@@ -63,6 +63,7 @@ type Config struct {
 	Skills           SkillsConfig        `toml:"skills"`
 	Statusline       StatuslineConfig    `toml:"statusline"`
 	LSP              LSPConfig           `toml:"lsp"`
+	Startup          StartupConfig       `toml:"startup"`
 	Bot              BotConfig           `toml:"bot"`
 	Serve            ServeConfig         `toml:"serve"`
 	Secrets          SecretsConfig       `toml:"secrets"`
@@ -744,6 +745,23 @@ type LSPServer struct {
 	LanguageID  string            `toml:"language_id"`
 	Extensions  []string          `toml:"extensions"`
 	InstallHint string            `toml:"install_hint"`
+}
+
+// StartupConfig toggles per-process startup behaviour. The default for every
+// field is the conservative option (off, false, nil) so a missing [startup]
+// section or an absent field behaves like the legacy boot — no online calls.
+type StartupConfig struct {
+	// Online, when true, lets startup paths that the rest of the app considers
+	// optional reach the network (e.g. telemetry consent prompt). The default
+	// false keeps reasonix bootable offline; flip to true in config.toml only
+	// when you intentionally want those hooks.
+	Online bool `toml:"online"`
+}
+
+// StartupOnline reports whether startup paths may make optional network calls.
+// A missing [startup] section or absent online field reads as false.
+func (c *Config) StartupOnline() bool {
+	return c != nil && c.Startup.Online
 }
 
 // StatuslineConfig configures a custom status line. Command, when set, is run at

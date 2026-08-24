@@ -509,6 +509,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	fmt.Fprintf(&b, "network = %v\n", c.Sandbox.Network)
 	b.WriteString("\n")
 
+	b.WriteString("[startup]\n")
+	b.WriteString("# online = false   # when false (default), startup paths skip optional network calls; flip true to opt in\n")
+	b.WriteString("# online = true\n")
+	b.WriteString("\n")
+
 	b.WriteString("[statusline]\n")
 	b.WriteString("# A custom status line: a command whose first stdout line replaces the built-in\n")
 	b.WriteString("# data row. It receives {\"model\",\"contextUsed\",\"contextWindow\",\"cwd\"} as JSON on stdin.\n")
@@ -1243,6 +1248,15 @@ func RenderTOMLProjectDelta(c *Config) string {
 			b.WriteString(sandboxBuf.String())
 			b.WriteString("\n")
 		}
+	}
+
+	// [startup]
+	if !reflect.DeepEqual(c.Startup, d.Startup) {
+		b.WriteString("[startup]\n")
+		if c.Startup.Online {
+			b.WriteString("online = true\n")
+		}
+		b.WriteString("\n")
 	}
 
 	// [statusline]

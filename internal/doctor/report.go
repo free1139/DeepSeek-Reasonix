@@ -33,6 +33,7 @@ type Report struct {
 	Arch       string           `json:"arch"`
 	CWD        string           `json:"cwd,omitempty"`
 	Config     ConfigReport     `json:"config"`
+	Startup    StartupReport    `json:"startup"`
 	Providers  []ProviderReport `json:"providers"`
 	Plugins    []PluginReport   `json:"plugins,omitempty"`
 	LSP        LSPReport        `json:"lsp"`
@@ -41,6 +42,12 @@ type Report struct {
 	Network    NetworkReport    `json:"network"`
 	Permission PermissionReport `json:"permission"`
 	Warnings   []string         `json:"warnings,omitempty"`
+}
+
+// StartupReport surfaces the [startup].online toggle so operators can verify
+// offline mode is in effect without reading the user's config.toml.
+type StartupReport struct {
+	Online bool `json:"online"`
 }
 
 type ConfigReport struct {
@@ -164,6 +171,9 @@ func Collect(opts Options) Report {
 			SourcePath:   redactHome(sourcePath),
 			UserPath:     redactHome(userPath),
 			DefaultModel: cfg.DefaultModel,
+		},
+		Startup: StartupReport{
+			Online: cfg.StartupOnline(),
 		},
 		LSP: LSPReport{
 			Enabled: cfg.LSP.Enabled,
