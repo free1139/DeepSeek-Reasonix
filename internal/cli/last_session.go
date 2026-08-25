@@ -22,9 +22,10 @@ func lastSessionPath(sessionDir string) string {
 
 // readLastSession returns the absolute session path stored in the pointer
 // file, or ("", false) when the file is missing, empty, or unreadable. The
-// caller is responsible for any further validation of the path; this helper
-// does not stat the target session so a transient disk hiccup on the
-// pointer file falls straight back to mtime without burning extra IO.
+// helper does not stat the target session so the read stays a single
+// os.ReadFile; callers that need staleness protection (a pointer written
+// before its target session was removed) should os.Stat the returned path
+// before passing it to LoadSession.
 func readLastSession(sessionDir string) (string, bool) {
 	path := lastSessionPath(sessionDir)
 	if path == "" {

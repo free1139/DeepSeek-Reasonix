@@ -21,11 +21,19 @@ func reclaimCLIRecoveryBranches(dir string, wait bool) {
 		go reclaimCLIRecoveryBranches(dir, true)
 		return
 	}
+	// Skip the file the last-session pointer names so an async GC never
+	// outlaws the entry --continue is about to load. readLastSession is
+	// cheap (one os.ReadFile of a one-line pointer); a missing or empty
+	// pointer returns "" and the skip is a no-op.
+	pointed, _ := readLastSession(dir)
 	candidates, err := agent.ReclaimableRecoveryBranches(dir, time.Now(), agent.RecoveryGCGracePeriod)
 	if err != nil {
 		return
 	}
 	for _, path := range candidates {
+		if pointed != "" && path == pointed {
+			continue
+		}
 		_ = agent.TrashReclaimableRecoveryBranch(path, dir)
 	}
 }

@@ -1075,8 +1075,16 @@ func chatREPL(args []string, version string) int {
 		// --continue (or an in-chat /resume /switch /new) names the most
 		// recent session. Reading it skips both agent.ListSessions's
 		// per-sidecar decode and the mtime scan; a missing or empty pointer
-		// falls through to the mtime fast path below.
+		// falls through to the mtime fast path below. A stale pointer
+		// (target file removed between sessions) also falls through rather
+		// than failing later in agent.LoadSession.
 		path, ok := readLastSession(sessionDir)
+		if ok {
+			if info, statErr := os.Stat(path); statErr != nil || info.IsDir() {
+				diagnostics.Milestone("resume_last_session_stale")
+				ok = false
+			}
+		}
 		if ok {
 			diagnostics.Milestone("resume_last_session_hit")
 		} else {
