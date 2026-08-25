@@ -1189,6 +1189,7 @@ func chatREPL(args []string, version string) int {
 		ctrl.Resume(loaded, resumePath)
 	}
 	ctrl.EnsureSessionPath()
+	diagnostics.Milestone("chat_session_resolve_done")
 	// Fresh sessions take the lease too (defensive: the path is brand new); a
 	// resumed path is already held, making this a no-op.
 	if err := rebindCLIControllerAuthority(leases, ctrl); err != nil {
@@ -1196,6 +1197,7 @@ func chatREPL(args []string, version string) int {
 		return 1
 	}
 	reclaimCLIRecoveryBranches(ctrl.SessionDir())
+	diagnostics.Milestone("chat_recovery_reclaim_done")
 
 	// Surface a missing-key warning inside the TUI banner so the first message
 	// failing is at least pre-announced; the user can still enter chat.
@@ -1218,6 +1220,7 @@ func chatREPL(args []string, version string) int {
 			}
 		}
 	}
+	diagnostics.Milestone("chat_config_recheck_done")
 
 	// Initial terminal width — the TUI re-flows on every WindowSizeMsg so
 	// this is just a starting estimate before the first resize event lands.
@@ -1238,6 +1241,7 @@ func chatREPL(args []string, version string) int {
 	}
 
 	m := newChatTUI(ctrl, missing, eventCh, termW)
+	diagnostics.Milestone("chat_tui_constructed")
 	// Plan-first is the startup default for the interactive TUI; the approval
 	// axis still follows --permission-mode. applyPermissionMode above already
 	// synced the controller from the permission flags, so set the plan axis
@@ -1295,6 +1299,7 @@ func chatREPL(args []string, version string) int {
 	// buildController so the replacement matches this session's launch wiring;
 	// the CLI holds no SharedHost, so each rebuild owns its plugin host.
 	m.bindRuntimeRebuilder(*maxSteps, sink, *yolo, overrides, cliProfileBuildOptions)
+	diagnostics.Milestone("chat_runtime_rebuilder_bound")
 	if effortOverride != nil {
 		m.effortLevel = *effortOverride
 	}
@@ -1305,6 +1310,7 @@ func chatREPL(args []string, version string) int {
 	if m.nativeScrollback {
 		prepareNativeScrollback(os.Stdout, m.bottomRows())
 	}
+	diagnostics.Milestone("chat_scrollback_prepared")
 
 	// Non-Termux terminals use an alt-screen transcript viewport. Termux stays
 	// in the normal buffer so native touch scrollback and soft-keyboard focus
