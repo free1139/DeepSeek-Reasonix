@@ -25,7 +25,7 @@ type resumePicker struct {
 // openResumePicker populates the picker from the session directory and opens it.
 // A no-op (with a notice) when there are no saved sessions.
 func (m *chatTUI) openResumePicker() {
-	reclaimCLIRecoveryBranches(m.ctrl.SessionDir())
+	reclaimCLIRecoveryBranches(m.ctrl.SessionDir(), true)
 	sessions := recentSessions(m.ctrl.SessionDir())
 	if len(sessions) == 0 {
 		m.notice(i18n.M.NoSessionToResume)

@@ -600,7 +600,7 @@ func runAgent(args []string, version string) int {
 	}
 	if resumePath == "" && *cont {
 		sessionDir := resolveCLISessionDir()
-		reclaimCLIRecoveryBranches(sessionDir)
+		reclaimCLIRecoveryBranches(sessionDir, true)
 		session, ok := mostRecentSession(sessionDir)
 		if !ok {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
@@ -725,7 +725,7 @@ func runAgent(args []string, version string) int {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, control.SessionInUseMessage(err)+"; "+control.SessionLeaseCloseHint)
 		return 1
 	}
-	reclaimCLIRecoveryBranches(ctrl.SessionDir())
+	reclaimCLIRecoveryBranches(ctrl.SessionDir(), true)
 
 	runErr := ctrl.Run(ctx, prompt)
 	reporter.RecordRecovery(ctrl.DrainRecoveryMetrics())
@@ -1069,7 +1069,7 @@ func chatREPL(args []string, version string) int {
 	case *cont:
 		sessionDir := resolveCLISessionDir()
 		diagnostics.Milestone("resume_list_begin")
-		reclaimCLIRecoveryBranches(sessionDir)
+		reclaimCLIRecoveryBranches(sessionDir, true)
 		diagnostics.Milestone("resume_reclaim_done")
 		// last-session fast path: a pointer file written by the previous
 		// --continue (or an in-chat /resume /switch /new) names the most
@@ -1196,8 +1196,8 @@ func chatREPL(args []string, version string) int {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, control.SessionInUseMessage(err)+"; "+control.SessionLeaseCloseHint)
 		return 1
 	}
-	reclaimCLIRecoveryBranches(ctrl.SessionDir())
-	diagnostics.Milestone("chat_recovery_reclaim_done")
+	reclaimCLIRecoveryBranches(ctrl.SessionDir(), false)
+	diagnostics.Milestone("chat_recovery_reclaim_fired_async")
 
 	// Surface a missing-key warning inside the TUI banner so the first message
 	// failing is at least pre-announced; the user can still enter chat.
@@ -1587,7 +1587,7 @@ func interactiveSetup(configPath, envPath string) int {
 // exit code (non-zero when there's nothing to pick or the user cancelled).
 func pickSessionToResume() (string, int) {
 	sessionDir := resolveCLISessionDir()
-	reclaimCLIRecoveryBranches(sessionDir)
+	reclaimCLIRecoveryBranches(sessionDir, true)
 	sessions := recentSessions(sessionDir)
 	if len(sessions) == 0 {
 		fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
