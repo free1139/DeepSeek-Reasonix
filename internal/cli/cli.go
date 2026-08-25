@@ -600,7 +600,7 @@ func runAgent(args []string, version string) int {
 	}
 	if resumePath == "" && *cont {
 		sessionDir := resolveCLISessionDir()
-		reclaimCLIRecoveryBranches(sessionDir, true)
+		reclaimCLIRecoveryBranches(sessionDir, false)
 		session, ok := mostRecentSession(sessionDir)
 		if !ok {
 			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
@@ -725,7 +725,7 @@ func runAgent(args []string, version string) int {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, control.SessionInUseMessage(err)+"; "+control.SessionLeaseCloseHint)
 		return 1
 	}
-	reclaimCLIRecoveryBranches(ctrl.SessionDir(), true)
+	reclaimCLIRecoveryBranches(ctrl.SessionDir(), false)
 
 	runErr := ctrl.Run(ctx, prompt)
 	reporter.RecordRecovery(ctrl.DrainRecoveryMetrics())
@@ -1069,8 +1069,8 @@ func chatREPL(args []string, version string) int {
 	case *cont:
 		sessionDir := resolveCLISessionDir()
 		diagnostics.Milestone("resume_list_begin")
-		reclaimCLIRecoveryBranches(sessionDir, true)
-		diagnostics.Milestone("resume_reclaim_done")
+		reclaimCLIRecoveryBranches(sessionDir, false)
+		diagnostics.Milestone("resume_reclaim_fired_async")
 		// last-session fast path: a pointer file written by the previous
 		// --continue (or an in-chat /resume /switch /new) names the most
 		// recent session. Reading it skips both agent.ListSessions's
@@ -1587,7 +1587,7 @@ func interactiveSetup(configPath, envPath string) int {
 // exit code (non-zero when there's nothing to pick or the user cancelled).
 func pickSessionToResume() (string, int) {
 	sessionDir := resolveCLISessionDir()
-	reclaimCLIRecoveryBranches(sessionDir, true)
+	reclaimCLIRecoveryBranches(sessionDir, false)
 	sessions := recentSessions(sessionDir)
 	if len(sessions) == 0 {
 		fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
