@@ -119,7 +119,7 @@ func foldEconomics(region []provider.Message) bool {
 func estimateMessagesTokens(msgs []provider.Message) int {
 	total := 0
 	for _, m := range msgs {
-		if m.LocalOnly {
+		if m.LocalOnly || IsPinnedContextRevision(m) {
 			continue
 		}
 		total += 4 // chat-message framing overhead
@@ -372,7 +372,7 @@ func (a *Agent) summaryRequest(region []provider.Message, instructions string) p
 		}
 	}
 	messages := a.normalizeModelRequestMessages(prefix)
-	messages = append(messages, provider.Message{Role: provider.RoleUser, Content: compactionInstructionWithFocus(instructions)})
+	messages = append(messages, HostGeneratedUserMessage(compactionInstructionWithFocus(instructions)))
 	var schemas []provider.ToolSchema
 	if a.svc.tools != nil {
 		schemas = a.providerToolSchemas()
