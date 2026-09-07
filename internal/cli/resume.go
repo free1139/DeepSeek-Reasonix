@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -337,7 +338,7 @@ func (m *chatTUI) runResumeCommand(input string) {
 		return
 	}
 	m.replayActiveBranch(i18n.M.ResumedTitle)
-	_ = writeLastSession(m.ctrl.SessionDir(), target.Path)
+	_ = writeLastSession(m.ctrl.SessionDir(), target.session.Path)
 }
 
 // runTakeoverCommand handles "/takeover": it force-takes the last refused
