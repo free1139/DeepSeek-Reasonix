@@ -1097,7 +1097,7 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		imageInput: newImageInput(opts.ImageInput, prov),
 		svc: newAgentServices(prov, tools, sink, gate, planModeReadOnlyTrust,
 			sandboxEscapeApprover, configWriteApprover, hooks, opts),
-		reads: readState{gates: !opts.ReadPipeline.LegacyEvidenceGates},
+		reads: readState{gates: !defaultLegacyEvidenceGates()},
 		agentConfig: agentConfig{
 			maxSteps:                opts.MaxSteps,
 			maxStepsKey:             maxStepsKey,

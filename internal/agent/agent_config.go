@@ -43,12 +43,28 @@ type agentConfig struct {
 // ReadPipelineOptions carries the internal read-pipeline rollback switches. The
 // new behavior is the default; each switch exists so an operator can fall back
 // for diagnosis, is host-local, and is fixed for the whole run.
+//
+// LegacyEvidenceGates inverts the default: the writer-declared evidence gate
+// is OFF by default and only re-enables when an explicit Options value forces
+// it on. The gate's hook (operation_evidence.go) is keyed on a per-call
+// "has the model seen this content" check that adds an extra round-trip to
+// every write; with it off, writes no longer wait on read evidence.
 type ReadPipelineOptions struct {
 	// LegacyCoordinator restores the legacy incomplete-read execution owner.
 	LegacyCoordinator bool
-	// LegacyEvidenceGates turns the writer-declared evidence check off.
+	// LegacyEvidenceGates turns the writer-declared evidence check off. It is
+	// the host-local rollback switch for the evidence gate; see the type
+	// comment for the default direction.
 	LegacyEvidenceGates bool
 	// LegacyImplicitFullReads restores the old rule that a read with no window
 	// promised the whole file. It exists for diagnosis and rollback only.
 	LegacyImplicitFullReads bool
+}
+
+// defaultLegacyEvidenceGates reports whether the writer-declared evidence gate
+// should be disabled for this run. The boot path may force it on (set
+// opts.ReadPipeline.LegacyEvidenceGates = false) when an operator wants the
+// pre-2026 strict-read-before-write behavior back.
+func defaultLegacyEvidenceGates() bool {
+	return true
 }
